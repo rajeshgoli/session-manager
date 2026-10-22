@@ -425,6 +425,9 @@ async fn main() -> Result<()> {
             if cfg!(target_os = "macos") {
                 sm_server::utilization::spawn_recorder(
                     sm_server::utilization::RecorderSettings {
+                        near_idle: config.queue_runner.near_idle.clone(),
+                        admission_policy: config.queue_admission_policy(),
+                        cancel_grace_seconds: config.queue_runner.cancel_grace_seconds,
                         db_path: expand_home(&config.utilization.db_path),
                         queue_db_path: queue_state_dir.join("queue_runner.db"),
                         interval: Duration::from_secs(config.utilization.sample_interval_seconds),

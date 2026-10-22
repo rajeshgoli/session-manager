@@ -321,6 +321,19 @@
 <h3>E. How the evidence was computed</h3>
 <p>Read-only copy of <code>~/.local/share/claude-sessions/utilization.db</code>, snapshot 21 Oct evening, 554 hours of samples, all four sampled job types (review jobs are not sampled). For every running job, slide a 30-minute window over its samples and apply rule A with 50% of a core and 5 GiB; the simulation used "no GPU" because no job in the window used any. "Passed 1 core or 10 GiB" in the memo table means a later 5-minute window at or above 1 core, or a footprint at or above 10 GiB. "Hours some job waited" sums sample intervals (capped at 10 s) where any pending job had <code>holding_reason = concurrency_cap</code>; that reason covers per-type limits as well as the global one, so 32 of 56 is an upper bound on hours actually unblocked. The nine wake-ups: 2066-nq5-money (19 GiB), 2221-smoke-watch (29 cores), 2171-watch (31 cores, 34 GiB), 2171-watch8 (20 cores, 38 GiB), backup-first-run (1.3 cores), and four tests jobs at 1.3–2 cores.</p>
 
+<h3>F. Implementation and verification</h3>
+<table class="sans">
+<thead><tr><th>Contract</th><th>Code and tests</th></tr></thead>
+<tbody>
+<tr><td>Entry, wake, fresh windows, coverage, counter drops, memory fallback, all types, log independence, restart and disable</td><td><code>crates/sm-server/src/utilization/near_idle.rs</code>: <code>Clock::observe</code>, <code>Detector::tick</code>, <code>since</code> and the module's tests. The map is process memory; it keys the canonical queue database path and the job's start timestamp.</td></tr>
+<tr><td>Configuration defaults and rejection of invalid thresholds</td><td><code>crates/sm-server/src/config.rs</code>: <code>QueueNearIdleConfig</code>, <code>near_idle_defaults_partial_config_and_validation</code>; <code>config.yaml.example</code>.</td></tr>
+<tr><td>Global and per-type counts, perf pause, finite blockers, displacement, wake overshoot and admission request</td><td><code>crates/sm-server/src/queue.rs</code>: <code>holds_slot</code>, <code>publish_near_idle_slots</code>, <code>request_near_idle_admission</code>, tests prefixed <code>near_idle_</code> and <code>newly_near_idle_</code>. <code>utilization.rs</code>: recorder <code>tick</code> requests admission on a newly released slot.</td></tr>
+<tr><td>Service overcapacity, refreshed holds, recovery and unchanged resource guards</td><td><code>queue.rs</code>: <code>service_overcapacity_blocks_only_new_services</code>, existing memory/process guard tests. <code>crates/sm-server/tests/read_only_http.rs</code>: <code>queue_runtime_recovery_over_service_capacity_holds_only_at_applicable_limits</code>.</td></tr>
+<tr><td>Wait reasons, running-job JSON, slot counts and CLI status</td><td><code>queue.rs</code>: <code>concurrency_cap_wait_detail</code>, <code>queue_hold_explanation</code>. <code>http.rs</code>: <code>queue_job_response_with_names</code>, <code>client_queue_lists_running_queued_in_order_and_recent_stops</code>. <code>bin/sm.rs</code>: <code>near_idle_cli_marks_released_slot_only_while_running</code>.</td></tr>
+<tr><td>Queue page chip, since-when and held/limit counter</td><td><code>crates/sm-server/src/web/queue.js</code>: <code>QueuePage</code>, <code>JobRow</code>.</td></tr>
+</tbody>
+</table>
+
 <h3>Z. FAQ</h3>
 <p><b>Why not just raise the global limit to 16?</b> It treats a busy 48 GiB job and a sleeping watcher alike; two more busy jobs would oversubscribe the Mac with no signal. The limit means "real work running at once"; near-idle keeps it meaning that.</p>
 <p><b>Why does memory count at all if CPU is the contended resource?</b> A job holding 9 GiB while idle (2171-watch8 today) is often between phases of real work; 2171-watch8 itself later ran 20 cores. Counting it is conservative, and the 5 GiB bar still frees every pure watcher seen today.</p>

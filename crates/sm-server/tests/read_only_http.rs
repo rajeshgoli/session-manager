@@ -7153,7 +7153,7 @@ async fn queue_runtime_recovery_at_service_capacity_preserves_non_service_reserv
 
 #[cfg(unix)]
 #[tokio::test]
-async fn queue_runtime_recovery_rejects_live_services_above_reduced_capacity() {
+async fn queue_runtime_recovery_over_service_capacity_holds_only_at_applicable_limits() {
     let state_dir = unique_temp_path().with_extension("queue-recover-reduced-service-capacity");
     let message_queue_db = state_dir.with_extension("message-queue.db");
     let create_job = |job_type: &str, label: &str| {
@@ -7184,7 +7184,8 @@ async fn queue_runtime_recovery_rejects_live_services_above_reduced_capacity() {
         create_job("service", "old service three"),
         create_job("service", "old service four"),
     ];
-    let background = create_job("background", "must remain pending");
+    let background = create_job("background", "finite background");
+    let pending_service = create_job("service", "new service");
     set_queue_job_holding_reason(&state_dir, &background.id, "memory_pressure");
     let mut children = services
         .iter()
@@ -7192,6 +7193,7 @@ async fn queue_runtime_recovery_rejects_live_services_above_reduced_capacity() {
             let child = Command::new("/bin/zsh")
                 .arg("-lc")
                 .arg("sleep 30")
+                .process_group(0)
                 .spawn()
                 .unwrap();
             let pid = i64::from(child.id());
@@ -7200,7 +7202,7 @@ async fn queue_runtime_recovery_rejects_live_services_above_reduced_capacity() {
         })
         .collect::<Vec<_>>();
 
-    let error = RetainedQueueStore::recover_queue_jobs_in_state_dir_with_policy(
+    let summary = RetainedQueueStore::recover_queue_jobs_in_state_dir_with_policy(
         &state_dir,
         &message_queue_db,
         0,
@@ -7211,14 +7213,10 @@ async fn queue_runtime_recovery_rejects_live_services_above_reduced_capacity() {
             ..QueueAdmissionPolicy::default()
         },
     )
-    .unwrap_err()
-    .to_string();
-    assert!(error.contains("recovered_live_service_jobs=4"));
-    assert!(error.contains("service_cap=3"));
-    assert!(error.contains("global_capacity=4"));
-    assert!(error.contains("non_service_reserve=1"));
+    .unwrap();
+    assert_eq!(summary.recovered_running, 4);
+    assert_eq!(summary.started_pending, 0);
     for service in &services {
-        assert!(error.contains(&service.id));
         let record = RetainedQueueStore::get_queue_job_from_path(
             &state_dir.join("queue_runner.db"),
             &service.id,
@@ -7236,7 +7234,38 @@ async fn queue_runtime_recovery_rejects_live_services_above_reduced_capacity() {
     assert_eq!(background_record.state, "pending");
     assert_eq!(
         background_record.holding_reason.as_deref(),
-        Some("memory_pressure")
+        Some("concurrency_cap")
+    );
+
+    // With global room, service overcapacity no longer wedges finite work.
+    RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
+        &state_dir,
+        &message_queue_db,
+        0,
+        QueueAdmissionPolicy {
+            max_running_jobs: 8,
+            service_max_concurrent: 3,
+            ..QueueAdmissionPolicy::default()
+        },
+    )
+    .unwrap();
+    let background_record = RetainedQueueStore::get_queue_job_from_path(
+        &state_dir.join("queue_runner.db"),
+        &background.id,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(background_record.started_at.is_some());
+    let service_record = RetainedQueueStore::get_queue_job_from_path(
+        &state_dir.join("queue_runner.db"),
+        &pending_service.id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(service_record.state, "pending");
+    assert_eq!(
+        service_record.holding_reason.as_deref(),
+        Some("concurrency_cap")
     );
 
     for child in &mut children {

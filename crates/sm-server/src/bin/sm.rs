@@ -2928,6 +2928,9 @@ fn queue_quiet_age(job: &Value) -> Option<String> {
 
 fn queue_state_text(job: &Value) -> String {
     let state = json_string(job, "state");
+    if state == "running" && job["near_idle_since"].is_string() {
+        return format!("{state} · near-idle");
+    }
     queue_quiet_age(job)
         .map(|age| format!("{state} quiet {age}"))
         .unwrap_or(state)
@@ -2935,6 +2938,17 @@ fn queue_state_text(job: &Value) -> String {
 
 fn queue_quiet_lines(job: &Value) -> Vec<String> {
     let mut lines = Vec::new();
+    if job["state"] == "running" {
+        if let Some(since) = job["near_idle_since"].as_str() {
+            lines.push(format!(
+                "Slot: released, near-idle since {} ({}).",
+                sm_server::queue::quiet::local_time(since),
+                job["near_idle_rule"]
+                    .as_str()
+                    .unwrap_or("below configured CPU, GPU and memory thresholds")
+            ));
+        }
+    }
     if let Some(age) = queue_quiet_age(job) {
         lines.push(format!(
             "Quiet since {} ({age}): no CPU, GPU or log output. Holding {}.",
@@ -6146,6 +6160,19 @@ mod tests {
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn near_idle_cli_marks_released_slot_only_while_running() {
+        let mut job = json!({"state":"running", "near_idle_since":"2026-10-21T18:01:00Z", "near_idle_rule":"under 50% of a core, 10% GPU and 5 GiB for 30 min"});
+        assert_eq!(queue_state_text(&job), "running · near-idle");
+        let lines = queue_quiet_lines(&job);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("Slot: released, near-idle since "));
+        assert!(lines[0].ends_with("(under 50% of a core, 10% GPU and 5 GiB for 30 min)."));
+        job["state"] = json!("succeeded");
+        assert_eq!(queue_state_text(&job), "succeeded");
+        assert!(queue_quiet_lines(&job).is_empty());
+    }
 
     #[test]
     fn quiet_cli_status_and_list_clear_after_completion() {

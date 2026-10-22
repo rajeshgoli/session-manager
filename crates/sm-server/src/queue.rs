@@ -194,6 +194,8 @@ pub struct QueueJobFilters {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueueJobRecord {
+    #[serde(skip)]
+    pub near_idle_since: Option<String>,
     pub local_agent_id: Option<String>,
     pub quiet_alerted_at: Option<String>,
     pub id: String,
@@ -240,6 +242,16 @@ pub struct QueueJobRecord {
     pub stop_requested_at: Option<String>,
     /// The last signal sm sent to stop the job: `SIGTERM` or `SIGKILL`.
     pub stop_signal: Option<String>,
+}
+
+impl QueueJobRecord {
+    pub fn holds_slot(&self) -> bool {
+        holds_slot(&self.state, &self.job_type, self.near_idle_since.is_some())
+    }
+}
+
+fn holds_slot(state: &str, job_type: &str, near_idle: bool) -> bool {
+    state == "running" && job_type != shell::SHELL_JOB_TYPE && !near_idle
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -296,6 +308,7 @@ pub struct QueueRecoverySummary {
 
 #[derive(Debug, Clone)]
 struct QueueJobRuntimeRecord {
+    near_idle_since: Option<i64>,
     local_agent_id: Option<String>,
     local_binding_json: Option<String>,
     owner: Option<String>,
@@ -336,6 +349,12 @@ struct QueueJobRuntimeRecord {
     lane_rank: i64,
     /// The submitted argv as stored; a shell job's exact command (sm#2412).
     argv_json: Option<String>,
+}
+
+impl QueueJobRuntimeRecord {
+    fn holds_slot(&self) -> bool {
+        holds_slot(&self.state, &self.job_type, self.near_idle_since.is_some())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4543,6 +4562,13 @@ fn get_queue_job_runtime_conn(
     statement
         .query_row(params![job_id], |row| {
             Ok(QueueJobRuntimeRecord {
+                near_idle_since: crate::utilization::near_idle::since(
+                    Path::new(conn.path().unwrap_or("")),
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(2)?,
+                    &row.get::<_, String>(1)?,
+                    &row.get(5)?,
+                ),
                 local_agent_id: row.get(28)?,
                 local_binding_json: row.get(29)?,
                 owner: row.get(27)?,
@@ -4659,6 +4685,13 @@ fn list_queue_job_runtime_records_where_conn(
     let rows = statement
         .query_map(rusqlite::params_from_iter(finished_since), |row| {
             Ok(QueueJobRuntimeRecord {
+                near_idle_since: crate::utilization::near_idle::since(
+                    Path::new(conn.path().unwrap_or("")),
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(2)?,
+                    &row.get::<_, String>(1)?,
+                    &row.get(5)?,
+                ),
                 local_agent_id: row.get(28)?,
                 local_binding_json: row.get(29)?,
                 owner: row.get(27)?,
@@ -4764,26 +4797,6 @@ fn admit_pending_queue_jobs_conn(
         crate::managed_artifacts::queue::repair(conn, Some(message_queue_db_path)).err();
     if let Some(error) = &artifact_store_error {
         eprintln!("queue artifact repair deferred: {error:#}");
-    }
-    // Validate before clearing any existing holds: after a restart, preserved
-    // service processes may outnumber a newly lowered configuration.  In that
-    // state, admitting even one finite job would violate the configured global
-    // reserve for non-service work.
-    let running_jobs = list_queue_job_runtime_records_recent_conn(
-        conn,
-        &runtime_finished_since(admission_policy),
-    )?;
-    if let Err(error) =
-        ensure_service_capacity_reserve_before_admission(&running_jobs, admission_policy)
-    {
-        schedule_pending_queue_deadline_retry(
-            conn,
-            state_dir,
-            message_queue_db_path,
-            cancel_grace_seconds,
-            admission_policy,
-        )?;
-        return Err(error);
     }
     let requeued = conn.execute(
         "UPDATE queue_jobs SET holding_reason = NULL WHERE state = 'pending' AND holding_reason IS NOT NULL AND holding_reason NOT IN ('disk_space','thawing')",
@@ -4978,37 +4991,6 @@ fn admit_pending_queue_jobs_conn(
     Ok(summary)
 }
 
-fn schedule_pending_queue_deadline_retry(
-    conn: &Connection,
-    state_dir: &Path,
-    message_queue_db_path: &Path,
-    cancel_grace_seconds: u64,
-    admission_policy: QueueAdmissionPolicy,
-) -> Result<()> {
-    let retry_after_seconds = list_queue_job_runtime_records_recent_conn(
-        conn,
-        &runtime_finished_since(admission_policy),
-    )?
-    .iter()
-    .filter(|job| job.state == "pending")
-    .map(|job| artifact_aware_wait_remaining(conn, job))
-    .collect::<Result<Vec<_>>>()?
-    .into_iter()
-    .flatten()
-    .min()
-    .map(|seconds| seconds.max(1) as u64);
-    if let Some(seconds) = retry_after_seconds {
-        schedule_queue_admission_retry(
-            state_dir.to_path_buf(),
-            message_queue_db_path.to_path_buf(),
-            cancel_grace_seconds,
-            admission_policy,
-            seconds,
-        );
-    }
-    Ok(())
-}
-
 fn artifact_aware_wait_remaining(
     conn: &Connection,
     job: &QueueJobRuntimeRecord,
@@ -5091,8 +5073,8 @@ fn concurrency_cap_wait_detail(
         .iter()
         .filter(|other| {
             // Shell jobs take no slot, so they never hold another job back.
-            other.state == "running"
-                && other.job_type != shell::SHELL_JOB_TYPE
+            other.holds_slot()
+                && (!global || other.job_type != "review")
                 && (global || other.job_type == job.job_type)
         })
         .map(summary)
@@ -5114,6 +5096,7 @@ fn concurrency_cap_wait_detail(
             admission_policy.max_concurrent_jobs(&job.job_type) as i64
         },
         "running": running,
+        "near_idle": jobs.iter().filter(|other| other.state == "running" && other.near_idle_since.is_some()).map(summary).collect::<Vec<_>>(),
         "queued_ahead_count": ahead.len(),
         "queued_ahead": ahead.into_iter().take(5).map(summary).collect::<Vec<_>>(),
     })
@@ -5154,47 +5137,33 @@ pub fn concurrency_cap_wait_text(detail: &JsonValue) -> String {
             text.push_str(&format!(", {} more", ahead_count - shown));
         }
     }
+    let near_idle = names("near_idle");
+    if !near_idle.is_empty() {
+        text.push_str(&format!("; Near-idle, not holding slots: {near_idle}"));
+    }
     text
 }
 
-fn ensure_service_capacity_reserve_before_admission(
-    jobs: &[QueueJobRuntimeRecord],
-    admission_policy: QueueAdmissionPolicy,
-) -> Result<()> {
-    let global_capacity = usize::try_from(admission_policy.max_running_jobs)
-        .context("queue max_running_jobs must be a non-negative integer")?;
-    let service_capacity = admission_policy.service_max_concurrent;
-    if service_capacity >= global_capacity && service_capacity != 0 {
-        bail!(
-            "queue service capacity configuration is invalid before admission: \
-             service_cap={service_capacity} global_capacity={global_capacity}; \
-             service capacity must leave at least one non-service slot"
-        );
-    }
+pub(crate) fn publish_near_idle_slots(
+    queue_db: &Path,
+    slots: HashMap<String, crate::utilization::near_idle::ReleasedSlot>,
+) {
+    let _guard = QUEUE_ADMISSION_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    crate::utilization::near_idle::publish(queue_db, slots);
+}
 
-    let non_service_reserve = global_capacity.saturating_sub(service_capacity);
-    let recovered_service_ids = jobs
-        .iter()
-        .filter(|job| job.state == "running" && job.job_type == "service")
-        .map(|job| job.id.as_str())
-        .collect::<Vec<_>>();
-    let recovered_service_count = recovered_service_ids.len();
-    let preserves_service_cap = recovered_service_count <= service_capacity;
-    let preserves_global_reserve = recovered_service_count
-        .checked_add(non_service_reserve)
-        .is_some_and(|required_capacity| required_capacity <= global_capacity);
-    if preserves_service_cap && preserves_global_reserve {
-        return Ok(());
-    }
-
-    bail!(
-        "queue admission blocked: recovered live service occupancy violates configured capacity; \
-         recovered_live_service_jobs={recovered_service_count} \
-         service_cap={service_capacity} global_capacity={global_capacity} \
-         non_service_reserve={non_service_reserve} \
-         job_ids=[{}]. Recovered jobs were left unchanged and no pending job was admitted; \
-         reduce live service occupancy or raise the configuration before retrying recovery.",
-        recovered_service_ids.join(", ")
+pub(crate) fn request_near_idle_admission(settings: &crate::utilization::RecorderSettings) {
+    let Some(state_dir) = settings.queue_db_path.parent() else {
+        return;
+    };
+    schedule_queue_admission_retry(
+        state_dir.to_path_buf(),
+        settings.message_queue_db_path.clone(),
+        settings.cancel_grace_seconds,
+        settings.admission_policy,
+        0,
     );
 }
 
@@ -5789,7 +5758,7 @@ fn parse_linux_meminfo(text: &str) -> Option<(i64, i64)> {
 
 fn perf_has_finite_blockers(jobs: &[QueueJobRuntimeRecord]) -> bool {
     jobs.iter()
-        .any(|job| job.state == "running" && matches!(job.job_type.as_str(), "tests" | "review"))
+        .any(|job| job.holds_slot() && matches!(job.job_type.as_str(), "tests" | "review"))
 }
 
 /// A running job is being displaced, or is a background job sm is already
@@ -5832,7 +5801,7 @@ fn displace_background_for_perf_conn(
         // The owner started a forced run, or pinned one, on purpose; perf
         // waits instead.
         .filter(|job| {
-            job.state == "running"
+            job.holds_slot()
                 && job.job_type == "background"
                 && job.owner_forced_at.is_none()
                 && !pinned.contains_key(&job.id)
@@ -5938,7 +5907,7 @@ fn ranked_queue_job_runtime_records_conn(
 fn running_queue_job_count(jobs: &[QueueJobRuntimeRecord], job_type: Option<&str>) -> usize {
     jobs.iter()
         .filter(|job| {
-            job.state == "running"
+            job.holds_slot()
                 && match job_type {
                     Some(expected) => job.job_type == expected,
                     // Review runs on its own budget; shell jobs were found
@@ -6144,9 +6113,9 @@ fn perf_blocked_by_tests_after_perf(jobs: &[QueueJobRuntimeRecord]) -> bool {
         })
         .min_by_key(|(elapsed, _)| *elapsed);
     matches!(latest, Some((_, "perf")))
-        && jobs.iter().any(|job| {
-            job.job_type == "tests" && matches!(job.state.as_str(), "pending" | "running")
-        })
+        && jobs
+            .iter()
+            .any(|job| job.job_type == "tests" && (job.state == "pending" || job.holds_slot()))
 }
 
 enum QueueChild {
@@ -8356,7 +8325,7 @@ fn queue_start_check(
         }
         for perf in jobs
             .iter()
-            .filter(|other| other.state == "running" && other.job_type == "perf")
+            .filter(|other| other.holds_slot() && other.job_type == "perf")
         {
             warnings.push(format!(
                 "A perf job is running ({}). Starting now shares the machine with its measurement.",
@@ -8479,7 +8448,7 @@ pub fn queue_hold_explanation(
     // Shell jobs take no slot, so they never hold another job back.
     let running: Vec<_> = jobs
         .iter()
-        .filter(|j| j.state == "running" && j.id != job.id && j.job_type != shell::SHELL_JOB_TYPE)
+        .filter(|j| j.holds_slot() && j.id != job.id)
         .collect();
     let perf = jobs
         .iter()
@@ -8547,14 +8516,18 @@ pub fn queue_hold_explanation(
         ),
         "concurrency_cap" => {
             let global = job.job_type != "review" && running.iter().filter(|j|j.job_type != "review").count() as i64 >= policy.max_running_jobs;
-            blockers = running.iter().copied().filter(|j| global || j.job_type == job.job_type).collect();
+            blockers = running.iter().copied().filter(|j| if global { j.job_type != "review" } else { j.job_type == job.job_type }).collect();
             let limit = if global { format!("global limit of {} running jobs", policy.max_running_jobs) }
                 else { format!("{} limit of {} running jobs", job.job_type, policy.max_concurrent_jobs(&job.job_type)) };
             let mut detail = if blockers.is_empty() {
                 format!("The scheduler reports the {limit}, but no matching running jobs are present in the latest snapshot. Awaiting the next scheduler pass.")
             } else {
-                format!("Waiting for an available slot ({limit}). Currently running: {}.", names(&blockers))
+                format!("Waiting for an available slot ({limit}; {} held). Holding slots: {}.", blockers.len(), names(&blockers))
             };
+            let near_idle: Vec<_> = jobs.iter().filter(|j| j.state == "running" && j.near_idle_since.is_some()).collect();
+            if !near_idle.is_empty() {
+                detail.push_str(&format!(" Near-idle, not holding slots: {}.", names(&near_idle)));
+            }
             let ahead: Vec<&QueueJobRecord> = jobs
                 .iter()
                 .filter(|j| j.state == "pending" && j.job_type == job.job_type && (&j.queued_at, &j.id) < (&job.queued_at, &job.id))
@@ -8661,6 +8634,7 @@ pub fn queue_hold_explanation(
         "estimated_wait_seconds": estimated_wait_seconds,
         "max_wait_seconds": job.max_wait_seconds,
         "wait_remaining_seconds": wait_remaining_seconds,
+        "near_idle": jobs.iter().filter(|j| j.state == "running" && j.near_idle_since.is_some()).map(|j| serde_json::json!({"id":j.id,"label":j.label,"type":j.job_type})).collect::<Vec<_>>(),
         "blocking_jobs": blockers.iter().map(|j| serde_json::json!({"id":j.id,"label":j.label,"type":j.job_type,"state":j.state})).collect::<Vec<_>>()
     }))
 }
@@ -9672,10 +9646,9 @@ pub(crate) fn list_queue_jobs_conn(
         }
         Err(error) => return Err(error.into()),
     };
-    let rows = statement.query_map(
-        rusqlite::params_from_iter(values),
-        queue_job_record_from_row,
-    )?;
+    let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+        queue_job_record_from_row(row, conn)
+    })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
@@ -9716,7 +9689,7 @@ fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJob
         Err(error) => return Err(error.into()),
     };
     statement
-        .query_row(params![job_id], queue_job_record_from_row)
+        .query_row(params![job_id], |row| queue_job_record_from_row(row, conn))
         .optional()
         .map_err(Into::into)
 }
@@ -9816,7 +9789,10 @@ fn queue_job_stop_projection(conn: &Connection) -> Result<&'static str> {
     })
 }
 
-fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJobRecord> {
+fn queue_job_record_from_row(
+    row: &rusqlite::Row<'_>,
+    conn: &Connection,
+) -> rusqlite::Result<QueueJobRecord> {
     let argv_json: Option<String> = row.get(6)?;
     let argv = match argv_json
         .as_deref()
@@ -9833,6 +9809,14 @@ fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJ
         None => None,
     };
     Ok(QueueJobRecord {
+        near_idle_since: crate::utilization::near_idle::since(
+            Path::new(conn.path().unwrap_or("")),
+            &row.get::<_, String>(0)?,
+            &row.get::<_, String>(13)?,
+            &row.get::<_, String>(1)?,
+            &row.get(16)?,
+        )
+        .map(crate::utilization::quiet::timestamp),
         local_agent_id: row.get(28)?,
         id: row.get(0)?,
         job_type: row.get(1)?,
@@ -10175,13 +10159,13 @@ mod tests {
             300,
         )
         .unwrap();
-        // A service cap that leaves no slot for other work fails the pass.
-        let invalid = QueueAdmissionPolicy {
-            max_running_jobs: 1,
-            service_max_concurrent: 1,
-            ..QueueAdmissionPolicy::default()
-        };
-        assert!(RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(&state_dir,&state_dir.join("messages.db"),0,invalid).is_err());
+        // An admission failure is retried and explained without needing an
+        // invalid policy (service occupancy no longer aborts admission).
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute("UPDATE queue_jobs SET holding_reason='concurrency_cap'", [])
+            .unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_clear AFTER UPDATE OF holding_reason ON queue_jobs WHEN NEW.holding_reason IS NULL BEGIN SELECT RAISE(FAIL, 'injected admission failure'); END;").unwrap();
+        assert!(RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(&state_dir,&state_dir.join("messages.db"),0,QueueAdmissionPolicy::default()).is_err());
         assert!(queue_admission_retries()
             .lock()
             .unwrap()
@@ -10195,7 +10179,7 @@ mod tests {
         assert!(detail["error"]
             .as_str()
             .unwrap()
-            .contains("service capacity"));
+            .contains("injected admission failure"));
         let explanation =
             queue_hold_explanation(&held, &[], QueueAdmissionPolicy::default()).unwrap();
         assert_eq!(
@@ -10205,7 +10189,7 @@ mod tests {
         assert!(explanation["detail"]
             .as_str()
             .unwrap()
-            .contains("service capacity"));
+            .contains("injected admission failure"));
         drop(conn);
         std::fs::remove_dir_all(state_dir).unwrap();
     }
@@ -10932,6 +10916,7 @@ mod tests {
         let state_dir = unique_temp_path("queue-ended-reasons");
         let base = create_test_job(&state_dir, "background", "job");
         let with = |state: &str| QueueJobRecord {
+            near_idle_since: None,
             local_agent_id: None,
             state: state.into(),
             queued_at: "2026-09-28T10:00:00Z".into(),
@@ -13163,7 +13148,7 @@ mod tests {
             admit_pending_queue_jobs_conn(&conn, &dir, &messages, 0, policy, true).unwrap();
         assert_eq!(summary.started, 0);
         assert!(summary.retry_after_seconds.is_some());
-        schedule_pending_queue_deadline_retry(&conn, &dir, &messages, 0, policy).unwrap();
+        assert!(queue_admission_retries().lock().unwrap().contains_key(&dir));
         release_queue_admission_retry(&dir);
         assert!(
             RetainedQueueStore::start_check_in_state_dir(&dir, &pending.id, policy, |_| None)
@@ -13274,6 +13259,7 @@ mod tests {
         )
         .unwrap();
         let job = QueueJobRuntimeRecord {
+            near_idle_since: None,
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
@@ -13420,6 +13406,7 @@ mod tests {
     #[test]
     fn queue_hold_context_names_other_jobs_and_explains_global_and_type_gates() {
         let record = |id: &str, kind: &str, state: &str, reason: Option<&str>| QueueJobRecord {
+            near_idle_since: None,
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
@@ -13626,6 +13613,7 @@ mod tests {
     #[test]
     fn queue_completion_without_exit_receipt_is_explicitly_non_evidence() {
         let job = QueueJobRuntimeRecord {
+            near_idle_since: None,
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
@@ -13691,6 +13679,7 @@ mod tests {
         let log_path = unique_temp_path("completion-log");
         fs::write(&log_path, "long test output that belongs only in the log\n").unwrap();
         let job = QueueJobRuntimeRecord {
+            near_idle_since: None,
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
@@ -13762,6 +13751,7 @@ mod tests {
         )
         .unwrap();
         let job = QueueJobRuntimeRecord {
+            near_idle_since: None,
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
@@ -13840,6 +13830,7 @@ mod tests {
         )));
         assert!(!wrapper.contains("source \"$1\""));
         let job = QueueJobRuntimeRecord {
+            near_idle_since: None,
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
@@ -13894,6 +13885,7 @@ mod tests {
     #[test]
     fn zero_timeout_never_expires() {
         let mut job = QueueJobRuntimeRecord {
+            near_idle_since: None,
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,
@@ -14135,7 +14127,7 @@ mod tests {
     }
 
     #[test]
-    fn service_overcapacity_still_schedules_pending_wait_deadline() {
+    fn service_overcapacity_blocks_only_new_services() {
         let state_dir = unique_temp_path("service-overcapacity-deadline");
         let create_job = |job_type: &str, label: &str| {
             RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
@@ -14162,9 +14154,17 @@ mod tests {
         };
         let first_service = create_job("service", "first service");
         let second_service = create_job("service", "second service");
-        let _pending = create_job("background", "pending finite job");
+        let third_service = create_job("service", "third service");
+        let fourth_service = create_job("service", "fourth service");
+        let pending = create_job("background", "pending finite job");
+        let pending_service = create_job("service", "pending service");
         let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
-        for id in [&first_service.id, &second_service.id] {
+        for id in [
+            &first_service.id,
+            &second_service.id,
+            &third_service.id,
+            &fourth_service.id,
+        ] {
             conn.execute(
                 "UPDATE queue_jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
                 params![id, now_rfc3339()],
@@ -14178,14 +14178,27 @@ mod tests {
             &state_dir.join("messages.db"),
             0,
             QueueAdmissionPolicy {
-                max_running_jobs: 3,
-                service_max_concurrent: 1,
+                max_running_jobs: 8,
+                service_max_concurrent: 2,
                 ..QueueAdmissionPolicy::default()
             },
             true,
         );
 
-        assert!(result.is_err());
+        assert_eq!(result.unwrap().started, 1);
+        assert!(get_queue_job_conn(&conn, &pending.id)
+            .unwrap()
+            .unwrap()
+            .started_at
+            .is_some());
+        assert_eq!(
+            get_queue_job_conn(&conn, &pending_service.id)
+                .unwrap()
+                .unwrap()
+                .holding_reason
+                .as_deref(),
+            Some("concurrency_cap")
+        );
         assert!(queue_admission_retries()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -14256,6 +14269,261 @@ mod tests {
         release_queue_admission_retry(&state_dir);
         drop(conn);
         fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn near_idle_slots_admit_background_and_wake_overshoot_starts_nothing() {
+        let dir = unique_temp_path("near-idle-admission");
+        let mut running = Vec::new();
+        for n in 0..9 {
+            let kind = if n < 6 { "background" } else { "tests" };
+            let job = pending_job(&dir, kind, &format!("watcher-{n}"));
+            if n < 8 {
+                running.push(job);
+            }
+        }
+        let pending = pending_job(&dir, "background", "finite-compute");
+        let conn = open_queue_jobs_connection(&dir.join("queue_runner.db")).unwrap();
+        for job in &running {
+            conn.execute(
+                "UPDATE queue_jobs SET state='running',started_at=?2 WHERE id=?1",
+                params![job.id, now_rfc3339()],
+            )
+            .unwrap();
+        }
+        let policy = QueueAdmissionPolicy {
+            max_running_jobs: 8,
+            ..QueueAdmissionPolicy::default()
+        };
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        assert_eq!(
+            next_admissible_queue_job_id_conn(
+                &conn,
+                &jobs,
+                policy,
+                &mut QueueAdmissionSummary::default()
+            )
+            .unwrap(),
+            None
+        );
+        let slots = jobs
+            .iter()
+            .filter(|j| j.state == "running" && j.job_type == "background")
+            .map(|j| {
+                (
+                    j.id.clone(),
+                    crate::utilization::near_idle::ReleasedSlot {
+                        since: 0,
+                        started_at: j.started_at.clone(),
+                    },
+                )
+            })
+            .collect();
+        publish_near_idle_slots(&dir.join("queue_runner.db"), slots);
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        assert_eq!(running_queue_job_count(&jobs, None), 2);
+        assert_eq!(running_queue_job_count(&jobs, Some("background")), 0);
+        assert_eq!(
+            next_admissible_queue_job_id_conn(
+                &conn,
+                &jobs,
+                policy,
+                &mut QueueAdmissionSummary::default()
+            )
+            .unwrap(),
+            Some(pending.id.clone())
+        );
+        let public = list_queue_jobs_conn(&conn, QueueJobFilters::default()).unwrap();
+        let mut held = public.iter().find(|j| j.id == pending.id).unwrap().clone();
+        held.holding_reason = Some("concurrency_cap".into());
+        // Force a tight cap to inspect blocker text without starting work.
+        let explanation = queue_hold_explanation(
+            &held,
+            &public,
+            QueueAdmissionPolicy {
+                max_running_jobs: 2,
+                ..policy
+            },
+        )
+        .unwrap();
+        assert_eq!(explanation["blocking_jobs"].as_array().unwrap().len(), 2);
+        assert_eq!(explanation["near_idle"].as_array().unwrap().len(), 6);
+        assert!(explanation["detail"]
+            .as_str()
+            .unwrap()
+            .contains("2 held). Holding slots:"));
+        assert!(explanation["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Near-idle, not holding slots:"));
+        let snapshot = concurrency_cap_wait_detail(
+            jobs.iter().find(|j| j.id == pending.id).unwrap(),
+            &jobs,
+            QueueAdmissionPolicy {
+                max_running_jobs: 2,
+                ..policy
+            },
+        );
+        assert_eq!(snapshot["running"].as_array().unwrap().len(), 2);
+        assert!(concurrency_cap_wait_text(&snapshot).contains("Near-idle, not holding slots:"));
+        // All six wake, and another job is already running: no eviction.
+        publish_near_idle_slots(&dir.join("queue_runner.db"), HashMap::new());
+        conn.execute("UPDATE queue_jobs SET state='running',started_at=?1 WHERE state='pending' AND type='tests'", [now_rfc3339()]).unwrap();
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        assert_eq!(running_queue_job_count(&jobs, None), 9);
+        let summary =
+            admit_pending_queue_jobs_conn(&conn, &dir, &dir.join("messages.db"), 0, policy, true)
+                .unwrap();
+        assert_eq!(summary.started, 0);
+        assert_eq!(
+            running_queue_job_count(&list_queue_job_runtime_records_conn(&conn).unwrap(), None),
+            9
+        );
+        release_queue_admission_retry(&dir);
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn near_idle_perf_lifts_pause_and_wake_restores_it_without_stopping_work() {
+        let dir = unique_temp_path("near-idle-perf-wake");
+        let perf = pending_job(&dir, "perf", "idle-perf");
+        let first = pending_job(&dir, "background", "first-compute");
+        let conn = open_queue_jobs_connection(&dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET state='running',started_at=?2 WHERE id=?1",
+            params![perf.id, now_rfc3339()],
+        )
+        .unwrap();
+        let perf = get_queue_job_conn(&conn, &perf.id).unwrap().unwrap();
+        publish_near_idle_slots(
+            &dir.join("queue_runner.db"),
+            HashMap::from([(
+                perf.id.clone(),
+                crate::utilization::near_idle::ReleasedSlot {
+                    since: 0,
+                    started_at: perf.started_at.clone(),
+                },
+            )]),
+        );
+        let policy = QueueAdmissionPolicy::default();
+        let summary =
+            admit_pending_queue_jobs_conn(&conn, &dir, &dir.join("messages.db"), 0, policy, true)
+                .unwrap();
+        assert_eq!(summary.started, 1);
+        assert!(get_queue_job_conn(&conn, &first.id)
+            .unwrap()
+            .unwrap()
+            .started_at
+            .is_some());
+        publish_near_idle_slots(&dir.join("queue_runner.db"), HashMap::new());
+        let second = pending_job(&dir, "background", "second-compute");
+        let summary =
+            admit_pending_queue_jobs_conn(&conn, &dir, &dir.join("messages.db"), 0, policy, true)
+                .unwrap();
+        assert_eq!(summary.started, 0);
+        assert_eq!(
+            get_queue_job_conn(&conn, &second.id)
+                .unwrap()
+                .unwrap()
+                .holding_reason
+                .as_deref(),
+            Some("perf_running")
+        );
+        assert_eq!(
+            get_queue_job_conn(&conn, &first.id).unwrap().unwrap().state,
+            "running"
+        );
+        RetainedQueueStore::cancel_queue_job_in_state_dir(
+            &dir,
+            &dir.join("messages.db"),
+            &first.id,
+            0,
+            policy,
+            false,
+        )
+        .unwrap();
+        release_queue_admission_retry(&dir);
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn near_idle_finite_jobs_do_not_block_perf_or_get_displaced() {
+        let dir = unique_temp_path("near-idle-perf-blockers");
+        let mut finite = Vec::new();
+        for kind in ["tests", "review", "background"] {
+            finite.push(pending_job(&dir, kind, kind));
+        }
+        let perf = pending_job(&dir, "perf", "pending-perf");
+        let conn = open_queue_jobs_connection(&dir.join("queue_runner.db")).unwrap();
+        for job in &finite {
+            conn.execute(
+                "UPDATE queue_jobs SET state='running',started_at=?2 WHERE id=?1",
+                params![job.id, now_rfc3339()],
+            )
+            .unwrap();
+        }
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        assert!(perf_has_finite_blockers(&jobs));
+        publish_near_idle_slots(
+            &dir.join("queue_runner.db"),
+            jobs.iter()
+                .filter(|j| j.state == "running")
+                .map(|j| {
+                    (
+                        j.id.clone(),
+                        crate::utilization::near_idle::ReleasedSlot {
+                            since: 0,
+                            started_at: j.started_at.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let mut jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        assert!(!perf_has_finite_blockers(&jobs));
+        assert!(!displace_background_for_perf_conn(
+            &conn,
+            &jobs,
+            &dir.join("messages.db"),
+            0,
+            QueueAdmissionPolicy::default()
+        )
+        .unwrap());
+        // A finished perf makes pending tests get a turn; near-idle running tests do not.
+        let mut previous = jobs.iter().find(|j| j.id == perf.id).unwrap().clone();
+        previous.id = "previous-perf".into();
+        previous.state = "succeeded".into();
+        previous.finished_at = Some(now_rfc3339());
+        jobs.push(previous);
+        assert!(!perf_blocked_by_tests_after_perf(&jobs));
+        let test = jobs.iter_mut().find(|j| j.job_type == "tests").unwrap();
+        test.state = "pending".into();
+        assert!(perf_blocked_by_tests_after_perf(&jobs));
+        publish_near_idle_slots(&dir.join("queue_runner.db"), HashMap::new());
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn newly_near_idle_recorder_requests_an_admission_retry() {
+        let dir = unique_temp_path("near-idle-retry");
+        let settings = crate::utilization::RecorderSettings {
+            near_idle: Default::default(),
+            admission_policy: Default::default(),
+            cancel_grace_seconds: 0,
+            db_path: dir.join("utilization.db"),
+            queue_db_path: dir.join("queue_runner.db"),
+            interval: StdDuration::from_secs(5),
+            retention_days: 1,
+            quiet_minutes: 10,
+            quiet_alert_repeat_minutes: 120,
+            message_queue_db_path: dir.join("messages.db"),
+        };
+        request_near_idle_admission(&settings);
+        assert!(queue_admission_retries().lock().unwrap().contains_key(&dir));
+        release_queue_admission_retry(&dir);
     }
 
     #[test]
@@ -15101,6 +15369,7 @@ mod tests {
         let recent_started_at = python_naive_timestamp(now_local - Duration::seconds(30));
         let old_started_at = python_naive_timestamp(now_local - Duration::seconds(300));
         let mut job = QueueJobRuntimeRecord {
+            near_idle_since: None,
             stop_grace_seconds: None,
             stop_requested_at: None,
             stop_signal: None,

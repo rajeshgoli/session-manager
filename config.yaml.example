@@ -448,6 +448,18 @@ queue_runner:
   max_running_jobs: 2
   perf_cooldown_seconds: 30
   cancel_grace_seconds: 10
+  # A sampled near-idle job keeps running but releases its job-count slots.
+  # Memory/process guards still cover it. Disable to count every job again.
+  near_idle:
+    enabled: true
+    minutes: 30
+    cpu_percent: 50       # percent of ONE core, averaged over the window
+    gpu_percent: 10
+    memory_gib: 5        # every footprint (RSS fallback) must be below this
+    wake_minutes: 5
+    wake_cpu_percent: 100
+    wake_gpu_percent: 20
+    wake_memory_gib: 10  # a single reading above this reclaims the slot
   memory:
     # Exclusive perf admission/runtime reserve. macOS always keeps at least 8 GiB.
     min_free_bytes: 8589934592

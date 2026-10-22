@@ -18,7 +18,7 @@ export function QueuePage() {
   const now = useNow(5000);
   if (!queue) return html`<div class="content">${errorText(error) || 'Loading queue…'}</div>`;
   return html`<div class="content queue-page">${errorText(error)}
-    <div class="q-tiles">${['review', 'tests', 'background', 'perf', 'service'].map((type) => {
+    <div class="q-tiles"><div class="q-card"><span class="q-label">slots held</span><strong>${queue.slots?.running ?? '—'} <small>of ${queue.slots?.max ?? '—'}</small></strong></div>${['review', 'tests', 'background', 'perf', 'service'].map((type) => {
       const slot = queue.slots?.by_type?.[type];
       const waiting = queue.queued.filter((job) => job.type === type).length;
       return html`<div class="q-card"><span class="q-label">${type}</span><strong>${slot?.running ?? '—'} <small>of ${slot?.max ?? '—'}</small></strong>${waiting ? html`<span class="amber">${waiting} waiting</span>` : null}</div>`;
@@ -181,6 +181,7 @@ function JobRowButton({ job, now, anchor = false, color = null }) {
       : html`<span class="q-job-title">${job.position ? `${job.position}. ` : ''}<${JobName} job=${job} color=${color} /><small>${job.type} · ${jobAgentLabel(job)}</small></span>`}
     <span class="q-timeline">${timelineSegments(job, now).map((s) => html`<i class=${s.kind} style=${`left:${s.left}%;width:${s.width}%`}></i>`)}</span>
     <span class=${job.quiet_since ? 'red' : ''}>${job.state === 'running' ? `${age(job.started_at, now)}${job.timeout_seconds ? ` of ${duration(job.timeout_seconds)}` : " · no time limit"}` : `${age(job.queued_at, now)} waited`}
+      ${job.near_idle_since ? html`<span class="link-chip" title=${`Near-idle since ${clock(job.near_idle_since)}`}>near-idle · no slot</span>` : null}
       ${job.quiet_since ? ` · quiet ${age(job.quiet_since, now)}` : job.low_cpu ? html`<span class="muted"> · low CPU</span>` : ''}
       ${job.state === 'pending' && deadline < 21600000 && Number.isFinite(deadline) ? ` · gives up in ${duration(deadline / 1000)}` : ''}
       ${job.state === 'running' ? html`<${UsageLine} job=${job} />` : null}</span>

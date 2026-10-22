@@ -388,6 +388,9 @@ mod tests {
         let messages = dir.join("unavailable");
         std::fs::create_dir_all(&messages).unwrap(); // Opening a directory as SQLite fails.
         let settings = RecorderSettings {
+            near_idle: Default::default(),
+            admission_policy: Default::default(),
+            cancel_grace_seconds: 0,
             db_path: dir.join("samples.db"),
             queue_db_path: dir.join("queue_runner.db"),
             message_queue_db_path: messages.clone(),
@@ -482,6 +485,9 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let settings = RecorderSettings {
+            near_idle: Default::default(),
+            admission_policy: Default::default(),
+            cancel_grace_seconds: 0,
             db_path: PathBuf::new(),
             queue_db_path: PathBuf::from("quiet-replay"),
             interval: Duration::from_secs(5),

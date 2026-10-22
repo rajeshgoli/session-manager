@@ -225,6 +225,7 @@ impl AppConfig {
     }
 
     fn validate_queue_runner_capacity(&self) -> Result<()> {
+        self.queue_runner.near_idle.validate()?;
         if self.queue_runner.memory.min_free_bytes <= 0 {
             bail!("queue_runner.memory.min_free_bytes must be greater than zero");
         }
@@ -1625,6 +1626,8 @@ fn default_codex_observability_db_path() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct QueueRunnerConfig {
+    #[serde(default)]
+    pub near_idle: QueueNearIdleConfig,
     #[serde(default = "default_quiet_minutes")]
     pub quiet_minutes: u64,
     #[serde(default = "default_quiet_alert_repeat_minutes")]
@@ -1645,6 +1648,55 @@ pub struct QueueRunnerConfig {
     pub types: QueueRunnerTypesConfig,
     #[serde(skip)]
     pub configured: bool,
+}
+
+/// Sample-based release of job-count capacity; resource guards stay in force.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct QueueNearIdleConfig {
+    pub enabled: bool,
+    pub minutes: u64,
+    pub cpu_percent: f64,
+    pub gpu_percent: f64,
+    pub memory_gib: f64,
+    pub wake_minutes: u64,
+    pub wake_cpu_percent: f64,
+    pub wake_gpu_percent: f64,
+    pub wake_memory_gib: f64,
+}
+
+impl Default for QueueNearIdleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            minutes: 30,
+            cpu_percent: 50.0,
+            gpu_percent: 10.0,
+            memory_gib: 5.0,
+            wake_minutes: 5,
+            wake_cpu_percent: 100.0,
+            wake_gpu_percent: 20.0,
+            wake_memory_gib: 10.0,
+        }
+    }
+}
+
+impl QueueNearIdleConfig {
+    fn validate(&self) -> Result<()> {
+        if self.wake_minutes < 1 || self.minutes < self.wake_minutes {
+            bail!("queue_runner.near_idle.minutes must be >= wake_minutes >= 1");
+        }
+        for (key, entry, wake) in [
+            ("cpu_percent", self.cpu_percent, self.wake_cpu_percent),
+            ("gpu_percent", self.gpu_percent, self.wake_gpu_percent),
+            ("memory_gib", self.memory_gib, self.wake_memory_gib),
+        ] {
+            if !entry.is_finite() || !wake.is_finite() || entry < 0.0 || entry >= wake {
+                bail!("queue_runner.near_idle.{key} must be finite, non-negative and below wake_{key}");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1817,6 +1869,7 @@ fn default_quiet_alert_repeat_minutes() -> u64 {
 impl Default for QueueRunnerConfig {
     fn default() -> Self {
         Self {
+            near_idle: QueueNearIdleConfig::default(),
             state_dir: default_queue_runner_state_dir(),
             quiet_minutes: default_quiet_minutes(),
             quiet_alert_repeat_minutes: default_quiet_alert_repeat_minutes(),
@@ -1896,6 +1949,7 @@ fn queue_runner_config_for_state_file(state_file: &str) -> QueueRunnerConfig {
         return QueueRunnerConfig::default();
     }
     QueueRunnerConfig {
+        near_idle: QueueNearIdleConfig::default(),
         state_dir: queue_runner_state_dir_for_state_file(state_file)
             .to_string_lossy()
             .into_owned(),
@@ -4090,6 +4144,43 @@ queue_runner:
             .unwrap_err()
             .to_string()
             .contains("cannot consume the entire global queue capacity"));
+    }
+
+    #[test]
+    fn near_idle_defaults_partial_config_and_validation() {
+        let config = AppConfig::default();
+        assert_eq!(
+            config.queue_runner.near_idle,
+            QueueNearIdleConfig::default()
+        );
+        let raw: RawConfig =
+            serde_yaml::from_str("queue_runner:\n  near_idle:\n    enabled: false\n").unwrap();
+        let config = AppConfig::from(raw);
+        assert!(!config.queue_runner.near_idle.enabled);
+        assert_eq!(config.queue_runner.near_idle.minutes, 30);
+        assert!(config.validate_queue_runner_capacity().is_ok());
+        for (key, value) in [
+            ("minutes", "4"),
+            ("wake_minutes", "0"),
+            ("cpu_percent", "100"),
+            ("gpu_percent", "20"),
+            ("memory_gib", "10"),
+            ("wake_cpu_percent", "49"),
+            ("wake_gpu_percent", "9"),
+            ("wake_memory_gib", "4"),
+            ("cpu_percent", ".nan"),
+        ] {
+            let raw: RawConfig = serde_yaml::from_str(&format!(
+                "queue_runner:\n  near_idle:\n    {key}: {value}\n"
+            ))
+            .unwrap();
+            let error = AppConfig::from(raw)
+                .validate_queue_runner_capacity()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("queue_runner.near_idle"), "{key}: {error}");
+            assert!(error.contains(key), "{key}: {error}");
+        }
     }
 
     #[test]
