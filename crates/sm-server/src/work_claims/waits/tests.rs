@@ -383,3 +383,32 @@ fn handoff_moves_open_waits_to_the_successor() {
         ]
     );
 }
+
+#[test]
+fn restore_after_retire_reopens_waits_for_the_successor() {
+    let (store, _db) = new_store();
+    store
+        .open_wait(WAITER, &seat(TARGET), "hashes", at(450), at(0))
+        .unwrap();
+    // An older ended wait stays ended.
+    store
+        .open_wait(WAITER, &seat("holder01"), "old", at(450), at(1))
+        .unwrap();
+    store
+        .cancel_waits(WAITER, Some(&seat("holder01")), at(2))
+        .unwrap();
+    let before_retire = checks::format_time(OffsetDateTime::now_utc() - time::Duration::seconds(5));
+    store.end_claims_for_session(WAITER).unwrap();
+    assert!(store.open_waits().unwrap().is_empty());
+    store.reopen_retired_claims(WAITER, &before_retire).unwrap();
+    store.hand_off(WAITER, "succ0001", "far-2139").unwrap();
+    let open = store.open_waits().unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(
+        (
+            open[0].waiter_session_id.as_str(),
+            open[0].deliverable.as_str()
+        ),
+        ("succ0001", "hashes")
+    );
+}

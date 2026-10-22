@@ -1476,6 +1476,31 @@ async fn an_open_wait_silences_check_c_until_the_target_delivers() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(f.store().open_waits().unwrap().len(), 1);
+    // A stopped waiter gets nothing, so the awaited seat's send leaves its
+    // wait open.
+    let (_, body) = open_wait(&f, "asleep01", "other001", &eta(60)).await;
+    let (_, sent) = request(
+        &f.app,
+        "POST",
+        "/sessions/asleep01/input",
+        Some(send("other001")),
+    )
+    .await;
+    assert_eq!(sent["delivered"], false, "{sent}");
+    let open: Vec<String> = f
+        .store()
+        .open_waits()
+        .unwrap()
+        .into_iter()
+        .map(|w| w.id)
+        .collect();
+    assert!(
+        open.contains(&body["id"].as_str().unwrap().to_owned()),
+        "{open:?}"
+    );
+    f.store()
+        .cancel_waits("asleep01", None, time::OffsetDateTime::now_utc())
+        .unwrap();
     // The awaited seat's sm send ends the wait and empties waiting_on, the
     // only thing that held Check C back.
     request(

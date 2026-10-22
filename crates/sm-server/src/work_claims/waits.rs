@@ -493,6 +493,42 @@ pub(super) fn end_waits_of_waiter(conn: &Connection, waiter: &str, now: &str) ->
     Ok(())
 }
 
+/// Restore, or the handoff that follows an Auto PM retire: reopens the
+/// waiter's waits that its retire ended, those ended `waiter_retired` at or
+/// after `retired_at`, unless the same wait is open again. A reopened wait
+/// past its ETA ends as `expired` at the next sync pass.
+pub(super) fn reopen_retired_waits(
+    conn: &Connection,
+    waiter: &str,
+    retired_at: OffsetDateTime,
+    now: &str,
+) -> Result<()> {
+    let mut statement = conn.prepare(
+        "SELECT id, ended_at FROM agent_waits
+          WHERE waiter_session_id = ?1 AND end_reason = 'waiter_retired'",
+    )?;
+    let ended: Vec<(String, String)> = statement
+        .query_map(params![waiter], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, ended_at) in ended {
+        if parse_time(&ended_at).is_none_or(|ended| ended < retired_at) {
+            continue;
+        }
+        let reopened = conn.execute(
+            "UPDATE OR IGNORE agent_waits
+                SET ended_at = NULL, end_reason = NULL, end_message_id = NULL
+              WHERE id = ?1",
+            params![id],
+        )?;
+        if reopened == 1 {
+            if let Some(wait) = query_waits(conn, "WHERE id = ?1", params![id])?.pop() {
+                wait_event(conn, "wait.reopened", &wait, None, None, now)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn end_wait(
     conn: &Connection,
     wait: &AgentWait,

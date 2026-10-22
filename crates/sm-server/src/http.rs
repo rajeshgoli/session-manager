@@ -10988,7 +10988,11 @@ async fn send_session_input(
     let Some(result) = result else {
         return Err(ApiError::NotFound("Session not found"));
     };
-    agent_waits::deliver_on_send(&state, wait_sender.as_deref(), &session.id);
+    // A stopped or retired recipient neither got nor queued the text, so a
+    // wait it holds stays open (the batch path reports this as a failure).
+    if result.delivered || !matches!(result.status.as_str(), "stopped" | "retired" | "killed") {
+        agent_waits::deliver_on_send(&state, wait_sender.as_deref(), &session.id);
+    }
     let mut response = serde_json::to_value(result)?;
     if let Some(forwarded) = forwarded {
         response["forwarded"] = json!(forwarded);

@@ -1330,7 +1330,8 @@ impl WorkClaimStore {
 
     /// Restore (sm#1839, spec 1821 E3): reopens the claims the session's
     /// retire ended, those ended `retired` at or after `retired_at`, unless
-    /// another session holds the item now. Returns the claims reopened.
+    /// another session holds the item now, and the agent waits the retire
+    /// ended. Returns the claims reopened.
     pub fn reopen_retired_claims(
         &self,
         session_id: &str,
@@ -1387,6 +1388,7 @@ impl WorkClaimStore {
             )?;
             reopened.push(claim);
         }
+        waits::reopen_retired_waits(&tx, session_id, retired_at, &now)?;
         tx.commit()?;
         Ok(reopened)
     }
