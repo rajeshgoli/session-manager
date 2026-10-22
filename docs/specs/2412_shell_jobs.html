@@ -322,6 +322,7 @@ which needs --timeout and --cpu as well.</pre>
 <p><b>Reservation sizes.</b> They are now 16 GB and 8 GB, sized from last week's queue readings, where the first revision used 10 GB and 5 GB. You asked for numbers from data.</p>
 <p><b>Detached commands.</b> A command an agent detaches with <code>nohup … &amp;</code> is now traced to its agent, adopted at 1 GB and shown as a background job. The first revision called this out of reach. You asked whether the process tree could show it. It can, through the process group (see "Commands an agent detaches").</p>
 <p><b>Job type in the stop message.</b> The resubmit line now names <code>tests</code> only for known test runners and otherwise asks the agent to choose. The first revision defaulted to <code>background</code>, a guess you questioned.</p>
+<p><b>A queue job's <code>--memory</code> counts at its expected need, not in full (sm#2490).</b> Headroom used to subtract the whole unused part of every running job's <code>--memory</code>. On 2026-10-22 a job that declared 192 GB but sat at 29 GB (peak 39) left "0.0 GB to spare" with 170 GB free, and sm killed a shell command that the queue then admitted at once. A job now counts in full only for its first ten minutes; after that it counts at the larger of its peak and where its last 15 minutes' trend puts it 15 minutes ahead, never above what it declared. That day's headroom becomes about 138 GB. The stop message now names the free memory, the reserve and the jobs holding the most.</p>
 
 <hr class="appendix-divider">
 <h2>Appendices</h2>
