@@ -26,6 +26,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::owner_docs::{repo_name, validate_repo_slug};
 
 pub mod merge_holds;
+pub mod waits;
 pub mod worktrees;
 
 /// At most this many aliases per GraphQL call (about 20 KB of output).
@@ -37,7 +38,7 @@ pub const MESSAGE_CATEGORY: &str = "work_claim";
 
 // Bump when this initializer or its merge-hold, loose-worktree, or board
 // schema dependencies change. The marker is published with the whole schema.
-const WORK_CLAIMS_SCHEMA_VERSION: &str = "1";
+const WORK_CLAIMS_SCHEMA_VERSION: &str = "2";
 
 fn work_claims_schema_is_current(conn: &Connection) -> Result<bool> {
     if !table_exists(conn, "work_claims_meta")? {
@@ -77,6 +78,7 @@ pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
 
 fn init_work_claims_schema_in_transaction(conn: &Connection) -> Result<()> {
     merge_holds::init_schema(conn)?;
+    waits::init_schema(conn)?;
     worktrees::loose::init_schema(conn)?;
     crate::board::init_board_schema(conn)?;
     conn.execute_batch(
@@ -1305,7 +1307,8 @@ impl WorkClaimStore {
         Ok(ended)
     }
 
-    /// Retire or kill: ends every active claim of the session with `retired`.
+    /// Retire or kill: ends every active claim of the session with `retired`,
+    /// and its agent waits.
     pub fn end_claims_for_session(&self, session_id: &str) -> Result<usize> {
         let Some(mut conn) = self.open_existing()? else {
             return Ok(0);
@@ -1320,13 +1323,15 @@ impl WorkClaimStore {
         for claim in &claims {
             end_claim(&tx, claim, "retired", None, &now)?;
         }
+        waits::end_waits_of_waiter(&tx, session_id, &now)?;
         tx.commit()?;
         Ok(claims.len())
     }
 
     /// Restore (sm#1839, spec 1821 E3): reopens the claims the session's
     /// retire ended, those ended `retired` at or after `retired_at`, unless
-    /// another session holds the item now. Returns the claims reopened.
+    /// another session holds the item now, and the agent waits the retire
+    /// ended. Returns the claims reopened.
     pub fn reopen_retired_claims(
         &self,
         session_id: &str,
@@ -1383,14 +1388,15 @@ impl WorkClaimStore {
             )?;
             reopened.push(claim);
         }
+        waits::reopen_retired_waits(&tx, session_id, retired_at, &now)?;
         tx.commit()?;
         Ok(reopened)
     }
 
     /// Context handoff (sm#1651, Appendix G): re-point the predecessor's
-    /// active claims and worktree keeps to the successor in place, keeping
-    /// every other column, with one `claim.handed_off` event per claim and no
-    /// `[sm claim]` notice. Safe to repeat. Returns the claims moved.
+    /// active claims, worktree keeps and open agent waits to the successor in
+    /// place, keeping every other column, with one `claim.handed_off` event
+    /// per claim and no `[sm claim]` notice. Safe to repeat. Returns the claims moved.
     pub fn hand_off(
         &self,
         predecessor_id: &str,
@@ -1433,6 +1439,17 @@ impl WorkClaimStore {
             "UPDATE worktree_keeps SET session_id = ?2 WHERE session_id = ?1",
             params![predecessor_id, successor_id],
         )?;
+        // Open agent waits follow the work: the successor keeps waiting, and
+        // a wait on the predecessor now waits on the successor (#2477).
+        for column in ["waiter_session_id", "target_session_id"] {
+            tx.execute(
+                &format!(
+                    "UPDATE OR IGNORE agent_waits SET {column} = ?2
+                      WHERE {column} = ?1 AND ended_at IS NULL"
+                ),
+                params![predecessor_id, successor_id],
+            )?;
+        }
         tx.commit()?;
         Ok(claims.len())
     }
@@ -1536,6 +1553,9 @@ impl WorkClaimStore {
             SELECT l.repo, l.ticket_number FROM work_links l JOIN work_items p
                ON p.repo = l.repo AND p.number = l.pr_number
              WHERE p.state = 'open' OR p.merge_check = 'pending'
+            UNION
+            SELECT repo, number FROM agent_waits
+             WHERE ended_at IS NULL AND target_kind = 'ticket'
             ORDER BY 1, 2
             "#,
         )?;

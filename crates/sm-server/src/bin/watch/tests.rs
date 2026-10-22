@@ -738,6 +738,24 @@ fn queue_delivery_label_is_visible_even_when_the_job_is_in_history() {
 }
 
 #[test]
+fn agent_waits_count_by_kind_and_show_who_awaits() {
+    let obligation = json!({
+        "waiting_on":[
+            {"kind":"agent_wait", "id":"w1", "label":"far-2171 · hashes", "since":"2026-10-21T22:10:00Z"},
+            {"kind":"review", "id":"r", "label":"Review · repo #42", "since":"2026-10-21T22:10:00Z"}
+        ],
+        "awaited_by":[{"waiter_name":"far-2139", "for":"weights", "until_text":"Thu 22 Oct 05:30 UTC"}]
+    });
+    assert_eq!(
+        obligation_context(&obligation, &[], "a", false, 0),
+        vec![
+            "Waiting for 1 review and 1 agent wait",
+            "Awaited by far-2139 · weights · until Thu 22 Oct 05:30 UTC",
+        ]
+    );
+}
+
+#[test]
 fn obligations_do_not_repeat_visible_jobs_but_preserve_other_results() {
     let jobs = vec![job("j", "a", "running")];
     let single = json!({"waiting_on":[{"kind":"queue_job", "id":"j", "label":"unit tests", "since":"2026-09-10T10:00:00Z"}]});

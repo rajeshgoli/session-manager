@@ -59,6 +59,8 @@ enum Command {
     Usage(UsageArgs),
     Remind(RemindArgs),
     Wait(WaitArgs),
+    /// Record that you wait on another agent or ticket for a deliverable
+    Await(claims::waits::AwaitArgs),
     Spawn(SpawnArgs),
     /// Open, list, or retire plain login shells
     Shell(shell::ShellArgs),
@@ -1445,6 +1447,7 @@ fn run() -> Result<()> {
         }
         Command::MergeHold(args) => merge_holds::run(&client, args)?,
         Command::Ticket(args) => claims::run_ticket(&client, args)?,
+        Command::Await(args) => claims::waits::run_await(&client, args)?,
         Command::Pr(args) => claims::run_pr(&client, args)?,
         Command::Worktree(args) => claims::worktree::run_worktree(&client, args)?,
         Command::History(args) => history::run_history(&client, args)?,

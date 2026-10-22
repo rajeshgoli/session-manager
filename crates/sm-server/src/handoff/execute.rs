@@ -243,6 +243,10 @@ impl Brief {
 /// `every_session_id_column_is_classified` test.
 pub const MOVED_COLUMNS: &[(&str, &str)] = &[
     ("work_claims", "session_id"),
+    // A successor keeps its predecessor's waits, and a wait on the
+    // predecessor follows the work to the successor (#2477).
+    ("agent_waits", "waiter_session_id"),
+    ("agent_waits", "target_session_id"),
     ("worktree_keeps", "session_id"),
     ("message_queue", "target_session_id"),
     ("message_queue", "remind_cancel_on_reply_session_id"),

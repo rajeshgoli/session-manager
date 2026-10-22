@@ -141,11 +141,16 @@ fn obligation_context(
             .iter()
             .filter(|item| s(item, "kind") == "owner_review")
             .count();
-        let other = items.len() - jobs - reviews - owner_reviews;
+        let agent_waits = items
+            .iter()
+            .filter(|item| s(item, "kind") == "agent_wait")
+            .count();
+        let other = items.len() - jobs - reviews - owner_reviews - agent_waits;
         let counts: Vec<_> = [
             (jobs, "job"),
             (reviews, "review"),
             (owner_reviews, "owner review"),
+            (agent_waits, "agent wait"),
             (other, "result"),
         ]
         .into_iter()
@@ -171,6 +176,14 @@ fn obligation_context(
                 ));
             }
         }
+    }
+    for wait in array(obligation, "awaited_by") {
+        lines.push(format!(
+            "Awaited by {} · {} · until {}",
+            s(&wait, "waiter_name"),
+            s(&wait, "for"),
+            s(&wait, "until_text")
+        ));
     }
     lines
 }

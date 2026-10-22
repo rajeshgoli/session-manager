@@ -5,6 +5,7 @@
 use super::*;
 use crate::git_repo::{resolve_repo_slug, run_ok, DocTools, ProcessTools};
 
+pub(crate) mod waits;
 pub(crate) mod worktree;
 
 /// A refused claim: another live agent holds the item.

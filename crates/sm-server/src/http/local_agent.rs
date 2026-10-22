@@ -27,6 +27,10 @@ const SESSION: Policy = Policy {
     fields: &["session_id"],
     ..READ
 };
+const WAITER: Policy = Policy {
+    fields: &["waiter_session_id"],
+    ..READ
+};
 const OWN: Policy = Policy {
     own_path: true,
     ..READ
@@ -75,6 +79,7 @@ fn policy(method: &str, route: &str) -> Option<Policy> {
             | "/docs/{doc_id}"
             | "/docs/{doc_id}/{*rest}"
             | "/claims"
+            | "/claims/waits"
             | "/board"
             | "/merge-holds"
             | "/history"
@@ -112,6 +117,7 @@ fn policy(method: &str, route: &str) -> Option<Policy> {
             | "/sessions/input-batch"
             | "/humans/{identifier}/messages",
         ) => SENDER,
+        ("POST", "/claims/waits" | "/claims/waits/cancel") => WAITER,
         (
             "POST",
             "/docs" | "/board/links" | "/board/lanes" | "/review-requests/{request_id}/submit",

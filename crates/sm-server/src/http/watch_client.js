@@ -81,6 +81,10 @@
       return '<span class="' + (i.kind === 'owner_review' ? 'amb' : '') + '">' + e(i.label) +
         '</span> <span class="m">waiting ' + age(i.since, now) + '</span>';
     });
+    arr(v.awaited_by).forEach(function (w) {
+      lines.push('<span>Awaited by ' + e(w.waiter_name) + ' · ' + e(w['for']) +
+        '</span> <span class="m">until ' + e(w.until_text) + '</span>');
+    });
     arr(v.review_history).forEach(function (h) {
       lines.push('<span class="mt">' + e(repoName(h.repo)) + '#' + (h.pr_number || 0) +
         '</span> <span class="m">' + (h.landed_count || 0) + ' landed · ' + (h.request_count || 0) + ' requested</span>');

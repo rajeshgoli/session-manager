@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2477 — Let an agent record that it waits on another agent</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>2477 — Let an agent record that it waits on another agent</h1>
+<p class="sans"><small>Author: Claude Opus 5.5 <code>eed12fd4</code> · Ticket #2477 · 21 Oct 2026</small></p>
+
+<h2>Memo</h2>
+
+<p><b>I recommend one new command, <code>sm await</code>.</b> An agent runs it to say "I am blocked until that agent (or that ticket) delivers this, and I expect it by this time." While the wait is open, sm counts the agent as waiting, exactly as it already does when the agent waits on a queue job or a PR review. The idle reminder stops, and the agent list shows <i>Waiting for far-2171 · final weights · 3h</i>. The wait ends by itself when the awaited agent messages the waiter, the awaited ticket closes, the awaited agent retires, or the expected time passes. In the last three cases sm wakes the waiter with one message that says which. Nothing else in sm changes meaning.</p>
+
+<div class="vocab">
+<dl>
+<dt>Seat</dt><dd>One agent session that sm manages, e.g. <code>far-2139</code>.</dd>
+<dt>Claim</dt><dd>sm's record that a seat owns a ticket or PR, made by <code>sm ticket</code> or <code>sm pr</code>.</dd>
+<dt>Idle reminder</dt><dd>The message <code>[sm claim] Idle 33m, nothing pending. You hold: ticket #2139 (open).</code> sm sends it to a seat that has been idle for 30 minutes, holds an open claim, and is waiting on nothing. It repeats after each further 30 idle minutes that follow activity.</dd>
+<dt>Waiting-on list</dt><dd>sm's per-seat list of things the seat is blocked on: its queue jobs, its PR reviews, and its docs that wait for your review. A non-empty list is the only thing that stops the idle reminder today, and it is what turns the seat amber ("waiting") on the web and phone agent lists.</dd>
+<dt>Agent wait <i>(new)</i></dt><dd>An entry in the waiting-on list that says "this seat waits on that seat or that ticket for a named deliverable, until a stated time." Created by <code>sm await</code>.</dd>
+<dt>ETA</dt><dd>The time by which the waiter expects the deliverable. Every agent wait has one.</dd>
+</dl>
+</div>
+
+<h3>The problem</h3>
+<p>Seat <code>far-2139</code> holds #2139. Its next step needs the final model weights from #2171, which another seat is training on the GPU overnight. That seat promised to message <code>far-2139</code> with the file hashes around Thursday 05:00 UTC. Until then <code>far-2139</code> has nothing to do. sm sees an idle seat with an open claim and an empty waiting-on list, so every 30 minutes of quiet it sends "nothing pending." Each reply makes the seat active again, which re-arms the next reminder. The seat burns tokens on a false signal, and the agent list shows it as idle when it is in fact blocked.</p>
+<p>None of today's tools can say "blocked on that agent":</p>
+<table>
+<thead><tr><th style="width:28%">Tool</th><th>Why it does not cover this</th></tr></thead>
+<tbody>
+<tr><td><code>sm board after 2139 2171</code></td><td>Records that one ticket starts after another. It says nothing about a seat being blocked right now, and #2171 closing wakes nobody. It was already recorded in this case.</td></tr>
+<tr><td><code>sm status "Waiting for …"</code></td><td>Free text for you to read. sm does not interpret it.</td></tr>
+<tr><td><code>sm wait &lt;seat&gt; &lt;seconds&gt;</code></td><td>Holds the shell open until the other seat goes idle. Idle is not delivered: a training seat goes idle many times before the weights exist. It also blocks for at most the seconds given.</td></tr>
+<tr><td>Dummy queue job</td><td>Works, but it is a lie in the queue and holds a slot.</td></tr>
+</tbody>
+</table>
+
+<h3>How it works</h3>
+<figure>
+<svg viewBox="0 0 760 300" role="img" aria-label="Agent wait lifecycle">
+<style>
+ .bx{fill:var(--surface-2);stroke:var(--ink-3);stroke-width:1.2}
+ .op{fill:var(--surface-2);stroke:var(--orange);stroke-width:2}
+ .t{font:13px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink)}
+ .s{font:11.5px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink-2)}
+ .ar{stroke:var(--ink-2);stroke-width:1.3;fill:none;marker-end:url(#h)}
+</style>
+<defs><marker id="h" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--ink-2)"/></marker></defs>
+<rect class="bx" x="10" y="115" width="150" height="70" rx="6"/>
+<text class="t" x="22" y="140">sm await far-2171</text>
+<text class="s" x="22" y="158">--for "final weights"</text>
+<text class="s" x="22" y="174">--until 7h</text>
+<line class="ar" x1="160" y1="150" x2="205" y2="150"/>
+<rect class="op" x="207" y="95" width="180" height="110" rx="6"/>
+<text class="t" x="219" y="120">Open</text>
+<text class="s" x="219" y="140">In the waiting-on list</text>
+<text class="s" x="219" y="156">Idle reminder silent</text>
+<text class="s" x="219" y="172">Agent list: amber, "Waiting</text>
+<text class="s" x="219" y="188">for far-2171 · final weights"</text>
+<line class="ar" x1="387" y1="120" x2="455" y2="30"/>
+<line class="ar" x1="387" y1="135" x2="455" y2="85"/>
+<line class="ar" x1="387" y1="150" x2="455" y2="140"/>
+<line class="ar" x1="387" y1="165" x2="455" y2="195"/>
+<line class="ar" x1="387" y1="180" x2="455" y2="250"/>
+<rect class="bx" x="457" y="10" width="295" height="40" rx="5"/>
+<text class="t" x="467" y="28">Delivered: far-2171 messages far-2139</text>
+<text class="s" x="467" y="43">That message is the wake. sm adds nothing.</text>
+<rect class="bx" x="457" y="65" width="295" height="40" rx="5"/>
+<text class="t" x="467" y="83">Ticket closed (ticket waits only)</text>
+<text class="s" x="467" y="98">sm wakes the waiter: "#2171 closed"</text>
+<rect class="bx" x="457" y="120" width="295" height="40" rx="5"/>
+<text class="t" x="467" y="138">Awaited seat retired</text>
+<text class="s" x="467" y="153">sm wakes the waiter: "retired without messaging you"</text>
+<rect class="bx" x="457" y="175" width="295" height="40" rx="5"/>
+<text class="t" x="467" y="193">ETA passed</text>
+<text class="s" x="467" y="208">sm wakes the waiter: "passed its ETA"</text>
+<rect class="bx" x="457" y="230" width="295" height="40" rx="5"/>
+<text class="t" x="467" y="248">Cancelled by the waiter, or waiter retired</text>
+<text class="s" x="467" y="263">No message</text>
+</svg>
+<figcaption>Every way an agent wait ends. After it ends, the seat is an ordinary idle seat again, and the idle reminder resumes on its normal 30-minute clock.</figcaption>
+</figure>
+
+<p>A wait names either a <b>seat</b> or a <b>ticket</b>. Wait on a seat when a specific agent promised you something (the 2139 case). Wait on a ticket when you need it finished but do not care which agent finishes it; then a message from any seat that holds the ticket counts as delivery, and the ticket closing ends the wait too.</p>
+
+<h3>The 2139 case, end to end</h3>
+<pre><code>far-2139$ sm await far-2171 --for "#2171 end.pt and fitted.pkl hashes" --until 2026-10-22T05:30:00Z
+Waiting on far-2171 (4c1d2e3f) for "#2171 end.pt and fitted.pkl hashes" until Thu 22 Oct 05:30 UTC.</code></pre>
+<table>
+<thead><tr><th style="width:22%">When (UTC)</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>Wed 22:10</td><td><code>far-2139</code> runs the command above and goes idle. No idle reminders follow. On your phone it reads <i>Waiting for far-2171 · #2171 end.pt and fitted.pkl hashes · 2h</i>.</td></tr>
+<tr><td>Thu 04:52 <i>(good path)</i></td><td><code>far-2171</code> runs <code>sm send far-2139</code> with the hashes. The wait ends as delivered; the message itself wakes <code>far-2139</code>.</td></tr>
+<tr><td>Thu 05:30 <i>(late path)</i></td><td>No message has arrived. Within 5 minutes sm sends <code>[sm await] Your wait on far-2171 for "#2171 end.pt and fitted.pkl hashes" passed its ETA, Thu 22 Oct 05:30 UTC, and ended.</code> <code>far-2139</code> checks on #2171 and either re-runs <code>sm await</code> with a new ETA or acts.</td></tr>
+<tr><td>Any time <i>(bad path)</i></td><td><code>far-2171</code> is retired before messaging. sm sends <code>[sm await] far-2171 (4c1d2e3f) retired without messaging you. Your wait on it for "…" ended.</code></td></tr>
+</tbody>
+</table>
+
+<h3>Decision surface</h3>
+<table>
+<thead>
+<tr><th style="width:22%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. Should the agent state the wait, or should sm infer it from board order (<code>sm board after</code>)?</td><td><b>The agent states it with <code>sm await</code>.</b> Board order stays what it is today.</td><td>Inferring would silence the reminder for every seat whose ticket has an unfinished predecessor, including seats that are simply stuck.</td></tr>
+<tr><td>2. What counts as "delivered"?</td><td><b>Any <code>sm send</code> from the awaited seat to the waiter</b> (for a ticket wait: from any seat that holds the ticket). Messages from you do not count.</td><td>The awaited agent already plans to message; this needs no new habit from it. If an interim "still training" note ends the wait early, the waiter re-runs one command.</td></tr>
+<tr><td>3. Is an ETA required, and how far out may it be?</td><td><b>Required, at most 72 hours.</b> Longer waits re-register.</td><td>An open-ended wait hides a stalled seat forever. The ETA is the moment someone should look again.</td></tr>
+<tr><td>4. Should the awaited agent be told?</td><td><b>Not at registration. At its <code>sm task-complete</code>, sm lists who still waits on it</b>, and its agent row shows "awaited by far-2139".</td><td>No interruption to a busy seat, but it cannot finish and forget a promise.</td></tr>
+<tr><td>5. Add a line to this repo's standing contract (AGENTS.md, which CLAUDE.md links to)?</td><td><b>Yes, one bullet</b> in section 3 next to the <code>[sm claim]</code> rules: <i>"Blocked on another agent's deliverable: run <code>sm await &lt;agent or #ticket&gt; --for "&lt;what&gt;" --until &lt;ETA&gt;</code>, then go idle."</i></td><td>Agents learn commands from that file; without the line, seats keep answering idle reminders.</td></tr>
+</tbody>
+</table>
+<p>I made two smaller calls myself. The command is <code>sm await</code> because <code>sm wait</code> already means the blocking shell poll and I do not want to change its meaning. Board ticket cards do not show agent waits: the board is about tickets, and the seat's row on the agent list already shows the wait. I can add it later if you want it there.</p>
+
+<h3>What ships, and what you can try</h3>
+<p>One PR: the command, the stored wait record, the five ways a wait ends, the waiting-on list entry (browser watch page, <code>sm watch</code>, and a one-line phone app change that ships with the next app build), the task-complete listing, and tests. After it deploys, you can run <code>sm await</code> from any seat against another and watch the seat turn amber on your phone; Appendix F lists what I verify live myself.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>This is the first revision.</p>
+
+<!-- memo-print-scope keys on this divider: everything after it is hidden when printing
+     "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<h3>A. Command line</h3>
+<pre><code>sm await &lt;target&gt; --for "&lt;deliverable&gt;" --until &lt;eta&gt;   # open or update a wait
+sm await                                                  # list my waits and waits on me
+sm await --cancel [&lt;target&gt;]                              # end one wait, or all of mine</code></pre>
+<ul>
+<li><b>Caller.</b> Requires <code>CLAUDE_SESSION_MANAGER_ID</code>; the caller is the waiter. Outside a managed session: exit 1, <code>sm await must run inside a managed session (CLAUDE_SESSION_MANAGER_ID)</code>.</li>
+<li><b>&lt;target&gt;.</b> <code>#N</code> or <code>owner/repo#N</code> is a ticket target; the bare <code>#N</code> form resolves the repo the same way <code>sm ticket N</code> does from the caller's working directory. Anything else is a seat, resolved exactly like an <code>sm send</code> recipient (full id, id prefix, or friendly name). Errors (HTTP 400, CLI prints the detail and exits 1): <code>Session &lt;target&gt; not found</code>; <code>Session &lt;target&gt; is retired</code>; <code>you cannot wait on yourself</code>; <code>ticket number must be a positive integer</code>; and, for a bare <code>#N</code> that reaches the server unqualified, <code>a ticket target needs its repo: owner/repo#N</code>. A <code>--for</code> or <code>--until</code> without a target, or a target without both, is refused by the CLI before any request.</li>
+<li><b>--for.</b> Required. 1–200 characters after trimming, no newline; otherwise 400 <code>for must be one line of 1 to 200 characters</code>.</li>
+<li><b>--until.</b> Required. Either a duration in the <code>sm queue run</code> syntax (<code>45m</code>, <code>6h</code>, <code>2d</code>), measured from now, or an RFC 3339 timestamp. Must be later than now and no later than now + 72 h; otherwise 400 <code>until must be in the future and within 72h</code>.</li>
+<li><b>Re-running</b> with the same waiter and target replaces <code>for</code> and <code>until</code> and keeps the original <code>created_at</code> (the age shown on the agent list counts from the first registration). Output line starts <code>Updated wait on …</code> instead of <code>Waiting on …</code>.</li>
+<li><b>Output on open:</b> <code>Waiting on &lt;name&gt; (&lt;id8&gt;) for "&lt;for&gt;" until &lt;Ddd DD Mon HH:MM UTC&gt;.</code> For a ticket: <code>Waiting on #N "&lt;title&gt;" for … until ….</code>, with <code>"&lt;title&gt;"</code> left out while the title is unknown. A seat with no name shows its short id alone.</li>
+<li><b>List output:</b> two sections, <code>Waiting on:</code> and <code>Awaited by:</code> (each left out when empty), one line per open wait: <code>  far-2171 (4c1d2e3f) · "hashes" · until Thu 22 Oct 05:30 UTC · 3h</code> (target, or waiter under <i>Awaited by</i>; age since the wait opened, as <code>12m</code>, <code>3h</code> or <code>2d</code>). Nothing open: <code>No open waits.</code></li>
+<li><b>--cancel</b> with a target ends that wait and prints <code>Cancelled wait on &lt;target&gt;.</code> (404 / exit 1 <code>no open wait on &lt;target&gt;</code> if none; a retired seat may be named); without a target it ends all the caller's open waits and prints <code>Cancelled N waits.</code> (<code>Cancelled 1 wait.</code>).</li>
+</ul>
+
+<h3>B. Stored record</h3>
+<p>A new table in the work-claims database (the one holding <code>work_claims</code>), created by <code>WorkClaimStore::ensure_schema</code>.<sup>1</sup></p>
+<pre><code>CREATE TABLE IF NOT EXISTS agent_waits (
+    id                TEXT PRIMARY KEY,     -- "wait_" + 12 lowercase hex
+    waiter_session_id TEXT NOT NULL,
+    target_kind       TEXT NOT NULL CHECK (target_kind IN ('seat','ticket')),
+    target_session_id TEXT,                 -- seat waits only
+    repo              TEXT,                 -- ticket waits only, canonical slug
+    number            INTEGER,              -- ticket waits only
+    deliverable       TEXT NOT NULL,
+    created_at        TEXT NOT NULL,        -- RFC 3339 UTC
+    updated_at        TEXT NOT NULL,
+    until_at          TEXT NOT NULL,
+    ended_at          TEXT,
+    end_reason        TEXT CHECK (end_reason IN
+        ('delivered','ticket_closed','target_retired','expired','cancelled','waiter_retired')),
+    end_message_id    TEXT                  -- queue message sm sent at the end, if any
+);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_waits_open ON agent_waits
+    (waiter_session_id, target_kind, IFNULL(target_session_id,''), IFNULL(repo,''), IFNULL(number,0))
+    WHERE ended_at IS NULL;</code></pre>
+<p>A ticket wait inserts an unsynced <code>work_items</code> row for the ticket if none exists, and the tracked set<sup>2</sup> gains <code>SELECT repo, number FROM agent_waits WHERE ended_at IS NULL AND target_kind = 'ticket'</code>, so the claim sync fetches the ticket every pass while the wait is open. Every change writes an event in the existing <code>events</code> table: <code>wait.opened</code>, <code>wait.updated</code>, <code>wait.ended</code> (payload: wait id, target, deliverable, until, and for <code>wait.ended</code> the reason and message id), on the waiter's session and, for ticket waits, the ticket.</p>
+
+<h3>C. How a wait ends</h3>
+<table>
+<thead><tr><th style="width:16%">Reason</th><th style="width:30%">Trigger</th><th style="width:14%">When checked</th><th>Message to the waiter (important, category <code>work_claim</code>)</th></tr></thead>
+<tbody>
+<tr><td><code>delivered</code></td><td>An <code>sm send</code> (<code>from_sm_send</code>) delivered or queued to the waiter (a send that reports the waiter stopped or retired does not count) whose verified sender is the target seat, or for a ticket wait, a seat with an active claim on that ticket.</td><td>At send acceptance, in the same request.<sup>3</sup></td><td>None. The delivered message is the wake.</td></tr>
+<tr><td><code>ticket_closed</code></td><td>Ticket waits: the sync pass got an answer for the ticket and it is closed, or GitHub reports it not found.</td><td>Claim sync pass, using that pass's answers (as Check A does).</td><td><code>[sm await] #2171 "&lt;title&gt;" closed. Your wait on it for "&lt;for&gt;" ended.</code> Not found: <code>[sm await] #2171 was not found on GitHub. Your wait on it for "&lt;for&gt;" ended.</code></td></tr>
+<tr><td><code>target_retired</code></td><td>Seat waits: the target seat is retired.</td><td>Claim sync pass.</td><td><code>[sm await] far-2171 (4c1d2e3f) retired without messaging you. Your wait on it for "&lt;for&gt;" ended.</code></td></tr>
+<tr><td><code>expired</code></td><td><code>until_at</code> ≤ now.</td><td>Claim sync pass.</td><td><code>[sm await] Your wait on far-2171 for "&lt;for&gt;" passed its ETA, Thu 22 Oct 05:30 UTC, and ended.</code> (ticket target written <code>#2171</code>)</td></tr>
+<tr><td><code>cancelled</code></td><td><code>sm await --cancel</code>.</td><td>At the request.</td><td>None.</td></tr>
+<tr><td><code>waiter_retired</code></td><td>The waiter is retired.</td><td>Claim sync pass, and at retire.</td><td>None.</td></tr>
+</tbody>
+</table>
+<ul>
+<li>The claim sync pass runs every <code>work_claims.sync_interval_seconds</code> (default 300, minimum 60), so the three sync-time endings land within one interval. The wait step runs <b>before Check C</b> (the idle reminder) in <code>run_sync_pass</code>, so a wait that ends in a pass is no longer in the waiting-on list when that pass decides on reminders.</li>
+<li>A ticket counts as answered when GitHub answered for it in this pass or its cached state is already closed, since the sync never re-polls a closed item.</li>
+<li>If several triggers hold in one pass, the reason is the first in this order: <code>waiter_retired</code>, <code>ticket_closed</code>, <code>target_retired</code>, <code>expired</code>. One wait produces at most one message.</li>
+<li>A stopped (not retired) waiter keeps its waits; a stopped target seat does not end a wait.</li>
+<li>Restoring a retired seat, including the retire-then-successor path of an Auto PM handoff, reopens the waits its retire ended (<code>waiter_retired</code> at or after the retire), as it reopens claims; a reopened wait past its ETA ends as <code>expired</code> at the next sync pass.</li>
+<li>Ending a wait and enqueueing its message happen in one transaction on the work-claims database, as the existing checks do with <code>enqueue_important_in_conn</code>.</li>
+<li>After a wait ends, the idle reminder's normal re-arm rule applies unchanged: the end message makes the seat active, so a reminder comes at the earliest 30 idle minutes later.</li>
+</ul>
+
+<h3>D. Waiting-on list and agent views</h3>
+<p>The session feed (<code>session_obligations</code>)<sup>4</sup> adds one <code>waiting_on</code> entry per open wait, on the waiter:</p>
+<pre><code>{"kind": "agent_wait", "id": "wait_3f9a2c1d0b7e",
+ "label": "far-2171 · #2171 end.pt and fitted.pkl hashes",
+ "state": "waiting", "since": "2026-10-21T22:10:04Z", "until": "2026-10-22T05:30:00Z",
+ "target_kind": "seat", "target_session_id": "4c1d2e3f", "target_name": "far-2171",
+ "repo": null, "number": null, "title": null, "until_text": "Thu 22 Oct 05:30 UTC",
+ "waiter_session_id": "7e317fcd", "waiter_name": "far-2139", "for": "#2171 end.pt and fitted.pkl hashes"}</code></pre>
+<p>The label is <code>&lt;target&gt; · &lt;for&gt;</code>; the target is the seat's friendly name (else its 8-character id) or <code>#N</code>. Because the entry is in <code>waiting_on</code>, three things follow with no further code: Check C skips the seat (<code>IdleSession.waiting</code>), <code>watch_view</code> shows an idle waiter as waiting, and <code>waiting_since</code> includes it. The target seat's feed entry (for ticket waits: every seat with an active claim on the ticket) gains the same view in <code>"awaited_by"</code>. Every feed entry carries <code>awaited_by</code>, empty when none. A retired waiter's waits are left out of the feed until the next sync pass ends them. The browser watch page and <code>sm watch</code> show each as <i>Awaited by far-2139 · &lt;for&gt; · until &lt;ETA&gt;</i>; the phone app ignores the field.</p>
+<p>Clients that count waits by kind add <code>agent_wait</code> → "agent wait(s)": <code>sm watch</code> (<code>obligation_context</code>) and the Android <code>waitingSummary</code> list. The browser watch page and single-wait rendering everywhere already use the label and need no change.</p>
+
+<h3>E. Server routes</h3>
+<table>
+<thead><tr><th>Route</th><th>Body / query</th><th>Answer</th></tr></thead>
+<tbody>
+<tr><td><code>POST /claims/waits</code></td><td><code>{waiter_session_id, target, for, until}</code>; <code>target</code> as typed, <code>until</code> already converted by the CLI to RFC 3339; ticket <code>target</code> already repo-qualified.</td><td>201 new / 200 updated, with the wait view (shape of Appendix D plus <code>created</code>: bool). Errors as Appendix A.</td></tr>
+<tr><td><code>GET /claims/waits?session_id=</code></td><td>—</td><td><code>{"waiting_on": [view…], "awaited_by": [view…]}</code>, open waits only, oldest first.</td></tr>
+<tr><td><code>POST /claims/waits/cancel</code></td><td><code>{waiter_session_id, target?}</code></td><td><code>{"cancelled": n}</code>; 404 when a target is given and no open wait matches.</td></tr>
+</tbody>
+</table>
+<p>All three use the same session-allowed and core-writes guards as <code>/claims/release</code>. For signed local agents the gateway allows <code>GET /claims/waits</code> as a read and binds <code>waiter_session_id</code> to the calling agent on both POSTs (<code>http/local_agent.rs::policy</code>).</p>
+
+<h3>F. Task-complete listing</h3>
+<p>At <code>sm task-complete</code> of a seat that open waits target (directly, or through a ticket it claims), sm sends that seat, in addition to any Check B message:</p>
+<pre><code>[sm await] At task-complete, far-2139 (7e317fcd) waits on you for "#2171 end.pt and fitted.pkl hashes", ETA Thu 22 Oct 05:30 UTC.</code></pre>
+<p>Several waiters are joined with <code>; </code> in one message. The waits stay open. The added AGENTS.md bullet (decision 5) is the only policy text; sm messages state facts.</p>
+
+<h3>G. Requirement → code and test</h3>
+<table>
+<thead><tr><th>Requirement</th><th>Code</th><th>Test</th></tr></thead>
+<tbody>
+<tr><td>Open, update, list, cancel; validation errors</td><td><code>work_claims/waits.rs</code>, <code>http/agent_waits.rs</code>, <code>bin/claims/waits.rs</code></td><td><code>tests/work_claims_http.rs</code> <code>agent_waits_validate_list_and_project_into_the_feed</code> (each error string, update keeps <code>since</code>); <code>waits/tests.rs</code> <code>validation_bounds_deliverable_and_eta</code>, <code>reopening_a_wait_updates_it_and_keeps_its_age</code>; CLI output tests in <code>bin/claims/waits.rs</code></td></tr>
+<tr><td>Open wait silences the idle reminder</td><td><code>agent_waits::project_waits</code>, called from <code>session_obligations_with_inputs</code> in <code>http.rs</code></td><td><code>an_open_wait_silences_check_c_until_the_target_delivers</code></td></tr>
+<tr><td>Delivered on sm send from target / ticket holder; not from others</td><td><code>wait_sender</code> + <code>agent_waits::deliver_on_send</code> in <code>send_session_input</code> and <code>send_session_input_batch_one</code> (<code>http.rs</code>); <code>deliver_waits</code></td><td><code>a_message_from_the_target_or_ticket_holder_delivers</code>; HTTP send case above</td></tr>
+<tr><td>Ticket closed / not found, target retired, expired, waiter retired; precedence; one message</td><td><code>run_wait_endings</code>, called in <code>http/claims.rs::run_sync_pass</code> before Check C; <code>end_claims_for_session</code> at retire</td><td><code>sync_endings_message_the_waiter_once</code>, <code>precedence_waiter_retired_then_target_retired_then_expired</code>, <code>cancel_and_retire_end_waits_silently</code>, <code>the_sync_pass_ends_a_ticket_wait_and_task_complete_names_waiters</code></td></tr>
+<tr><td>Handoff moves open waits (both ends); restore reopens retired waits</td><td><code>WorkClaimStore::hand_off</code>; <code>handoff::execute::MOVED_COLUMNS</code>; <code>waits::reopen_retired_waits</code> from <code>reopen_retired_claims</code></td><td><code>handoff_moves_open_waits_to_the_successor</code>, <code>restore_after_retire_reopens_waits_for_the_successor</code>; stopped-waiter send case in <code>an_open_wait_silences_check_c_until_the_target_delivers</code></td></tr>
+<tr><td>Ticket waits join the tracked set</td><td><code>tracked_items</code></td><td><code>sync_endings_message_the_waiter_once</code></td></tr>
+<tr><td><code>awaited_by</code> and task-complete listing</td><td><code>project_waits</code>; <code>notify_awaited_at_task_complete</code> via <code>schedule_task_complete_notice</code></td><td>feed test above; <code>task_complete_lists_live_waiters_on_the_seat_and_its_tickets</code></td></tr>
+<tr><td>Client counts; <code>awaited_by</code> line on the browser watch page and <code>sm watch</code></td><td><code>http/watch_client.js</code>, <code>bin/watch/mod.rs</code>, Android <code>WatchModels.kt</code></td><td><code>agent_waits_count_by_kind_and_show_who_awaits</code> (<code>sm watch</code>)</td></tr>
+<tr><td>AGENTS.md bullet</td><td><code>AGENTS.md</code> §3</td><td>—</td></tr>
+</tbody>
+</table>
+<p><b>Live check after deploy:</b> spawn two idle probe seats; register a seat wait from one on the other with a 10-minute ETA through the route; confirm the waiter's feed entry and amber state; <code>sm send</code> from the target and confirm the wait ends as delivered; register again and let it expire, confirming the message within one sync interval.</p>
+
+<h3>Z. FAQ</h3>
+<p><b>Does this extend the claim lifecycle?</b> It extends the claim machinery, not the claim record. The wait lives in the claims database, is checked by the claim sync pass, writes to the claims event log, and its messages travel the same way as <code>[sm claim]</code> messages. It is not a new state of a claim because the idle reminder decides per seat, a seat can hold several claims, and a seat can wait on another agent while holding no claim at all.</p>
+<p><b>How is this different from <code>sm board waiting</code>?</b> That command marks a ticket as waiting on you, outside sm. An agent wait is a seat waiting on another seat or ticket. They do not interact.</p>
+<p><b>Why not end the wait when the target goes idle, like <code>sm wait</code>?</b> A seat goes idle many times before it delivers; idle says nothing about the deliverable.</p>
+<p><b>What if a seat is replaced (handoff)?</b> Open waits follow the work, as claims do: a successor keeps its predecessor's waits, and a wait on the predecessor becomes a wait on the successor, so the successor's <code>sm send</code> delivers it. A seat that retires without a successor ends the waits on it with a message.</p>
+<p><b>Why 72 hours?</b> Long GPU jobs here run overnight to two days. Three days covers that with margin while still forcing a look within a working stretch.</p>
+<p class="s"><small><sup>1</sup> <code>crates/sm-server/src/work_claims.rs</code>, <code>ensure_schema</code>. <sup>2</sup> <code>WorkClaimStore::tracked_items</code>, same file. <sup>3</sup> <code>SessionManager::send_core_input</code>, <code>crates/sm-server/src/sessions.rs</code>. <sup>4</sup> <code>project_session_obligations</code> and <code>session_obligations</code>, <code>crates/sm-server/src/http.rs</code>; Check C reads it through <code>idle_sessions</code> in <code>crates/sm-server/src/http/claims.rs</code>.</small></p>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  @media screen and (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+    }
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  if (!window.frameElement) {
+    try { saved = localStorage.getItem(KEY); } catch (e) {}
+    if (saved === 'dark' || saved === 'light') root.setAttribute('data-theme', saved);
+  }
+  function isDark() {
+    return root.getAttribute('data-theme') === 'dark' ||
+      (!root.hasAttribute('data-theme') && matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = isDark() ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = isDark();
+    root.setAttribute('data-theme', dark ? 'light' : 'dark');
+    if (!window.frameElement) {
+      try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    }
+    label();
+  };
+  new MutationObserver(label).observe(root, { attributes: true, attributeFilter: ['data-theme'] });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', label);
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
