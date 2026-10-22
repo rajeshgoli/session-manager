@@ -412,3 +412,25 @@ fn restore_after_retire_reopens_waits_for_the_successor() {
         ("succ0001", "hashes")
     );
 }
+
+#[test]
+fn a_wait_on_a_ticket_already_cached_closed_ends_at_the_next_pass() {
+    let (store, db) = new_store();
+    let fetched: Result<BatchFetch, String> = Ok([(7, found("closed"))].into_iter().collect());
+    store.record_fetch(REPO, &[7], &fetched).unwrap();
+    store
+        .open_wait(WAITER, &ticket(7), "weights", at(450), at(0))
+        .unwrap();
+    // Closed items are never re-polled, so this pass has no answer for #7.
+    assert!(store.tracked_items().unwrap().is_empty());
+    assert_eq!(
+        store
+            .run_wait_endings(&answered(&[]), &directory(), at(5))
+            .unwrap(),
+        [WAITER]
+    );
+    assert_eq!(
+        queued(&db, WAITER),
+        ["[sm await] #7 \"Final weights\" closed. Your wait on it for \"weights\" ended."]
+    );
+}

@@ -334,7 +334,8 @@ impl WorkClaimStore {
 
     /// After a sync pass, before Check C: ends waits whose waiter retired,
     /// whose ticket GitHub reported closed or missing in this pass
-    /// (`answered`, as for Check A), whose seat retired, or whose ETA passed,
+    /// (`answered`, as for Check A) or whose cached state is already closed,
+    /// whose seat retired, or whose ETA passed,
     /// in that order of precedence; all but the first message the waiter.
     /// Returns the sessions sent a message.
     pub fn run_wait_endings(
@@ -360,8 +361,21 @@ impl WorkClaimStore {
                 continue;
             }
             let deliverable = &wait.deliverable;
+            // A ticket counts when GitHub answered for it in this pass, or when
+            // its cached state is final: the sync never re-polls a closed item.
+            let ticket_settled = match wait.target() {
+                WaitTarget::Ticket { repo, number } => {
+                    answered.contains(&(repo.clone(), number))
+                        || get_item(&tx, &repo, number)?.is_some_and(|item| {
+                            item.synced_at.is_some()
+                                && item.sync_error.is_none()
+                                && item.state != "open"
+                        })
+                }
+                WaitTarget::Seat(_) => false,
+            };
             let mut ending = match wait.target() {
-                WaitTarget::Ticket { repo, number } if answered.contains(&(repo.clone(), number)) => {
+                WaitTarget::Ticket { repo, number } if ticket_settled => {
                     closed_text(&tx, &repo, number, deliverable)?
                         .map(|text| (WaitEnd::TicketClosed, text))
                 }

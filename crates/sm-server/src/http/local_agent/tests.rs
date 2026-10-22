@@ -240,6 +240,8 @@ async fn omitted_caller_and_sender_fields_are_supplied_and_self_paths_cannot_be_
     let app = echo_router(fixture.state.clone());
     for (method, path, field) in [
         ("POST", "/claims", "requester_session_id"),
+        ("POST", "/claims/waits", "waiter_session_id"),
+        ("POST", "/claims/waits/cancel", "waiter_session_id"),
         ("POST", "/sessions/agent-b/input", "sender_session_id"),
         ("POST", "/docs", "session_id"),
     ] {

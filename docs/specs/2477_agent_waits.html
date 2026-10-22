@@ -276,6 +276,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_waits_open ON agent_waits
 </table>
 <ul>
 <li>The claim sync pass runs every <code>work_claims.sync_interval_seconds</code> (default 300, minimum 60), so the three sync-time endings land within one interval. The wait step runs <b>before Check C</b> (the idle reminder) in <code>run_sync_pass</code>, so a wait that ends in a pass is no longer in the waiting-on list when that pass decides on reminders.</li>
+<li>A ticket counts as answered when GitHub answered for it in this pass or its cached state is already closed, since the sync never re-polls a closed item.</li>
 <li>If several triggers hold in one pass, the reason is the first in this order: <code>waiter_retired</code>, <code>ticket_closed</code>, <code>target_retired</code>, <code>expired</code>. One wait produces at most one message.</li>
 <li>A stopped (not retired) waiter keeps its waits; a stopped target seat does not end a wait.</li>
 <li>Restoring a retired seat, including the retire-then-successor path of an Auto PM handoff, reopens the waits its retire ended (<code>waiter_retired</code> at or after the retire), as it reopens claims; a reopened wait past its ETA ends as <code>expired</code> at the next sync pass.</li>
@@ -303,7 +304,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_waits_open ON agent_waits
 <tr><td><code>POST /claims/waits/cancel</code></td><td><code>{waiter_session_id, target?}</code></td><td><code>{"cancelled": n}</code>; 404 when a target is given and no open wait matches.</td></tr>
 </tbody>
 </table>
-<p>All three use the same session-allowed and core-writes guards as <code>/claims/release</code>.</p>
+<p>All three use the same session-allowed and core-writes guards as <code>/claims/release</code>. For signed local agents the gateway allows <code>GET /claims/waits</code> as a read and binds <code>waiter_session_id</code> to the calling agent on both POSTs (<code>http/local_agent.rs::policy</code>).</p>
 
 <h3>F. Task-complete listing</h3>
 <p>At <code>sm task-complete</code> of a seat that open waits target (directly, or through a ticket it claims), sm sends that seat, in addition to any Check B message:</p>

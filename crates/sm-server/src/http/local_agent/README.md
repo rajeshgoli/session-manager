@@ -35,6 +35,7 @@ replaced before typed handler extraction; recipient fields are preserved.
 | Route (POST unless stated) | Bound caller or restriction |
 | --- | --- |
 | `/claims`, `/claims/release`, `/claims/worktree` | `requester_session_id` |
+| `/claims/waits`, `/claims/waits/cancel` | `waiter_session_id`; preserve `target` |
 | `/worktrees/keep`, `/worktrees/delete` | `requester_session_id`; existing worktree ownership rules apply |
 | `/queue-jobs`, `/review-requests` | `requester_session_id`; preserve `notify_target` and its aliases |
 | `/merge-holds`, `/merge-holds/release` | `requester_session_id` |
