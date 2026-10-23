@@ -60,12 +60,26 @@ pub(super) fn owner_human(config: &AppConfig) -> Option<crate::email::HumanRecip
     (humans.len() == 1).then(|| humans.remove(0))
 }
 
-/// Agents blocked on the owner (names), and unread messages since `since`.
+/// The identity the owner's phone registered its push tokens under: whose
+/// alerts overnight holds and summarizes.
+pub(super) fn owner_notice_user(state: &AppState) -> String {
+    let owner = owner_human(&state.config).map(|human| human.name);
+    follows::notice_user_id(state, owner.as_deref())
+}
+
+/// Agents blocked on the owner (names), and the owner's unread messages
+/// since `since`.
 fn waiting_counts(state: &AppState, since: &str) -> anyhow::Result<(Vec<String>, usize)> {
+    let Some(owner) = owner_human(&state.config) else {
+        return Ok((Vec::new(), 0));
+    };
     let rows = super::messages::owner_message_store(state).for_obligations(since)?;
     let mut blocked = BTreeSet::new();
     let mut unread = 0;
-    for (message, replied) in rows {
+    for (message, replied) in rows
+        .into_iter()
+        .filter(|(message, _)| message.human == owner.name)
+    {
         if message.blocked && !replied && message.handled_at.is_none() {
             blocked.insert(message.sender_session_name.clone());
         }
@@ -260,28 +274,46 @@ impl AppState {
             let since = parse_ts(&night.since).unwrap_or(at);
             let owner_back = now.last_activity.is_some_and(|last| last > since);
             // Read before the summary is counted, so it covers at least these.
-            let held = push.held_message_notices(since)?;
+            let held = push.held_message_notices(&owner_notice_user(self), since)?;
             if owner_back {
                 push.release_held(&held, at)?;
             } else if !held.is_empty() {
-                let id = format!("ovs-{}", since.unix_timestamp());
-                if self.send_overnight_summary(&night.since, &id) {
-                    pending = Some(overnight::PendingSummary {
-                        id,
-                        since: night.since.clone(),
-                        sent_at: format_ts(at),
-                        notices: held,
-                    });
+                let summary = overnight::PendingSummary {
+                    id: format!("ovs-{}", since.unix_timestamp()),
+                    since: night.since.clone(),
+                    sent_at: format_ts(at),
+                    notices: held,
+                };
+                // Stored first, so a phone that acknowledges at once finds it.
+                let stored = summary.clone();
+                store(self).update(|current| overnight::State {
+                    summary: Some(stored),
+                    ..current.clone()
+                })?;
+                if self.send_overnight_summary(&night.since, &summary.id) {
+                    pending = Some(summary);
                     holds = true;
+                } else {
+                    store(self).update(|current| overnight::State {
+                        summary: current.summary.clone().filter(|kept| kept.id != summary.id),
+                        ..current.clone()
+                    })?;
                 }
             }
         }
         let next = now.away.clone();
+        let acknowledged = pending.is_some();
         store(self).update(|current| overnight::State {
             seen: next,
-            summary: pending.or_else(|| current.summary.clone()),
             ..current.clone()
         })?;
+        // Acknowledged while it was being sent: the alerts are already released.
+        if acknowledged && store(self).load()?.summary.is_none() {
+            return Ok(now
+                .away
+                .as_ref()
+                .is_some_and(|away| away.source.holds_alerts()));
+        }
         Ok(holds)
     }
 
@@ -365,8 +397,7 @@ impl AppState {
             ("summary_id".to_owned(), id.to_owned()),
         ]);
         let store = follows::push_store(self);
-        let owner = owner_human(&self.config).map(|human| human.name);
-        let user = follows::notice_user_id(self, owner.as_deref());
+        let user = owner_notice_user(self);
         let tokens = match store.valid_tokens(&user) {
             Ok(tokens) => tokens,
             Err(error) => {

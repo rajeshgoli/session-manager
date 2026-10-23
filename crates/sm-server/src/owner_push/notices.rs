@@ -340,14 +340,20 @@ impl OwnerPushStore {
 
     /// The message notices created since `since` that have not gone out:
     /// what an overnight summary stands for (sm#2494).
-    pub fn held_message_notices(&self, since: OffsetDateTime) -> Result<Vec<String>> {
+    pub fn held_message_notices(
+        &self,
+        user_id: &str,
+        since: OffsetDateTime,
+    ) -> Result<Vec<String>> {
         let conn = self.open()?;
         let mut statement = conn.prepare(
             "SELECT id FROM owner_notices WHERE notified_at IS NULL AND kind = ?2 \
-             AND created_at >= ?1 ORDER BY created_at, rowid",
+             AND user_id = ?3 AND created_at >= ?1 ORDER BY created_at, rowid",
         )?;
         let ids = statement
-            .query_map(params![format_ts(since), NOTICE_MESSAGE], |row| row.get(0))?
+            .query_map(params![format_ts(since), NOTICE_MESSAGE, user_id], |row| {
+                row.get(0)
+            })?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
     }
@@ -508,8 +514,25 @@ pub fn deliver_notices(
     mailer: &dyn NoticeMailer,
     now: OffsetDateTime,
 ) -> Result<Vec<String>> {
+    deliver_notices_holding(store, world, sender, mailer, now, None)
+}
+
+/// [`deliver_notices`], leaving `held_user`'s notices untouched while
+/// overnight mode holds that owner's alerts (sm#2494).
+pub fn deliver_notices_holding(
+    store: &OwnerPushStore,
+    world: &dyn NoticeWorld,
+    sender: Option<&dyn PushSender>,
+    mailer: &dyn NoticeMailer,
+    now: OffsetDateTime,
+    held_user: Option<&str>,
+) -> Result<Vec<String>> {
+    let held = |notice: &Notice| held_user == Some(notice.user_id.as_str());
     let mut problems = Vec::new();
     for mut notice in store.pending_notices(now)? {
+        if held(&notice) {
+            continue;
+        }
         if !world.still_wanted(&notice)? || world.opened(&notice)? {
             close_resolved(&mut notice, now);
             store.save_notice_delivery(&notice)?;
@@ -588,6 +611,9 @@ pub fn deliver_notices(
         store.save_notice_delivery(&notice)?;
     }
     for mut notice in store.notice_ack_fallback_due(now)? {
+        if held(&notice) {
+            continue;
+        }
         if !world.still_wanted(&notice)? || world.opened(&notice)? {
             close_resolved(&mut notice, now);
             store.save_notice_delivery(&notice)?;

@@ -978,15 +978,16 @@ impl AppState {
             owner_push::repair_notices(&store, &notice_world, now)?;
             self.sweep_approval_waits(&store, now)?;
         }
-        if !held {
-            problems.extend(owner_push::deliver_notices(
-                &store,
-                &notice_world,
-                self.push_sender.as_deref(),
-                &AppNoticeMailer { state: self },
-                now,
-            )?);
-        }
+        // Only the owner's alerts wait; other humans' still go out.
+        let held_user = held.then(|| super::overnight::owner_notice_user(self));
+        problems.extend(owner_push::deliver_notices_holding(
+            &store,
+            &notice_world,
+            self.push_sender.as_deref(),
+            &AppNoticeMailer { state: self },
+            now,
+            held_user.as_deref(),
+        )?);
         problems.extend(owner_push::withdraw_notices(
             &store,
             &notice_world,
