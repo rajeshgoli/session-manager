@@ -13797,7 +13797,13 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
     let background = || {
         crate::agent_memory_guard::background_jobs(&session.id).is_some_and(|jobs| !jobs.is_empty())
     };
-    if idle && background() {
+    if idle
+        && (session
+            .subagents
+            .iter()
+            .any(|agent| agent["status"] == "running" && agent["stopped_at"].as_str().is_none())
+            || background())
+    {
         return Some("waiting");
     }
     live
@@ -23077,6 +23083,67 @@ mod tests {
         );
         assert_eq!(links["rcnone01"], &Value::Null);
         assert_eq!(links["rcstop01"], &Value::Null);
+    }
+
+    #[tokio::test]
+    async fn background_subagent_start_and_stop_reach_watch_and_session_activity() {
+        let state_file = write_session_state("bgagent1", "idle");
+        let mut config = AppConfig::default();
+        config.paths.state_file = state_file;
+        let state = AppState::new(config);
+        let record = state
+            .session_store
+            .get_session("bgagent1")
+            .unwrap()
+            .unwrap();
+        assert_ne!(live_activity_state(&state, &record), Some("waiting"));
+        state
+            .session_store
+            .register_subagent_start(
+                "bgagent1",
+                SubagentStartRequest {
+                    agent_id: "child-one".into(),
+                    agent_type: "Explore".into(),
+                    transcript_path: None,
+                },
+            )
+            .unwrap();
+        let record = state
+            .session_store
+            .get_session("bgagent1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(live_activity_state(&state, &record), Some("waiting"));
+        let params = watch::WatchParams::default();
+        let doc = watch::watch_state(&state, &params).unwrap();
+        let agent = &doc["sessions"][0];
+        assert_eq!(agent["background_agents"][0]["agent_id"], "child-one");
+        assert_eq!(
+            agent["facts"]["jobs"]["text"],
+            "◷ Background agent working: Explore"
+        );
+        assert_eq!(agent["facts"]["jobs"]["tone"], "background");
+        assert_eq!(agent["facts"]["background"], 1);
+        state
+            .session_store
+            .register_subagent_stop(
+                "bgagent1",
+                "child-one",
+                SubagentStopRequest {
+                    summary: None,
+                    transcript_path: None,
+                },
+            )
+            .unwrap();
+        let record = state
+            .session_store
+            .get_session("bgagent1")
+            .unwrap()
+            .unwrap();
+        assert_ne!(live_activity_state(&state, &record), Some("waiting"));
+        let doc = watch::watch_state(&state, &params).unwrap();
+        assert_eq!(doc["sessions"][0]["background_agents"], json!([]));
+        assert_eq!(doc["sessions"][0]["facts"]["jobs"]["text"], "No jobs");
     }
 
     /// The web's agent panel and Clone read model, effort and folder, and

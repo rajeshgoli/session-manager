@@ -153,7 +153,10 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
             None => include_stopped || !record.is_stopped(),
         })
         .map(|record| {
-            serde_json::to_value(session_response_with_live_activity(state, record.clone()))
+            let mut value =
+                serde_json::to_value(session_response_with_live_activity(state, record.clone()))?;
+            value["subagents"] = json!(record.subagents);
+            Ok::<Value, serde_json::Error>(value)
         })
         .collect::<Result<_, _>>()?;
 
@@ -277,7 +280,9 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
             .filter(|job| job.shell_job_id.is_none())
             .filter_map(|job| serde_json::to_value(job).ok())
             .collect();
+        let background_agents = running_background_agents(v);
         let mut with_background = v.clone();
+        with_background["background_agents"] = json!(background_agents);
         with_background["background_jobs"] = json!(background);
         let (facts, attention) = agent_facts(
             &with_background,
@@ -327,6 +332,7 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
             "review_history": field("review_history"),
             "jobs": own_jobs,
             "background_jobs": background,
+            "background_agents": background_agents,
             "collision": colliding.contains(id),
             "attach": format!("sm attach {}", name(v)),
         }));
@@ -499,6 +505,20 @@ fn facts_cut(text: &str, max: usize) -> String {
         Some((end, _)) => format!("{}…", &text[..end]),
         None => text.to_owned(),
     }
+}
+
+/// Provider-native subagents are background work only while the parent is idle.
+fn running_background_agents(session: &Value) -> Vec<Value> {
+    if s(session, "status") == "stopped"
+        || matches!(s(session, "activity_state"), "working" | "thinking")
+        || s(session, "activity_state").starts_with("parked:")
+    {
+        return Vec::new();
+    }
+    array(session, "subagents")
+        .into_iter()
+        .filter(|agent| s(agent, "status") == "running" && !agent["stopped_at"].is_string())
+        .collect()
 }
 
 fn agent_facts(
@@ -706,6 +726,19 @@ fn agent_facts(
             job_text.push_str(&format!(" · {} in background", background.len()));
         }
     }
+    let background_agents = array(session, "background_agents");
+    if !background_agents.is_empty() {
+        let text = match background_agents.as_slice() {
+            [only] => format!("Background agent working: {}", s(only, "agent_type")),
+            many => format!("{} background agents working", many.len()),
+        };
+        if tone.is_null() {
+            tone = json!("background");
+            job_text = format!("◷ {text}");
+        } else {
+            job_text.push_str(&format!(" · {text}"));
+        }
+    }
     let review_fact =
         review.map(|item| json!({"pr_number": item["pr_number"], "since": item["since"]}));
     let job_facts = json!({"running": running.len(), "waiting": pending.len(),
@@ -762,7 +795,7 @@ fn agent_facts(
         );
     let note = notes.get(s(session, "id"));
     let facts = json!({"agent": {"state": agent_state, "since": activity_since, "text": parked.then(|| s(session, "activity_state"))},
-        "jobs": job_facts, "background": background.len(), "you": you, "finished": finished,
+        "jobs": job_facts, "background": background.len() + background_agents.len(), "you": you, "finished": finished,
         "note": note.map_or(Value::Null, |note| json!({"text": note.text, "at": note.at}))});
     let last = s(session, "last_activity");
     let has_claim = claims
@@ -779,6 +812,8 @@ fn agent_facts(
         && review.is_none()
         && delivery.is_none()
         && agent_wait.is_none()
+        && background.is_empty()
+        && background_agents.is_empty()
         && has_claim
         && activity_since
             .is_some_and(|at| old_enough(at, now, i64::from(config.board.stall_minutes)));
@@ -1441,6 +1476,26 @@ mod facts_tests {
             );
             assert_eq!(attention["section"], section);
             assert_eq!(facts["jobs"]["text"], job_text);
+        }
+    }
+
+    #[test]
+    fn background_subagents_exclude_completed_and_busy_or_stopped_parents() {
+        let running = json!({"agent_id": "one", "agent_type": "Explore", "status": "running", "stopped_at": null});
+        let completed = json!({"agent_id": "two", "status": "completed"});
+        let stopped =
+            json!({"agent_id": "three", "status": "running", "stopped_at": "2026-10-22T01:00:00"});
+        for (status, activity, expected) in [
+            ("idle", "idle", json!([running.clone()])),
+            ("idle", "waiting", json!([running.clone()])),
+            ("active", "working", json!([])),
+            ("active", "thinking", json!([])),
+            ("stopped", "idle", json!([])),
+            ("idle", "parked: model yielded", json!([])),
+        ] {
+            let session = json!({"status": status, "activity_state": activity,
+                "subagents": [running, completed, stopped]});
+            assert_eq!(json!(running_background_agents(&session)), expected);
         }
     }
 
