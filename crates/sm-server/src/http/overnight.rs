@@ -184,9 +184,12 @@ pub(super) async fn put_dnd(
 impl AppState {
     /// The follow pass's overnight step. Returns whether alerts wait now.
     /// On a new night it tells each agent with an unanswered message that
-    /// the owner is away; when a night that held alerts ends, what waited is
-    /// released without a push each, and one summary goes out unless the
-    /// owner has been active since the night began.
+    /// the owner is away. When a night that held alerts ends, the message
+    /// alerts that waited give way to one summary push: released silently
+    /// when the owner is already back, or once a phone has the summary.
+    /// Otherwise (no phone, a failed push, nothing to summarize, or the
+    /// follows the owner asked for) they go out one by one with their usual
+    /// retries and email fallback.
     pub(super) fn overnight_tick(&self, at: OffsetDateTime) -> anyhow::Result<bool> {
         let now = evaluate(self, at)?;
         let seen = now.stored.seen.clone();
@@ -203,10 +206,12 @@ impl AppState {
             .is_some_and(|away| away.source.holds_alerts());
         if let (Some(night), false) = (held_before, holds_now) {
             let since = parse_ts(&night.since).unwrap_or(at);
-            let released = follows::push_store(self).release_held(since, at)?;
             let owner_back = now.last_activity.is_some_and(|last| last > since);
-            if released > 0 && !owner_back {
-                self.send_overnight_summary(&night.since);
+            let store = follows::push_store(self);
+            if owner_back
+                || (store.held_count(since)? > 0 && self.send_overnight_summary(&night.since))
+            {
+                store.release_held(since, at)?;
             }
         }
         let next = now.away.clone();
@@ -271,20 +276,21 @@ impl AppState {
         }
     }
 
-    /// The morning push: what waited, in one notification that opens the Inbox.
-    fn send_overnight_summary(&self, since: &str) {
+    /// The morning push: what waited, in one notification that opens the
+    /// Inbox. Returns whether at least one phone took it.
+    fn send_overnight_summary(&self, since: &str) -> bool {
         let Some(sender) = self.push_sender.as_deref() else {
-            return;
+            return false;
         };
         let (blocked, unread) = match waiting_counts(self, since) {
             Ok(counts) => counts,
             Err(error) => {
                 eprintln!("overnight summary counts failed: {error:#}");
-                return;
+                return false;
             }
         };
         if blocked.is_empty() && unread == 0 {
-            return;
+            return false;
         }
         let (title, body) = overnight_summary_text(&blocked, unread);
         let data = BTreeMap::from([
@@ -299,19 +305,22 @@ impl AppState {
             Ok(tokens) => tokens,
             Err(error) => {
                 eprintln!("overnight summary tokens unreadable: {error:#}");
-                return;
+                return false;
             }
         };
+        let mut delivered = false;
         for token in tokens {
-            if let Err(PushError::InvalidToken(detail) | PushError::Retryable(detail)) =
-                sender.send(&token.token, &data)
-            {
-                eprintln!(
-                    "overnight summary to {} failed: {detail}",
-                    token.device_name
-                );
+            match sender.send(&token.token, &data) {
+                Ok(()) => delivered = true,
+                Err(PushError::InvalidToken(detail) | PushError::Retryable(detail)) => {
+                    eprintln!(
+                        "overnight summary to {} failed: {detail}",
+                        token.device_name
+                    );
+                }
             }
         }
+        delivered
     }
 }
 

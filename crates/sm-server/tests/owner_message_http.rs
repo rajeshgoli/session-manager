@@ -2142,6 +2142,21 @@ async fn sm_blocked_files_a_blocked_on_you_thread_above_needs_you() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
+    // Five unread updates do not stop the escalation (the cap is for updates).
+    for n in 0..5 {
+        created_id(&f, "child001", &format!("# Update {n}\nx"), json!({})).await;
+    }
+    let (status, capped) = create(&f, "child001", "# One more\nx", json!({})).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{capped}");
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/owner/blocked",
+        Some(json!({"sender_session_id": "child001", "reason": "Plug in the test phone"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
     let listing = inbox(&f, "open").await;
     assert_eq!(keys(&listing)[0], "agent:eng00001", "{listing}");
     assert_eq!(row(&listing, "agent:eng00001")["group"], "blocked");
@@ -2149,6 +2164,8 @@ async fn sm_blocked_files_a_blocked_on_you_thread_above_needs_you() {
         listing["needs_you_count"], 1,
         "the ended agent's ask no longer needs you"
     );
+    // child001 is retired, so its block is history rather than an ask.
+    assert_eq!(listing["blocked_count"], 1, "{listing}");
 
     let (status, watch) = request(&f.app, "GET", "/watch/state", None).await;
     assert_eq!(status, StatusCode::OK);

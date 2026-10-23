@@ -191,3 +191,28 @@ fn the_store_round_trips_and_skips_unchanged_writes() {
     assert_eq!(store.load().unwrap().manual_since, Some(format_ts(now)));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn a_dnd_report_goes_stale_after_twelve_hours() {
+    let reported = datetime!(2026-10-22 08:00 -7);
+    let state = report_dnd(&State::default(), true, reported);
+    let fresh = reported + Duration::hours(11);
+    assert_eq!(
+        evaluate(fresh, PT, &settings(), &state, None)
+            .unwrap()
+            .source,
+        Source::Dnd
+    );
+    assert!(evaluate(reported + DND_REPORT_TTL, PT, &settings(), &state, None).is_none());
+    // A renewed report keeps the episode and makes it count again.
+    let renewed = report_dnd(&state, true, reported + Duration::hours(13));
+    assert_eq!(renewed.dnd_since, state.dnd_since);
+    assert!(evaluate(
+        reported + Duration::hours(14),
+        PT,
+        &settings(),
+        &renewed,
+        None
+    )
+    .is_some());
+}

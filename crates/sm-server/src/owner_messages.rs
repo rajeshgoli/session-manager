@@ -561,7 +561,8 @@ impl OwnerMessageStore {
             params![message.sender_session_id, message.human],
             |row| row.get(0),
         )?;
-        if unread >= UNREAD_CAP {
+        // `sm blocked` (sm#2494) is the escalation after many updates; the cap must not stop it.
+        if unread >= UNREAD_CAP && !message.blocked {
             return Ok(CreateOwnerMessage::UnreadCapReached);
         }
         let id = allocate_message_id(&tx)?;

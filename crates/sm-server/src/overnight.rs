@@ -94,6 +94,9 @@ pub fn parse_clock(value: &str) -> Option<Time> {
     Time::from_hms(hours.parse().ok()?, minutes.parse().ok()?, 0).ok()
 }
 
+/// How long a Do Not Disturb report counts without a newer one.
+pub const DND_REPORT_TTL: Duration = Duration::hours(12);
+
 /// What sm remembers between evaluations. Stored as one JSON row.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
@@ -186,7 +189,14 @@ pub fn evaluate(
             });
         }
     }
-    if settings.follow_dnd {
+    // A report the phone has not renewed for half a day is stale: the app's
+    // process may have died before Do Not Disturb turned off.
+    let dnd_fresh = state
+        .dnd_reported_at
+        .as_deref()
+        .and_then(parse_ts)
+        .is_some_and(|at| now - at < DND_REPORT_TTL);
+    if settings.follow_dnd && dnd_fresh {
         if let Some(dnd_since) = state
             .dnd_since
             .as_deref()

@@ -338,27 +338,27 @@ impl OwnerPushStore {
         Ok(exists)
     }
 
-    /// Overnight mode stopped holding alerts (sm#2494): the notices and
-    /// fired follows that waited since `since` are marked sent without a
-    /// push, so the phone does not buzz once per agent; one summary covers
-    /// them. Returns how many.
+    /// Notices created since `since` that have not gone out: what an
+    /// overnight night held (sm#2494).
+    pub fn held_count(&self, since: OffsetDateTime) -> Result<usize> {
+        let count: i64 = self.open()?.query_row(
+            "SELECT COUNT(*) FROM owner_notices WHERE notified_at IS NULL AND created_at >= ?1",
+            params![format_ts(since)],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// Overnight mode stopped holding alerts and one summary covers them
+    /// (sm#2494): the notices that waited since `since` are marked sent
+    /// without a push, so the phone does not buzz once per agent. Follows
+    /// the owner asked for still go out. Returns how many.
     pub fn release_held(&self, since: OffsetDateTime, now: OffsetDateTime) -> Result<usize> {
-        let mut conn = self.open()?;
-        let tx = conn.transaction()?;
-        let (since, now) = (format_ts(since), format_ts(now));
-        let notices = tx.execute(
+        Ok(self.open()?.execute(
             "UPDATE owner_notices SET notified_at = ?2, notified_via = 'overnight' \
              WHERE notified_at IS NULL AND created_at >= ?1",
-            params![since, now],
-        )?;
-        let follows = tx.execute(
-            "UPDATE owner_follows SET notified_at = ?2, notified_via = 'overnight' \
-             WHERE fired_at IS NOT NULL AND notified_at IS NULL AND cancelled_at IS NULL \
-               AND fired_at >= ?1",
-            params![since, now],
-        )?;
-        tx.commit()?;
-        Ok(notices + follows)
+            params![format_ts(since), format_ts(now)],
+        )?)
     }
 
     /// The owner's notices from the last 7 days, newest first.
