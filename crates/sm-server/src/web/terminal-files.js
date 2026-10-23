@@ -29,6 +29,10 @@ export function installFileLinks(terminal, id, activate) {
         for (let col = 0; col < line.length; col++) {
           const cell = line.getCell(col);
           if (!cell || cell.getWidth() === 0) continue;
+          // xterm leaves a structural blank when a wide character cannot fit
+          // in the final column. It belongs to neither the text nor the path.
+          const next = col === line.length - 1 && row < end ? buffer.getLine(row + 1) : null;
+          if (!cell.getChars() && next?.isWrapped && next.getCell(0)?.getWidth() === 2) continue;
           const chars = cell.getChars() || ' ';
           for (let i = 0; i < chars.length; i++) cells.push({ x: col + 1, y: row + 1, width: cell.getWidth() });
           text += chars;
