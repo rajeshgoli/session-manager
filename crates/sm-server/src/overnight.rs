@@ -119,7 +119,23 @@ pub struct State {
     /// What the follow pass last acted on, to find transitions.
     #[serde(default)]
     pub seen: Option<Away>,
+    /// The night's summary push, until the phone says it showed it.
+    #[serde(default)]
+    pub summary: Option<PendingSummary>,
 }
+
+/// A summary push out for acknowledgement. The night's held alerts stay
+/// held until the phone shows it; with no acknowledgement within
+/// [`SUMMARY_ACK_WINDOW`] they go out one by one after all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSummary {
+    pub id: String,
+    /// The night's start: what it held was created since then.
+    pub since: String,
+    pub sent_at: String,
+}
+
+pub const SUMMARY_ACK_WINDOW: Duration = Duration::minutes(15);
 
 /// The bedtime window containing `now` in local time, as UTC instants.
 fn bedtime_window(

@@ -181,45 +181,105 @@ pub(super) async fn put_dnd(
     respond(state).await
 }
 
+/// `POST /client/overnight/summary/{id}/ack`: the phone showed the night's
+/// summary, so the alerts it stands for are released without a push each.
+pub(super) async fn ack_summary(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    // The same guard as a notice acknowledgement: the phone's push service sends it.
+    follows::owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let at = OffsetDateTime::now_utc();
+        let mut released = None;
+        store(&state).update(|current| match &current.summary {
+            Some(summary) if summary.id == id => {
+                released = Some(summary.since.clone());
+                overnight::State {
+                    summary: None,
+                    ..current.clone()
+                }
+            }
+            _ => current.clone(),
+        })?;
+        if let Some(since) = released.as_deref().and_then(parse_ts) {
+            follows::push_store(&state).release_held(since, at)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 impl AppState {
     /// The follow pass's overnight step. Returns whether alerts wait now.
     /// On a new night it tells each agent with an unanswered message that
     /// the owner is away. When a night that held alerts ends, the message
     /// alerts that waited give way to one summary push: released silently
-    /// when the owner is already back, or once a phone has the summary.
-    /// Otherwise (no phone, a failed push, nothing to summarize, or the
-    /// follows the owner asked for) they go out one by one with their usual
-    /// retries and email fallback.
+    /// when the owner is already back, or when the phone acknowledges it
+    /// showed the summary. Otherwise (no phone, a failed or unshown push,
+    /// nothing to summarize, or the follows the owner asked for) they go out
+    /// one by one with their usual retries and email fallback.
     pub(super) fn overnight_tick(&self, at: OffsetDateTime) -> anyhow::Result<bool> {
         let now = evaluate(self, at)?;
+        let push = follows::push_store(self);
+        let mut holds = now
+            .away
+            .as_ref()
+            .is_some_and(|away| away.source.holds_alerts());
+        if let Some(summary) = &now.stored.summary {
+            let since = parse_ts(&summary.since).unwrap_or(at);
+            let sent = parse_ts(&summary.sent_at).unwrap_or(at);
+            let owner_back = now.last_activity.is_some_and(|last| last > sent);
+            if owner_back {
+                push.release_held(since, at)?;
+            }
+            if owner_back || at - sent >= overnight::SUMMARY_ACK_WINDOW {
+                store(self).update(|current| overnight::State {
+                    summary: None,
+                    ..current.clone()
+                })?;
+            } else {
+                holds = true;
+            }
+        }
         let seen = now.stored.seen.clone();
         if seen == now.away {
-            return Ok(now.away.is_some_and(|away| away.source.holds_alerts()));
+            return Ok(holds);
         }
         if let (None, Some(away)) = (&seen, &now.away) {
             self.tell_waiting_agents(away, at);
         }
         let held_before = seen.as_ref().filter(|away| away.source.holds_alerts());
-        let holds_now = now
-            .away
-            .as_ref()
-            .is_some_and(|away| away.source.holds_alerts());
-        if let (Some(night), false) = (held_before, holds_now) {
+        let mut pending = None;
+        if let (Some(night), false) = (held_before, holds) {
             let since = parse_ts(&night.since).unwrap_or(at);
             let owner_back = now.last_activity.is_some_and(|last| last > since);
-            let store = follows::push_store(self);
-            if owner_back
-                || (store.held_count(since)? > 0 && self.send_overnight_summary(&night.since))
-            {
-                store.release_held(since, at)?;
+            if owner_back {
+                push.release_held(since, at)?;
+            } else if push.held_count(since)? > 0 {
+                let id = format!("ovs-{}", since.unix_timestamp());
+                if self.send_overnight_summary(&night.since, &id) {
+                    pending = Some(overnight::PendingSummary {
+                        id,
+                        since: night.since.clone(),
+                        sent_at: format_ts(at),
+                    });
+                    holds = true;
+                }
             }
         }
         let next = now.away.clone();
         store(self).update(|current| overnight::State {
             seen: next,
+            summary: pending.or_else(|| current.summary.clone()),
             ..current.clone()
         })?;
-        Ok(holds_now)
+        Ok(holds)
     }
 
     /// One `[sm autoreply]` per agent waiting on an answer (a blocking
@@ -229,6 +289,7 @@ impl AppState {
         let Some(human) = owner_human(&self.config) else {
             return;
         };
+        // Older open blocking messages come back too, whatever their age.
         let window = format_ts(at - time::Duration::hours(24));
         let rows = match super::messages::owner_message_store(self).for_obligations(&window) {
             Ok(rows) => rows,
@@ -244,7 +305,6 @@ impl AppState {
                     && message.blocking
                     && message.human == human.name
                     && message.handled_at.is_none()
-                    && message.created_at >= window
                     && message.created_at < away.since
             })
             .map(|(message, _)| message.sender_session_id)
@@ -277,8 +337,9 @@ impl AppState {
     }
 
     /// The morning push: what waited, in one notification that opens the
-    /// Inbox. Returns whether at least one phone took it.
-    fn send_overnight_summary(&self, since: &str) -> bool {
+    /// Inbox; the phone acknowledges `id` once it shows it. Returns whether
+    /// at least one phone took it.
+    fn send_overnight_summary(&self, since: &str, id: &str) -> bool {
         let Some(sender) = self.push_sender.as_deref() else {
             return false;
         };
@@ -298,6 +359,7 @@ impl AppState {
             ("title".to_owned(), title),
             ("body".to_owned(), body),
             ("reader_path".to_owned(), "/inbox".to_owned()),
+            ("summary_id".to_owned(), id.to_owned()),
         ]);
         let store = follows::push_store(self);
         let user = follows::notice_user_id(self, None);

@@ -42,7 +42,11 @@ class FollowMessagingService : FirebaseMessagingService() {
         // instead, even when unregistering the token failed (offline, say).
         if (!enabled) return
         if (message.data["kind"] == NoticePush.KIND_OVERNIGHT_SUMMARY) {
-            NoticePush.showOvernightSummary(applicationContext, message.data)
+            // Acknowledged only when shown: until then sm keeps the night's alerts to send one by one.
+            val summaryId = message.data["summary_id"]?.takeIf { it.isNotBlank() }
+            if (NoticePush.showOvernightSummary(applicationContext, message.data) && summaryId != null) {
+                scope.launch { SessionManagerRepository(settings).ackOvernightSummary(serverUrl, accessToken, summaryId) }
+            }
             return
         }
         if (message.data["kind"] == NoticePush.KIND_GITHUB_CODEX_PAUSED) {

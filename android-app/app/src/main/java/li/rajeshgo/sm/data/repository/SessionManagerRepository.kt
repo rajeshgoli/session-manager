@@ -448,6 +448,10 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).setOvernight(li.rajeshgo.sm.data.model.OvernightSwitch(on)) }.mapFailure(::classifyWriteFailure)
     }
 
+    suspend fun ackOvernightSummary(baseUrl: String, token: String, summaryId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).ackOvernightSummary(summaryId) }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun reportDnd(baseUrl: String, token: String, on: Boolean) = withContext(Dispatchers.IO) {
         runCatching { api(baseUrl, token).reportDnd(li.rajeshgo.sm.data.model.OvernightSwitch(on)) }.mapFailure(::classifyWriteFailure)
     }

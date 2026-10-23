@@ -198,6 +198,10 @@ interface ApiService {
     @retrofit2.http.PUT("client/overnight")
     suspend fun setOvernight(@Body body: li.rajeshgo.sm.data.model.OvernightSwitch): li.rajeshgo.sm.data.model.OvernightStatus
 
+    /** The night's summary notification is showing, so sm releases the alerts it stands for. */
+    @POST("client/overnight/summary/{summary_id}/ack")
+    suspend fun ackOvernightSummary(@Path("summary_id") summaryId: String)
+
     /** The phone's Do Not Disturb; a background report, not the owner's action. */
     @retrofit2.http.PUT("client/overnight/dnd")
     suspend fun reportDnd(

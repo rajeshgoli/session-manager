@@ -2201,6 +2201,10 @@ pub fn router(state: AppState) -> Router {
             get(overnight::get_overnight).put(overnight::put_overnight),
         )
         .route("/client/overnight/dnd", put(overnight::put_dnd))
+        .route(
+            "/client/overnight/summary/{id}/ack",
+            post(overnight::ack_summary),
+        )
         .route("/client/devices", get(list_mobile_terminal_devices))
         .route("/client/devices/enroll", post(enroll_browser_computer))
         .route(

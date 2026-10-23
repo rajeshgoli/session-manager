@@ -599,6 +599,7 @@ pub const ACTIONS: &[(&str, &str, &str, Option<&str>)] = &[
     ("GET", "/client/overnight", "overnight.open", None),
     ("PUT", "/client/overnight", "overnight.change", None),
     ("PUT", "/client/overnight/dnd", "overnight.dnd", None),
+    ("POST", "/client/overnight/summary/{id}/ack", "overnight.summary_ack", None),
     ("GET", "/devices/{id}/ssh-keys", "device.ssh_keys", Some("device")),
     ("POST", "/devices/{id}/ssh-keys", "device.ssh_key_add", Some("device")),
     ("DELETE", "/devices/{id}/ssh-keys/{fingerprint}", "device.ssh_key_remove", Some("device")),

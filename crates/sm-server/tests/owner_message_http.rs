@@ -2196,3 +2196,71 @@ async fn sm_blocked_files_a_blocked_on_you_thread_above_needs_you() {
         "{listing}"
     );
 }
+
+#[tokio::test]
+async fn a_night_ends_with_one_summary_and_its_alerts_wait_for_the_phone_to_show_it() {
+    use sm_server::overnight::{Away, OvernightStore, Source, State};
+    let sender = Arc::new(RecordingSender::default());
+    let f = fixture_with_push(Some(sender.clone()));
+    let (status, _) = request(
+        &f.app,
+        "PUT",
+        "/client/push-token",
+        Some(json!({"token": "tok1", "device_name": "Pixel"})),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    // A night that held alerts has just ended, with a blocked agent waiting
+    // and the owner not back.
+    let since = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+    let store = OvernightStore::new(f.dir.join("message_queue.db"));
+    store
+        .update(|_| State {
+            seen: Some(Away {
+                source: Source::Manual,
+                since: sm_server::owner_push::format_ts(since),
+                until: None,
+            }),
+            ..State::default()
+        })
+        .unwrap();
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/owner/blocked",
+        Some(json!({"sender_session_id": "eng00001", "reason": "Log in to GitHub"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let kinds = || {
+        sender
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|data| data["kind"].clone())
+            .collect::<Vec<_>>()
+    };
+    follow_pass(&f).await;
+    follow_pass(&f).await;
+    assert_eq!(
+        kinds(),
+        vec!["overnight_summary".to_owned()],
+        "held until shown"
+    );
+    let summary = sender.sent.lock().unwrap()[0].clone();
+    assert_eq!(summary["title"], "1 agent is blocked on you");
+    assert_eq!(summary["reader_path"], "/inbox");
+
+    // Shown on the phone: the alert it stands for is released, never pushed.
+    let (status, _) = send(
+        &f.app,
+        "POST",
+        &format!("/client/overnight/summary/{}/ack", summary["summary_id"]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    follow_pass(&f).await;
+    assert_eq!(kinds(), vec!["overnight_summary".to_owned()]);
+}
