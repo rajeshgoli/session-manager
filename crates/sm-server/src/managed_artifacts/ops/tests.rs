@@ -591,6 +591,24 @@ fn managed_artifacts_ops_queued_thaw_ends_when_its_last_waiting_job_goes() {
     f.manager.config.floor_percent = 5;
     resume(&f.manager).unwrap();
     assert_eq!(f.detail("sample")["state"], "frozen");
+
+    // An explicit thaw of sm's queued thaw survives the job's cancellation.
+    reserve_reader(&f, "second");
+    f.manager.config.floor_percent = 100;
+    resume(&f.manager).unwrap();
+    assert_eq!(f.detail("sample")["operation"]["phase"], "queued");
+    request(&f.manager, &f.root, "sample", "thawing", "agent").unwrap();
+    f.manager
+        .store
+        .open()
+        .unwrap()
+        .execute("DELETE FROM artifact_job_reservations", [])
+        .unwrap();
+    resume(&f.manager).unwrap();
+    assert_eq!(f.detail("sample")["operation"]["phase"], "queued");
+    f.manager.config.floor_percent = 5;
+    resume(&f.manager).unwrap();
+    f.assert_bytes("sample");
 }
 
 #[test]

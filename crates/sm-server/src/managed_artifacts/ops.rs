@@ -189,7 +189,14 @@ pub fn request(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let first = artifact(&tx, &root.path, name)?;
     if first["op"] == kind {
-        return store::detail(&tx, &root.path, name);
+        // An explicit request adopts sm's queued operation, so the thaw outlives
+        // the queue jobs that first asked for it (sm#2500).
+        if actor != "sm" {
+            tx.execute("UPDATE artifact_operations SET actor=?3 WHERE root=?1 AND set_id=?2 AND phase NOT IN ('done','failed') AND actor='sm'",params![root.path,first["set_id"].as_str(),actor])?;
+        }
+        let result = store::detail(&tx, &root.path, name)?;
+        tx.commit()?;
+        return Ok(result);
     }
     let set = first["set_id"].as_str().context("artifact set")?;
     let members = store::query(
