@@ -27,6 +27,10 @@ enum ArtifactCommand {
         #[arg(long)]
         wait: bool,
     },
+    /// Cancel the queued freeze, thaw or move of NAME's set before it copies.
+    Cancel {
+        name: String,
+    },
     Rebuild {
         name: String,
     },
@@ -173,6 +177,7 @@ pub(crate) fn run(client: &ApiClient, args: ArtifactArgs) -> Result<()> {
             wait_for_thaw = wait;
             (name, "thaw", json!({}))
         }
+        ArtifactCommand::Cancel { name } => (name, "cancel", json!({})),
         ArtifactCommand::Rebuild { name } => (name, "rebuild", json!({})),
         ArtifactCommand::Measure { name } => (name, "measure", json!({})),
         ArtifactCommand::Done { name } => (name, "done", json!({})),

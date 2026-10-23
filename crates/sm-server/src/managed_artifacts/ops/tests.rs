@@ -547,3 +547,124 @@ fn managed_artifacts_ops_low_space_thaw_retains_one_pending_operation() {
     resume(&f.manager).unwrap();
     f.assert_bytes("sample");
 }
+
+fn reserve_reader(f: &Fixture, job: &str) {
+    let conn = f.manager.store.open().unwrap();
+    conn.execute("INSERT INTO artifact_job_reservations(job_id,root,outputs_json,inputs_json,disk_bytes) VALUES(?1,?2,'[]','[\"sample\"]',0)",params![job,f.root.path]).unwrap();
+    queue::request_operation(&conn, &f.root.path, "sample", "thaw_requested", job).unwrap();
+}
+
+#[test]
+fn managed_artifacts_ops_queued_thaw_ends_when_its_last_waiting_job_goes() {
+    let mut f = Fixture::new();
+    f.create("sample");
+    f.op("sample", "freezing");
+    resume(&f.manager).unwrap();
+    reserve_reader(&f, "reader");
+    f.manager.config.floor_percent = 100;
+    resume(&f.manager).unwrap();
+    let waiting = f.detail("sample")["operation"].clone();
+    assert_eq!(waiting["phase"], "queued");
+    // The job is cancelled: queue completion drops its reservation.
+    let conn = f.manager.store.open().unwrap();
+    conn.execute("DELETE FROM artifact_job_reservations", [])
+        .unwrap();
+    resume(&f.manager).unwrap();
+    let a = f.detail("sample");
+    assert_eq!(a["operation"]["id"], waiting["id"]);
+    assert_eq!(a["operation"]["phase"], "failed");
+    assert!(a["operation"]["error"]
+        .as_str()
+        .unwrap()
+        .starts_with("Cancelled by sm:"));
+    assert!(a["op"].is_null());
+    assert_eq!(a["state"], "frozen");
+    assert!(Path::new(&f.root.cold_store)
+        .join(".frozen/sample")
+        .is_dir());
+    assert!(a["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "op_cancelled"));
+    // Space returning later restores nothing.
+    f.manager.config.floor_percent = 5;
+    resume(&f.manager).unwrap();
+    assert_eq!(f.detail("sample")["state"], "frozen");
+
+    // An explicit thaw of sm's queued thaw survives the job's cancellation.
+    reserve_reader(&f, "second");
+    f.manager.config.floor_percent = 100;
+    resume(&f.manager).unwrap();
+    assert_eq!(f.detail("sample")["operation"]["phase"], "queued");
+    request(&f.manager, &f.root, "sample", "thawing", "agent").unwrap();
+    f.manager
+        .store
+        .open()
+        .unwrap()
+        .execute("DELETE FROM artifact_job_reservations", [])
+        .unwrap();
+    resume(&f.manager).unwrap();
+    assert_eq!(f.detail("sample")["operation"]["phase"], "queued");
+    f.manager.config.floor_percent = 5;
+    resume(&f.manager).unwrap();
+    f.assert_bytes("sample");
+}
+
+#[test]
+fn managed_artifacts_ops_explicit_cancel_refuses_started_needed_or_owner_operations() {
+    let f = Fixture::new();
+    f.create("sample");
+    f.op("sample", "freezing");
+    resume(&f.manager).unwrap();
+    let error = cancel(&f.manager, &f.root, "sample", "agent", false).unwrap_err();
+    assert!(error.to_string().contains("no operation to cancel"));
+
+    request(
+        &f.manager,
+        &f.root,
+        "sample",
+        "thawing",
+        "owner@example.com",
+    )
+    .unwrap();
+    let error = cancel(&f.manager, &f.root, "sample", "agent", false).unwrap_err();
+    assert!(error.to_string().contains("only the owner"));
+    reserve_reader(&f, "reader");
+    let error = cancel(&f.manager, &f.root, "sample", "owner@example.com", true).unwrap_err();
+    assert!(error.to_string().contains("reader still wait"));
+    f.manager
+        .store
+        .open()
+        .unwrap()
+        .execute("DELETE FROM artifact_job_reservations", [])
+        .unwrap();
+    let a = cancel(&f.manager, &f.root, "sample", "owner@example.com", true).unwrap();
+    assert_eq!(a["operation"]["phase"], "failed");
+    assert!(a["op"].is_null());
+
+    // A cancellation that lands while a worker measures space wins.
+    let mut op = f.op("sample", "thawing");
+    cancel(&f.manager, &f.root, "sample", "agent", false).unwrap();
+    assert!(!stage(&f.manager, &mut op).unwrap());
+    assert_eq!(f.detail("sample")["operation"]["phase"], "failed");
+    assert!(!Path::new(&f.root.cold_store)
+        .join(".sample.thawing")
+        .exists());
+
+    // Copying has begun: the operation runs to its end.
+    let op = f.op("sample", "thawing");
+    f.manager
+        .store
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE artifact_operations SET phase='copying' WHERE id=?1",
+            [op.id],
+        )
+        .unwrap();
+    let error = cancel(&f.manager, &f.root, "sample", "agent", false).unwrap_err();
+    assert!(error.to_string().contains("only a queued operation"));
+    resume(&f.manager).unwrap();
+    f.assert_bytes("sample");
+}

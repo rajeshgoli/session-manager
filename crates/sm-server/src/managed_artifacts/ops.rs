@@ -189,7 +189,14 @@ pub fn request(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let first = artifact(&tx, &root.path, name)?;
     if first["op"] == kind {
-        return store::detail(&tx, &root.path, name);
+        // An explicit request adopts sm's queued operation, so the thaw outlives
+        // the queue jobs that first asked for it (sm#2500).
+        if actor != "sm" {
+            tx.execute("UPDATE artifact_operations SET actor=?3 WHERE root=?1 AND set_id=?2 AND phase NOT IN ('done','failed') AND actor='sm'",params![root.path,first["set_id"].as_str(),actor])?;
+        }
+        let result = store::detail(&tx, &root.path, name)?;
+        tx.commit()?;
+        return Ok(result);
     }
     let set = first["set_id"].as_str().context("artifact set")?;
     let members = store::query(
@@ -289,6 +296,146 @@ pub fn request(
     Ok(result)
 }
 
+/// Queue jobs still waiting to read a member of the set. Each one would
+/// request the thaw again, so a thaw they need is never cancelled.
+fn waiting_readers(conn: &Connection, root: &str, members: &[Member]) -> Result<Vec<String>> {
+    let mut jobs = Vec::new();
+    for r in store::query(
+        conn,
+        "SELECT job_id,inputs_json FROM artifact_job_reservations WHERE root=?1 ORDER BY job_id",
+        &[&root],
+    )? {
+        let names: Vec<String> = serde_json::from_str(r["inputs_json"].as_str().unwrap_or("[]"))?;
+        if names
+            .iter()
+            .any(|n| members.iter().any(|m| m.name.eq_ignore_ascii_case(n)))
+        {
+            jobs.push(r["job_id"].as_str().unwrap_or_default().to_owned());
+        }
+    }
+    Ok(jobs)
+}
+/// Ends a queued operation before it writes anything: no staging folder
+/// exists yet and the archive or source is untouched (sm#2500).
+fn cancel_queued(
+    tx: &Connection,
+    id: i64,
+    root: &str,
+    kind: &str,
+    members: &[Member],
+    actor: &str,
+    reason: &str,
+) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE artifact_operations SET phase='failed',finished_at=?2,error=?3 WHERE id=?1 AND phase='queued'",
+        params![id, now(), format!("Cancelled by {actor}: {reason}")],
+    )?;
+    ensure!(changed == 1, "operation {id} is no longer queued");
+    for m in members {
+        tx.execute(
+            "UPDATE artifacts SET op=NULL WHERE root=?1 AND name=?2 AND op=?3",
+            params![root, m.name, kind],
+        )?;
+        event(
+            tx,
+            root,
+            &m.name,
+            "op_cancelled",
+            actor,
+            json!({"operation_id":id,"operation":kind,"reason":reason}),
+        )?;
+    }
+    Ok(())
+}
+/// Cancels the set's queued operation. One that has started copying runs to
+/// its end; a thaw a waiting queue job reads stays until that job is cancelled.
+/// Only the owner cancels what the owner requested.
+pub fn cancel(
+    manager: &ManagedArtifacts,
+    root: &ArtifactRoot,
+    name: &str,
+    actor: &str,
+    owner: bool,
+) -> Result<Value> {
+    let mut conn = manager.store.open()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let a = artifact(&tx, &root.path, name)?;
+    let set = a["set_id"].as_str().context("artifact set")?;
+    let row = store::query(
+        &tx,
+        "SELECT * FROM artifact_operations WHERE root=?1 AND set_id=?2 AND phase NOT IN ('done','failed')",
+        &[&root.path, &set],
+    )?
+    .pop()
+    .with_context(|| format!("{name} has no operation to cancel"))?;
+    let id = row["id"].as_i64().context("operation id")?;
+    let kind = row["kind"].as_str().context("kind")?;
+    let phase = row["phase"].as_str().context("phase")?;
+    ensure!(
+        phase == "queued",
+        "operation {id} is {phase}; only a queued operation can be cancelled"
+    );
+    let requester = row["actor"].as_str().unwrap_or("sm");
+    ensure!(
+        owner || !requester.contains('@'),
+        "operation {id} was requested by the owner; only the owner can cancel it"
+    );
+    let members: Vec<Member> =
+        serde_json::from_str(row["members_json"].as_str().context("members")?)?;
+    if kind == "thawing" {
+        let jobs = waiting_readers(&tx, &root.path, &members)?;
+        ensure!(
+            jobs.is_empty(),
+            "queue jobs {} still wait on this thaw; cancel them first",
+            jobs.join(", ")
+        );
+    }
+    cancel_queued(
+        &tx,
+        id,
+        &root.path,
+        kind,
+        &members,
+        actor,
+        "requested cancellation",
+    )?;
+    let result = store::detail(&tx, &root.path, name)?;
+    tx.commit()?;
+    Ok(result)
+}
+/// A thaw sm requested for queue jobs ends once none of them waits on it,
+/// so a cancelled job leaves no restore running behind it (sm#2500).
+fn abandon_unneeded_thaw(manager: &ManagedArtifacts, op: &Operation) -> Result<bool> {
+    if op.kind != "thawing" || op.phase != "queued" || op.actor != "sm" {
+        return Ok(false);
+    }
+    let mut conn = manager.store.open()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // An explicit request may have adopted it since this pass loaded the batch.
+    let (phase, actor): (String, String) = tx.query_row(
+        "SELECT phase,actor FROM artifact_operations WHERE id=?1",
+        [op.id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if phase != "queued"
+        || actor != "sm"
+        || !waiting_readers(&tx, &op.root.path, &op.members)?.is_empty()
+    {
+        return Ok(false);
+    }
+    cancel_queued(
+        &tx,
+        op.id,
+        &op.root.path,
+        &op.kind,
+        &op.members,
+        "sm",
+        "no waiting queue job reads it",
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 /// Splits a freeze archive whose source sits on the cold store's own disk into
 /// what stays there for good and what it only borrows (sm#2488): publication
 /// removes the source, so only an archive larger than its source grows the disk.
@@ -375,7 +522,7 @@ fn space(manager: &ManagedArtifacts, op: &Operation) -> Result<Option<&'static s
 }
 fn stage(manager: &ManagedArtifacts, op: &mut Operation) -> Result<bool> {
     let Some(disk) = space(manager, op)? else {
-        manager.store.open()?.execute("UPDATE artifact_operations SET error='Waiting for disk space above the floor and reservations' WHERE id=?1",[op.id])?;
+        manager.store.open()?.execute("UPDATE artifact_operations SET error='Waiting for disk space above the floor and reservations' WHERE id=?1 AND phase=?2",params![op.id, op.phase])?;
         return Ok(false);
     };
     store::set_meta(
@@ -390,10 +537,14 @@ fn stage(manager: &ManagedArtifacts, op: &mut Operation) -> Result<bool> {
     }
     // The destination is journaled with the phase, so recovery discards the
     // right staging folder and publishes where the copy went.
-    manager.store.open()?.execute(
-        "UPDATE artifact_operations SET phase='copying',members_json=?2,error=NULL WHERE id=?1",
-        params![op.id, serde_json::to_string(&op.members)?],
-    )?;
+    // A cancellation that landed while this pass measured space wins.
+    if manager.store.open()?.execute(
+        "UPDATE artifact_operations SET phase='copying',members_json=?2,error=NULL WHERE id=?1 AND phase=?3",
+        params![op.id, serde_json::to_string(&op.members)?, op.phase],
+    )? == 0
+    {
+        return Ok(false);
+    }
     for m in &op.members {
         mounted(&op.root)?;
         let (_, staging, _) = paths(&op.root, m, &op.kind);
@@ -769,6 +920,9 @@ pub fn resume(manager: &ManagedArtifacts) -> Result<()> {
                 members: serde_json::from_str(row["members_json"].as_str().context("members")?)?,
                 actor: row["actor"].as_str().unwrap_or("sm").into(),
             };
+            if abandon_unneeded_thaw(manager, &op)? {
+                continue;
+            }
             if let Err(error) = run(manager, &mut op) {
                 let mut db = manager.store.open()?;
                 let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -777,6 +931,10 @@ pub fn resume(manager: &ManagedArtifacts) -> Result<()> {
                     [op.id],
                     |r| r.get(0),
                 )?;
+                if phase == "failed" {
+                    // Cancelled while this pass worked on it; nothing was written.
+                    continue;
+                }
                 // Committed operations retain both their journal and op exclusion.
                 // Their remaining swaps/cleanup are idempotent on the next pass.
                 let abort =
