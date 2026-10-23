@@ -113,8 +113,8 @@ export function agentFact(agent, now = Date.now()) {
 function BackgroundJobs({ jobs, now }) {
   if (!jobs || !jobs.length) return null;
   const memory = (bytes) => bytes >= 1073741824 ? `${(bytes / 1073741824).toFixed(1)} G` : `${Math.round(bytes / 1048576)} M`;
-  return html`<section class="bg-jobs"><h4>Running in the background</h4>${jobs.map((job) => html`<div class="bg-job" key=${job.pid}>
-    <code title=${job.command}>${job.command}</code>
+  return html`<section class="bg-jobs"><h4>Running in the background</h4>${jobs.map((job) => html`<div class="bg-job" key=${job.pid || job.agent_id}>
+    <code title=${job.command || job.agent_type}>${job.command || `Agent: ${job.agent_type}`}</code>
     <small>${[job.started_at ? `started ${age(job.started_at, now)} ago` : null, job.memory_bytes != null ? memory(job.memory_bytes) : null].filter(Boolean).join(' · ')}</small>
   </div>`)}</section>`;
 }
@@ -662,7 +662,7 @@ export function AgentPanel({ id, controls, beside }) {
       onRetired=${(done) => { if (done) closePanel(); reload(); }} />`}
     <${Links} prs=${claims.filter(item => item.kind === 'pr')}
       jobs=${agent.jobs || []} docs=${agent.docs || []} />
-    <${BackgroundJobs} jobs=${agent.background_jobs} now=${now} />
+    <${BackgroundJobs} jobs=${[...(agent.background_jobs || []), ...(agent.background_agents || [])]} now=${now} />
     <${AgentStatus} agent=${agent} claims=${claims} now=${now} onAnswered=${reload} />
     <${Thread} key=${agent.id} id=${agent.id} embedded
       empty=${html`<div class="pbody"><${LastTurn} id=${agent.id} /></div>${agent.state !== 'stopped' ? html`<${MessageBox} agent=${agent} />` : null}`} />

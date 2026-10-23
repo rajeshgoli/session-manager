@@ -9538,6 +9538,7 @@ impl SessionStore {
             } else {
                 format!("sm-rust-{session_id}")
             },
+            subagents: Vec::new(),
             tmux_socket_name: tmux_socket_name.map(ToOwned::to_owned),
             node,
             host: None,
@@ -17354,6 +17355,9 @@ pub struct SessionRecord {
     pub name: String,
     pub working_dir: String,
     pub tmux_session: String,
+    /// Provider-native subagents recorded by the start/stop hooks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<Value>,
     #[serde(default)]
     pub tmux_socket_name: Option<String>,
     #[serde(default = "default_node")]
@@ -20986,6 +20990,7 @@ sleep 30
 
     fn session_record(status: &str) -> SessionRecord {
         SessionRecord {
+            subagents: Vec::new(),
             id: "abc12345".to_owned(),
             name: "claude-abc12345".to_owned(),
             working_dir: "/repo".to_owned(),
