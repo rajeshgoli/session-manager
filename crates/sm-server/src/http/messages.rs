@@ -85,7 +85,8 @@ pub(super) async fn answer_session_needs_you(
     };
     let kind = requested["kind"].as_str().unwrap_or(shown);
     match kind {
-        "message" => {
+        // A blocked agent's ask is a blocking message too (sm#2494).
+        "message" | "blocked" => {
             let _guard = state.owner_message_lock.lock().await;
             owner_answered(&state, &session_id, "manual")?;
         }
@@ -356,6 +357,80 @@ pub(super) struct CreateOwnerMessageRequest {
     blocking: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct BlockedRequest {
+    #[serde(default)]
+    sender_session_id: Option<String>,
+    #[serde(default)]
+    reason: String,
+}
+
+/// `POST /owner/blocked` (`sm blocked`): the sender cannot continue without
+/// the owner (sm#2494). Files a "Blocked on you" message to the owner.
+pub(super) async fn create_blocked_message(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<BlockedRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/owner/blocked")?;
+    ensure_core_writes_enabled(&state)?;
+    let Some(human) = super::overnight::owner_human(&state.config) else {
+        return Err(ApiError::NotFound("No owner recipient configured"));
+    };
+    let reason = payload.reason.trim().to_owned();
+    if reason.is_empty() {
+        return Err(bad_request("say why you are blocked"));
+    }
+    let first_line = derive_title(&reason);
+    let title = format!("Blocked: {first_line}");
+    let title = match title
+        .char_indices()
+        .nth(crate::owner_messages::MAX_TITLE_CHARS - 1)
+    {
+        Some((cut, _)) => format!("{}…", &title[..cut]),
+        None => title,
+    };
+    file_owner_message(
+        &state,
+        &headers,
+        human,
+        payload.sender_session_id.as_deref(),
+        reason,
+        Some(title),
+        true,
+        true,
+    )
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct BlockedDoneRequest {
+    sender_session_id: String,
+}
+
+/// `POST /owner/blocked/done` (`sm blocked --done`): the sender withdraws
+/// its open "Blocked on you".
+pub(super) async fn withdraw_blocked_message(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(payload): Json<BlockedDoneRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_allowed_from_parts(
+        &state.config,
+        &headers,
+        Some(peer_addr),
+        "/owner/blocked/done",
+    )?;
+    ensure_core_writes_enabled(&state)?;
+    let _guard = state.owner_message_lock.lock().await;
+    let cleared = owner_message_store(&state).withdraw_blocked(payload.sender_session_id.trim())?;
+    if cleared > 0 {
+        super::board::request_recompute(&state);
+    }
+    Ok(Json(json!({ "cleared": cleared })))
+}
+
 /// `POST /humans/{identifier}/messages`.
 pub(super) async fn create_owner_message(
     State(state): State<Arc<AppState>>,
@@ -377,34 +452,57 @@ pub(super) async fn create_owner_message(
     else {
         return Err(ApiError::NotFound("Human recipient not configured"));
     };
-    let text = payload.text;
+    file_owner_message(
+        &state,
+        &headers,
+        human,
+        payload.sender_session_id.as_deref(),
+        payload.text,
+        payload.title,
+        payload.blocking,
+        false,
+    )
+}
+
+/// Stores one message to `human`, notices it, and answers the sender; while
+/// the owner is away the answer carries the autoreply `sm` prints.
+#[allow(clippy::too_many_arguments)] // One call per route; a struct would only rename them.
+fn file_owner_message(
+    state: &AppState,
+    headers: &HeaderMap,
+    human: crate::email::HumanRecipient,
+    sender_session_id: Option<&str>,
+    text: String,
+    title: Option<String>,
+    blocking: bool,
+    blocked: bool,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     if text.trim().is_empty() {
         return Err(bad_request("text is required"));
     }
     if text.chars().count() > MAX_MESSAGE_CHARS {
         return Err(bad_request(TOO_LONG_DETAIL));
     }
-    let title = match payload.title.as_deref() {
+    let title = match title.as_deref() {
         Some(title) => validate_title(title).map_err(|error| bad_request(error.to_string()))?,
         None => derive_title(&text),
     };
-    let sender_id = payload
-        .sender_session_id
-        .as_deref()
+    let sender_id = sender_session_id
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .ok_or_else(|| bad_request("sender_session_id is required"))?;
     let Some(sender) = state.session_store.get_session(sender_id)? else {
         return Err(conflict(format!("Sender session {sender_id} not found")));
     };
-    let store = owner_message_store(&state);
+    let store = owner_message_store(state);
     let message = match store.create(NewOwnerMessage {
         human: human.name.clone(),
         sender_session_id: sender.id.clone(),
         sender_session_name: session_display_name(sender),
         title,
         body_markdown: text,
-        blocking: payload.blocking,
+        blocking,
+        blocked,
     })? {
         CreateOwnerMessage::Created(message) => *message,
         CreateOwnerMessage::UnreadCapReached => {
@@ -417,20 +515,37 @@ pub(super) async fn create_owner_message(
             });
         }
     };
-    super::follows::notice_new_message(&state, &message);
+    super::follows::notice_new_message(state, &message);
     if message.blocking {
-        super::board::request_recompute(&state);
+        super::board::request_recompute(state);
     }
     let reader_path = message_reader_path(&message.id);
+    let owner_message = super::overnight::owner_human(&state.config)
+        .is_some_and(|owner| owner.name == message.human);
+    let away = owner_message
+        .then(|| super::overnight::current_away(state))
+        .flatten();
+    let autoreply = away.as_ref().map(|away| {
+        let offset = crate::overnight::local_offset(OffsetDateTime::now_utc());
+        let owner = &state.config.owner_name;
+        if message.blocked {
+            crate::overnight::blocked_autoreply(owner, away, offset)
+        } else {
+            crate::overnight::send_autoreply(owner, away, offset)
+        }
+    });
     Ok((
         StatusCode::CREATED,
         Json(json!({
             "id": message.id,
             "title": message.title,
             "reader_path": reader_path,
-            "reader_url": message_reader_url(&state.config, &headers, &reader_path),
+            "reader_url": message_reader_url(&state.config, headers, &reader_path),
             "blocking": message.blocking,
+            "blocked": message.blocked,
             "owner_name": state.config.owner_name,
+            "away": away.as_ref().map(|away| away.source.as_str()),
+            "autoreply": autoreply,
         })),
     ))
 }

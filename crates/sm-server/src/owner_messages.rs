@@ -40,6 +40,9 @@ pub struct OwnerMessage {
     pub title: String,
     pub body_markdown: String,
     pub blocking: bool,
+    /// Sent with `sm blocked` (sm#2494): the agent cannot continue without
+    /// the owner. Always blocking too; shown as "Blocked on you".
+    pub blocked: bool,
     pub created_at: String,
     pub first_viewed_at: Option<String>,
     pub handled_at: Option<String>,
@@ -365,7 +368,8 @@ pub fn init_owner_messages_schema(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL,
             first_viewed_at TEXT,
             handled_at TEXT,
-            handled_via TEXT
+            handled_via TEXT,
+            blocked INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS owner_messages_sender
             ON owner_messages(sender_session_id, created_at);
@@ -400,14 +404,17 @@ pub fn init_owner_messages_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
-    let has_via = conn
+    let columns = conn
         .prepare("PRAGMA table_info(owner_messages)")?
         .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .iter()
-        .any(|column| column == "handled_via");
-    if !has_via {
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|column| column == "handled_via") {
         conn.execute_batch("ALTER TABLE owner_messages ADD COLUMN handled_via TEXT")?;
+    }
+    if !columns.iter().any(|column| column == "blocked") {
+        conn.execute_batch(
+            "ALTER TABLE owner_messages ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0",
+        )?;
     }
     Ok(())
 }
@@ -421,6 +428,7 @@ pub struct NewOwnerMessage {
     pub title: String,
     pub body_markdown: String,
     pub blocking: bool,
+    pub blocked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,20 +457,29 @@ pub struct OwnerMessageStore {
 }
 
 const MESSAGE_COLUMNS: &str = "id, human, sender_session_id, sender_session_name, title, \
-     body_markdown, blocking, created_at, first_viewed_at, handled_at, handled_via";
-const LEGACY_MESSAGE_COLUMNS: &str = "id, human, sender_session_id, sender_session_name, title, \
-     body_markdown, blocking, created_at, first_viewed_at, handled_at, NULL AS handled_via";
+     body_markdown, blocking, created_at, first_viewed_at, handled_at";
 
-fn message_columns(conn: &Connection) -> Result<&'static str> {
+/// Read connections never migrate, so a column a newer build added reads
+/// as its default.
+fn message_columns(conn: &Connection) -> Result<String> {
     let columns = conn
         .prepare("PRAGMA table_info(owner_messages)")?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(if columns.iter().any(|column| column == "handled_via") {
-        MESSAGE_COLUMNS
-    } else {
-        LEGACY_MESSAGE_COLUMNS
-    })
+    let has = |name: &str| columns.iter().any(|column| column == name);
+    Ok(format!(
+        "{MESSAGE_COLUMNS}, {}, {}",
+        if has("handled_via") {
+            "handled_via"
+        } else {
+            "NULL AS handled_via"
+        },
+        if has("blocked") {
+            "blocked"
+        } else {
+            "0 AS blocked"
+        },
+    ))
 }
 const DRAFT_COLUMNS: &str = "id, message_id, line, quote, body, created_at, updated_at";
 const REPLY_COLUMNS: &str =
@@ -550,8 +567,8 @@ impl OwnerMessageStore {
         let id = allocate_message_id(&tx)?;
         tx.execute(
             "INSERT INTO owner_messages (id, human, sender_session_id, sender_session_name, \
-               title, body_markdown, blocking, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+               title, body_markdown, blocking, created_at, blocked) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 message.human,
@@ -559,8 +576,9 @@ impl OwnerMessageStore {
                 message.sender_session_name,
                 message.title,
                 message.body_markdown,
-                message.blocking,
-                now_rfc3339()
+                message.blocking || message.blocked,
+                now_rfc3339(),
+                message.blocked
             ],
         )?;
         if let Some(key) = key {
@@ -620,6 +638,20 @@ impl OwnerMessageStore {
             params![id, now, via],
         )?;
         get_message_conn(&conn, id)
+    }
+
+    /// The agent got unblocked on its own (`sm blocked --done`): its open
+    /// "Blocked on you" messages are handled. Returns how many.
+    pub fn withdraw_blocked(&self, session_id: &str) -> Result<usize> {
+        let conn = self.open_write()?;
+        let now = now_rfc3339();
+        Ok(conn.execute(
+            "UPDATE owner_messages SET handled_at = ?2, first_viewed_at = \
+             IFNULL(first_viewed_at, ?2), handled_via = 'agent' \
+             WHERE sender_session_id = ?1 AND blocked = 1 AND handled_at IS NULL \
+             AND NOT EXISTS (SELECT 1 FROM owner_message_replies r WHERE r.message_id = owner_messages.id)",
+            params![session_id, now],
+        )?)
     }
 
     /// Answer all open blocking questions from one agent without sending it a message.
@@ -1081,6 +1113,7 @@ fn message_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerMessage> {
         first_viewed_at: row.get(8)?,
         handled_at: row.get(9)?,
         handled_via: row.get(10)?,
+        blocked: row.get::<_, i64>(11)? != 0,
     })
 }
 

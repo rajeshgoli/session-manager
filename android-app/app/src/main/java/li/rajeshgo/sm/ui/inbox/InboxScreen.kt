@@ -105,6 +105,7 @@ fun inboxRowDetail(row: InboxRow): String {
     } else {
         if (row.messageCount > 0) parts += if (row.messageCount == 1) "1 message" else "${row.messageCount} messages"
         if (row.agents.isEmpty() && row.docCount == 0) parts += when {
+            row.group == "blocked" -> "blocked on you"
             row.group == "needs_you" -> "asks you"
             row.status == "ended" -> "agent ended"
             row.preview.startsWith("You: ") -> "you replied"
@@ -146,6 +147,11 @@ fun InboxScreen(
     LaunchedEffect(pendingOpen) {
         val open = pendingOpen?.takeIf { it.inbox } ?: return@LaunchedEffect
         val path = open.readerPath ?: return@LaunchedEffect
+        // The overnight summary (sm#2494) opens the Inbox itself.
+        if (path == "/inbox") {
+            FollowOpenRequests.pending = null
+            return@LaunchedEffect
+        }
         threadTargetForPath(path, open.title.ifBlank { "Inbox" })?.let { target ->
             openThread = target
             FollowOpenRequests.pending = null
@@ -253,6 +259,7 @@ fun InboxScreen(
                                 maxLines = 2,
                                 overflow = TextOverflow.Ellipsis,
                                 color = when {
+                                    heading.startsWith("BLOCKED") -> Rose
                                     heading.startsWith("NEEDS") -> Amber
                                     heading.startsWith("NEW") -> Fuchsia
                                     else -> TextMuted
@@ -432,6 +439,7 @@ private fun SwipeToDone(onDone: () -> Unit, content: @Composable () -> Unit) {
 @Composable
 private fun InboxRowCard(row: InboxRow, now: OffsetDateTime, onClick: () -> Unit, onArchive: () -> Unit) {
     val accent = when (row.group) {
+        "blocked" -> Rose
         "needs_you" -> Amber
         "new" -> Fuchsia
         else -> Border
@@ -440,7 +448,14 @@ private fun InboxRowCard(row: InboxRow, now: OffsetDateTime, onClick: () -> Unit
         onClick = onClick,
         color = Panel,
         shape = RoundedCornerShape(10.dp),
-        border = BorderStroke(1.dp, if (row.group == "needs_you") Amber.copy(alpha = 0.55f) else Border),
+        border = BorderStroke(
+            1.dp,
+            when (row.group) {
+                "blocked" -> Rose.copy(alpha = 0.6f)
+                "needs_you" -> Amber.copy(alpha = 0.55f)
+                else -> Border
+            },
+        ),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.Top) {

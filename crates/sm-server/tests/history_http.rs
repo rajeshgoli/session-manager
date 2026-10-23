@@ -661,7 +661,7 @@ async fn watch_state_matches_what_sm_watch_shows() {
     assert_eq!(
         state["counts"],
         json!({"live": 3, "waiting_on_owner": 1,
-        "needs_you": 1, "finished": 0, "waiting_long": 1,
+        "needs_you": 1, "blocked": 0, "finished": 0, "waiting_long": 1,
         "moving": 0, "waiting": 0, "idle": 1})
     );
     assert_eq!(eng["attention"]["section"], "you");
@@ -680,6 +680,7 @@ async fn blocking_question_counts_and_manual_answer_moves_only_its_agent() {
             title: "Check terminal".into(),
             body_markdown: "Please check the terminal".into(),
             blocking: true,
+            blocked: false,
         })
         .unwrap();
     let before = watch_state(&f.app, "").await;
@@ -716,6 +717,7 @@ async fn blocking_question_counts_and_manual_answer_moves_only_its_agent() {
             title: "Second check".into(),
             body_markdown: "One more check".into(),
             blocking: true,
+            blocked: false,
         })
         .unwrap();
     assert_eq!(watch_state(&f.app, "").await["counts"]["needs_you"], 2);

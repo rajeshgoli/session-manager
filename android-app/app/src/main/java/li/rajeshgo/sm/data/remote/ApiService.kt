@@ -191,6 +191,20 @@ interface ApiService {
     @retrofit2.http.PUT("client/settings")
     suspend fun setOwnerSettings(@Body patch: kotlinx.serialization.json.JsonObject): kotlinx.serialization.json.JsonObject
 
+    /** Overnight mode (sm#2494), re-read in the background so it never counts as the owner's activity. */
+    @GET("client/overnight")
+    suspend fun getOvernight(@Header("x-sm-bg") background: String = "1"): li.rajeshgo.sm.data.model.OvernightStatus
+
+    @retrofit2.http.PUT("client/overnight")
+    suspend fun setOvernight(@Body body: li.rajeshgo.sm.data.model.OvernightSwitch): li.rajeshgo.sm.data.model.OvernightStatus
+
+    /** The phone's Do Not Disturb; a background report, not the owner's action. */
+    @retrofit2.http.PUT("client/overnight/dnd")
+    suspend fun reportDnd(
+        @Body body: li.rajeshgo.sm.data.model.OvernightSwitch,
+        @Header("x-sm-bg") background: String = "1",
+    ): li.rajeshgo.sm.data.model.OvernightStatus
+
     @POST("client/sessions/{session_id}/attach-ticket")
     suspend fun createMobileAttachTicket(
         @Path("session_id") sessionId: String,

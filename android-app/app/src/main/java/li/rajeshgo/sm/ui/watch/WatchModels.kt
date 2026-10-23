@@ -574,6 +574,8 @@ fun isStoppedSession(session: ClientSession): Boolean = session.status == "stopp
 
 /** Attention sections in the server's order (spec 1782 B), with their headings. */
 val ATTENTION_SECTIONS = listOf(
+    // An agent that ran `sm blocked` (sm#2494).
+    "blocked" to "BLOCKED ON YOU",
     "you" to "NEEDS YOU",
     "finished" to "FINISHED",
     "waiting_long" to "WAITING LONG",
@@ -659,7 +661,8 @@ fun youLine(session: ClientSession, now: OffsetDateTime = OffsetDateTime.now()):
     val you = session.facts?.you ?: return null
     val age = factAge(you.since, now)?.let { "$it: " }.orEmpty()
     val more = if (you.more > 0) " (+${you.more} more)" else ""
-    return "◆ $age${you.text.trim()}$more"
+    val mark = if (you.kind == "blocked") "◆ Blocked · " else "◆ "
+    return "$mark$age${you.text.trim()}$more"
 }
 
 /** Line 3 for a finished agent the owner has not read: the first line of its last turn message. */

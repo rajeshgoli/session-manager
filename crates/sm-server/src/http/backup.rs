@@ -573,6 +573,7 @@ fn deliver_alerts(state: &AppState, manager: &ManagedArtifacts) -> anyhow::Resul
                 title: r["title"].as_str().unwrap_or("Backup").into(),
                 body_markdown: r["body"].as_str().unwrap_or("").into(),
                 blocking: r["blocking"] == 1,
+                blocked: false,
             },
             Some(key),
         )?;

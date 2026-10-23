@@ -228,6 +228,7 @@ mod tests {
             title: "Artifacts need disk space".into(),
             body_markdown: "Free 10 GB.".into(),
             blocking: false,
+            blocked: false,
             created_at: "2026-10-20T00:00:00Z".into(),
             first_viewed_at: None,
             handled_at: handled_via.map(|_| "2026-10-20T00:10:00Z".into()),

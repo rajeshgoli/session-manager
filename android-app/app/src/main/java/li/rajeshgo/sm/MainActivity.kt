@@ -18,8 +18,17 @@ import li.rajeshgo.sm.ui.board.boardLaneFromPath
 import li.rajeshgo.sm.ui.navigation.AppNavigation
 import li.rajeshgo.sm.ui.navigation.EnrollmentLinkRequests
 import li.rajeshgo.sm.ui.navigation.ReaderLinkRequests
+import li.rajeshgo.sm.ui.overnight.OvernightController
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import li.rajeshgo.sm.ui.theme.SessionManagerTheme
 import li.rajeshgo.sm.ui.watch.readerPageForLink
+
+private const val OVERNIGHT_REFRESH_MS = 30_000L
 
 class MainActivity : ComponentActivity() {
 
@@ -42,6 +51,17 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
+        // Overnight mode (sm#2494): the phone's Do Not Disturb on every return,
+        // and the moon's state while the app shows.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                OvernightController.reportDnd(this@MainActivity, force = true)
+                while (isActive) {
+                    OvernightController.refresh(this@MainActivity)
+                    delay(OVERNIGHT_REFRESH_MS)
+                }
+            }
+        }
         setContent {
             SessionManagerTheme {
                 androidx.compose.material3.Surface(color = androidx.compose.material3.MaterialTheme.colorScheme.background) {

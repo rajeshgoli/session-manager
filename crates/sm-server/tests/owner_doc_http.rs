@@ -341,6 +341,7 @@ async fn ask_an_ended_authors_doc_starts_one_reader_at_the_published_commit() {
             title: "Why buy?".into(),
             body_markdown: "The memo's reader answer".into(),
             blocking: false,
+            blocked: false,
         })
         .unwrap();
     let thread_key = before["thread_key"].as_str().unwrap();
@@ -472,6 +473,7 @@ async fn ask_a_live_author_uses_the_author_and_the_docs_work_thread() {
             title: "Answer about the memo".into(),
             body_markdown: "The author answer is here".into(),
             blocking: false,
+            blocked: false,
         })
         .unwrap();
     let encoded_key = target["thread_key"]

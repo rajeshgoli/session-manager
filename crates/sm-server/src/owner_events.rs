@@ -246,6 +246,14 @@ impl OwnerEventStore {
         )?)
     }
 
+    /// When the owner last did anything in sm (overnight mode's idle rule).
+    pub fn last_at_ms(&self) -> Result<Option<i64>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        Ok(conn.query_row("SELECT MAX(at_ms) FROM owner_events", [], |row| row.get(0))?)
+    }
+
     /// Rows in `(at_ms, id)` order, and the cursor of the last row when more
     /// remain.
     pub fn list(&self, query: &EventQuery) -> Result<(Vec<OwnerEvent>, Option<String>)> {
@@ -588,6 +596,9 @@ pub const ACTIONS: &[(&str, &str, &str, Option<&str>)] = &[
     ("GET", "/client/board/start-options", "board.start_options", None),
     ("GET", "/client/settings", "settings.open", None),
     ("PUT", "/client/settings", "settings.change", Some("setting")),
+    ("GET", "/client/overnight", "overnight.open", None),
+    ("PUT", "/client/overnight", "overnight.change", None),
+    ("PUT", "/client/overnight/dnd", "overnight.dnd", None),
     ("GET", "/devices/{id}/ssh-keys", "device.ssh_keys", Some("device")),
     ("POST", "/devices/{id}/ssh-keys", "device.ssh_key_add", Some("device")),
     ("DELETE", "/devices/{id}/ssh-keys/{fingerprint}", "device.ssh_key_remove", Some("device")),
@@ -637,6 +648,8 @@ pub const ACTIONS: &[(&str, &str, &str, Option<&str>)] = &[
     ("GET", "/humans/{identifier}", "human.open", Some("human")),
     ("POST", "/humans/{identifier}/email", "human.email", Some("human")),
     ("POST", "/humans/{identifier}/messages", "human.message", Some("human")),
+    ("POST", "/owner/blocked", "owner.blocked", None),
+    ("POST", "/owner/blocked/done", "owner.blocked_done", None),
     ("GET", "/inbox", "inbox.open", None),
     ("POST", "/inbox/done", "inbox.done", None),
     ("POST", "/inbox/archive", "inbox.archive", None),

@@ -223,6 +223,7 @@ pub(super) fn sync(state: &AppState) -> anyhow::Result<()> {
                 title: format!("PR #{} merged while held", hold.pr),
                 body_markdown: hold.merged_message(),
                 blocking: false,
+                blocked: false,
             },
             Some(&format!("merge-hold:{}", hold.id)),
         )?;

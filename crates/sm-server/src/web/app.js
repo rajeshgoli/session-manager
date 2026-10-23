@@ -5,7 +5,7 @@
 import { render } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
-  html, api, bus, build, network, clientNav, screenFor, pageData, usePoll, useShared, setShared, stored, store, panels,
+  html, api, bus, build, network, clientNav, screenFor, pageData, usePoll, useShared, setShared, shared, stored, store, panels,
   openPanel, closePanel, navigate, openItem, toast, typingIn, Icon, Ring, Seg, gigabytes, basename, meterBand,
 } from './ui.js';
 import { BoardPage } from './board.js';
@@ -196,6 +196,7 @@ function App() {
       <main class="main">
         <${TopBar} page=${page} offline=${offline} stale=${stale} onSearch=${() => setPalette(true)}
           creating=${creating} setCreating=${setCreating} />
+        <${NightBanner} />
         <${Page} page=${page} loc=${loc} />
       </main>
       ${panelOpen ? html`<${Panel} openRef=${loc.open} layout=${layout} updateLayout=${updateLayout} />` : null}
@@ -267,6 +268,75 @@ function useRailData() {
   useEffect(() => bus.on('queue-changed', reloadQueue), [reloadQueue]);
   usePoll(async () => setShared('inbox', await api('/inbox?format=json')), 30000, [], { background: true });
   usePoll(async () => setShared('board_badge', await api('/client/board/badge')), 30000, [], { background: true });
+  usePoll(async () => setShared('overnight', await api('/client/overnight')), 30000, [], { background: true });
+}
+
+// ---- overnight (sm#2494) ----------------------------------------------------
+
+/** The banner's first line: why overnight is on, and since when. */
+export function nightHeadline(status) {
+  const away = status?.away;
+  if (!away) return 'Overnight';
+  const why = { bedtime: ' · past bedtime', dnd: ' · Do Not Disturb' }[away.source] || '';
+  return `Overnight${why}${away.since_label ? ` · since ${away.since_label}` : ''}`;
+}
+
+/** The second line: what sm does about it. */
+export function nightDetail(status) {
+  const away = status?.away;
+  const alerts = !away || away.holds_alerts ? 'alerts wait' : 'your phone silences alerts';
+  return `Agents work on their own; ${alerts}${away?.until_label ? ` until ${away.until_label}` : ''}.`;
+}
+
+/** What waits: blocked agents first, then unread messages; '' when nothing does. */
+export function nightWaiting(status) {
+  const waiting = status?.waiting;
+  if (!waiting) return '';
+  const blocked = waiting.blocked || [];
+  const parts = [];
+  if (blocked.length === 1) parts.push(`${blocked[0]} is blocked on you`);
+  else if (blocked.length > 1) parts.push(`${blocked.length} agents blocked on you`);
+  if (waiting.unread === 1) parts.push('1 new message');
+  else if (waiting.unread > 1) parts.push(`${waiting.unread} new messages`);
+  return parts.join(' · ');
+}
+
+async function setOvernight(on) {
+  const previous = shared.overnight;
+  setShared('overnight', { ...(previous || {}), on, pending: true });
+  try {
+    setShared('overnight', await api('/client/overnight', { method: 'PUT', body: { on } }));
+  } catch (error) {
+    setShared('overnight', previous);
+    toast(`Couldn't change overnight mode: ${error.message}`);
+  }
+}
+
+/** The moon: one click tells agents you are away; click again when back. */
+function MoonButton() {
+  const status = useShared('overnight');
+  const on = !!status?.on;
+  const auto = on && status?.away && !status.manual;
+  const title = on ? `${nightHeadline(status)} · click when you're back` : 'Overnight mode: tell agents you are away';
+  return html`<button type="button" class=${['moon', on && 'on', auto && 'auto'].filter(Boolean).join(' ')}
+    aria-pressed=${on} aria-label="Overnight mode" title=${title} onClick=${() => setOvernight(!on)}>
+    <${Icon} name=${on ? 'moonFill' : 'moon'} size=${17} /></button>`;
+}
+
+/** Under the top bar while overnight is on. */
+function NightBanner() {
+  const status = useShared('overnight');
+  if (!status?.on) return null;
+  const waiting = nightWaiting(status);
+  return html`<div class="night" role="status">
+    <span class="orb"><${Icon} name="moonFill" size=${17} /></span>
+    <div class="txt">
+      <div class="hd">${nightHeadline(status)}</div>
+      <div class="dt">${nightDetail(status)}</div>
+      ${waiting ? html`<div class=${`wt ${status.waiting?.blocked?.length ? 'red' : ''}`}>${waiting}</div>` : null}
+    </div>
+    <button type="button" onClick=${() => setOvernight(false)}>I'm back</button>
+  </div>`;
 }
 
 function badges(queue, inbox, board) {
@@ -423,6 +493,7 @@ function TopBar({ page, offline, stale, onSearch, creating, setCreating }) {
         : null}
     </span>
     ${hidden ? html`<${HiddenShells} shells=${hidden.shells} onChanged=${hidden.reload} />` : null}
+    <${MoonButton} />
     <${BugButton} page=${current ? current.label : ''} />
     <span class="anchor">
       <button type="button" class="btn pri" data-pop-anchor onClick=${() => setCreating(creating ? null : {})}>New agent</button>

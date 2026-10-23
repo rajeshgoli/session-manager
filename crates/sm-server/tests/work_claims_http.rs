@@ -1072,6 +1072,7 @@ async fn merge_hold_owner_alert_retries_after_inbox_cap_and_history_names_hold()
                 title: "Earlier alert".into(),
                 body_markdown: "Earlier alert".into(),
                 blocking: false,
+                blocked: false,
             })
             .unwrap()
         else {

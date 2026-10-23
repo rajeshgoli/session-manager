@@ -438,6 +438,7 @@ impl ThreadCatalog {
                         open_asks += usize::from(*state == OwnerMessageState::NeedsYou);
                         (
                             match state {
+                                OwnerMessageState::NeedsYou if message.blocked => "blocked",
                                 OwnerMessageState::NeedsYou => "needs_you",
                                 OwnerMessageState::New => "new",
                                 _ => "earlier",
@@ -591,7 +592,7 @@ impl ThreadCatalog {
                 // A message the owner was pinged about stays findable for the
                 // Open window even after its agent retires (sm#2249).
                 && newest_message_at < message_cutoff
-                && !matches!(group, "needs_you" | "new")
+                && !matches!(group, "blocked" | "needs_you" | "new")
                 && !unread_finished
             {
                 Some("ended")
@@ -1185,6 +1186,7 @@ mod tests {
             title: id.into(),
             body_markdown: id.into(),
             blocking: false,
+            blocked: false,
             created_at: at.into(),
             first_viewed_at: None,
             handled_at: None,

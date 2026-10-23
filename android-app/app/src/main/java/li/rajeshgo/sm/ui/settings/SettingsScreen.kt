@@ -147,6 +147,7 @@ fun SettingsScreen(
             }
             state.updateError?.let { Text(it, color = Rose, style = MaterialTheme.typography.bodySmall) }
         }
+        if (state.isLoggedIn) SettingsGroup("Overnight") { OvernightSection() }
         if (state.isLoggedIn) SettingsGroup("Handoff defaults") {
             li.rajeshgo.sm.ui.handoff.HandoffDefaultsSection()
         }

@@ -11,7 +11,7 @@ import { AutoPmSettings } from './autopm.js';
 
 const SECTIONS = [
   ['appearance', 'Appearance'], ['new-agents', 'New agents'], ['context-handoff', 'Context handoff'], ['reviews', 'Reviews'],
-  ['queue-limits', 'Queue limits'], ['terminals', 'Terminals'], ['notifications', 'Notifications'], ['auto-pm', 'Auto PM'], ['devices-access', 'Devices & access'], ['worktrees', 'Worktrees'], ['about', 'About'],
+  ['queue-limits', 'Queue limits'], ['terminals', 'Terminals'], ['notifications', 'Notifications'], ['overnight', 'Overnight'], ['auto-pm', 'Auto PM'], ['devices-access', 'Devices & access'], ['worktrees', 'Worktrees'], ['about', 'About'],
 ];
 const SAMPLE = { repo: 'rajeshgoli/session-manager', number: 1706, title: 'Board Start preselects Fable', url: 'https://github.com/rajeshgoli/session-manager/issues/1706' };
 
@@ -146,6 +146,7 @@ export function SettingsPage() {
         : selected === 'about' ? html`<${About} />` : html`<${Resource} state=${settings} retry=${reload}>${data => selected === 'reviews'
           ? html`<${Reviews} data=${data} write=${write} />` : selected === 'queue-limits'
           ? html`<${QueueLimits} data=${data.queue_limits} write=${write} />`
+          : selected === 'overnight' ? html`<${Overnight} data=${data.overnight} write=${write} />`
           : selected === 'terminals' ? html`<${TerminalLimits} data=${data.terminal_limits} config=${data.terminal_config_limits || {}} write=${write} />`
           : html`<${NewAgents} data=${data.new_agent} retire=${data.auto_retire} restart=${data.host_restart} write=${write} />`}</${Resource}>`}
     </div>
@@ -267,6 +268,31 @@ function NewAgents({ data, retire, restart, write }) {
       hint="Placeholders: {ticket} {number} {repo} {repo_name} {repo_short} {title} {url}"
       save=${value => save({ message_template: value })} />
     <div class="settings-preview"><span class="sub">Message preview · ${sample.repo} #${sample.number}</span><pre>${rendered.message}</pre></div>`;
+}
+
+/** When sm turns overnight mode on by itself (sm#2494); the moon in the top bar needs no setting. */
+function Overnight({ data, write }) {
+  if (!data) return null;
+  const put = (fields) => write('/client/settings', { overnight: fields });
+  const minutes = (value) => {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 5 || n > 120) throw new Error('Enter whole minutes from 5 to 120.');
+    return n;
+  };
+  return html`<h2>Overnight</h2>
+    <p class="sub">The moon in the top bar tells agents you are away: they work on their own and run <code>sm blocked</code> only when they truly need you. sm can also turn it on by itself.</p>
+    <${Field} label="When my phone is on Do Not Disturb" type="checkbox" initial=${data.follow_dnd}
+      hint="The phone silences alerts itself; agents learn you're away once you've been quiet a while."
+      save=${value => put({ follow_dnd: value })} />
+    <${Field} label="After bedtime, once I go quiet" type="checkbox" initial=${data.bedtime_enabled}
+      hint="Alerts wait until the night ends; then one summary arrives instead of one per agent."
+      save=${value => put({ bedtime_enabled: value })} />
+    <div class="settings-grid">
+      <${Field} label="Bedtime" type="time" initial=${data.bedtime_start} save=${value => put({ bedtime_start: value })} />
+      <${Field} label="Wake" type="time" initial=${data.bedtime_end} save=${value => put({ bedtime_end: value })} />
+      <${Field} label="Quiet for (minutes)" type="number" min="5" max="120" initial=${data.idle_minutes}
+        save=${value => put({ idle_minutes: minutes(value) })} />
+    </div>`;
 }
 
 function QueueLimits({ data, write }) {

@@ -531,15 +531,24 @@ private fun ThreadItem(
             )
             MarkdownText(item.markdown.orEmpty())
         }
-        else -> Bubble(color = Panel, border = if (item.needsYou) Amber.copy(alpha = 0.6f) else Border, edge = null) {
+        else -> Bubble(
+            color = Panel,
+            border = when {
+                item.blocked && item.needsYou -> Rose.copy(alpha = 0.65f)
+                item.needsYou -> Amber.copy(alpha = 0.6f)
+                else -> Border
+            },
+            edge = null,
+        ) {
             if (item.needsYou) {
+                val tone = if (item.blocked) Rose else Amber
                 Text(
-                    "NEEDS YOU",
-                    color = Amber,
+                    if (item.blocked) "BLOCKED ON YOU" else "NEEDS YOU",
+                    color = tone,
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.padding(bottom = 4.dp)
-                        .background(Amber.copy(alpha = 0.16f), RoundedCornerShape(4.dp))
+                        .background(tone.copy(alpha = 0.16f), RoundedCornerShape(4.dp))
                         .padding(horizontal = 5.dp, vertical = 1.dp),
                 )
             }

@@ -68,7 +68,8 @@ fun cachedInboxState(filter: InboxFilter): InboxUiState {
 fun inboxSections(filter: InboxFilter, rows: List<InboxRow>): List<Pair<String?, List<InboxRow>>> {
     if (filter != InboxFilter.Open) return if (rows.isEmpty()) emptyList() else listOf(null to rows)
     // What reached the phone (Needs you, New) leads agents that merely finished a turn (sm#2249).
-    return listOf("needs_you" to "NEEDS YOU", "new" to "NEW", "finished" to "FINISHED", "earlier" to "EARLIER", "folded" to "FOLDED")
+    // An agent that ran `sm blocked` leads everything (sm#2494).
+    return listOf("blocked" to "BLOCKED ON YOU", "needs_you" to "NEEDS YOU", "new" to "NEW", "finished" to "FINISHED", "earlier" to "EARLIER", "folded" to "FOLDED")
         .mapNotNull { (group, label) ->
             rows.filter { it.group == group }.takeIf { it.isNotEmpty() }?.let { "$label · ${it.size}" to it }
         }

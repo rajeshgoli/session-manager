@@ -984,6 +984,8 @@ data class InboxThreadItem(
     /** A message's state: `new`, `read`, `needs you`, `replied` or `handled`. */
     val state: String? = null,
     @SerialName("needs_you") val needsYou: Boolean = false,
+    /** Sent with `sm blocked` (sm#2494): shown as "Blocked on you". */
+    val blocked: Boolean = false,
     val body: String? = null,
     val quotes: List<InboxQuote> = emptyList(),
     /** Who an owner item went to, when not the thread's own agent. */

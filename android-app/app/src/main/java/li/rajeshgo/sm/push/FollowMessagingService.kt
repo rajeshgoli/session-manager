@@ -35,9 +35,16 @@ class FollowMessagingService : FirebaseMessagingService() {
         }
         // A signed-out phone shows nothing, even if its token outlived sign-out.
         if (serverUrl.isBlank() || accessToken.isBlank()) return
+        // Every push says whether the phone is on Do Not Disturb, so sm knows
+        // when the owner is away, and when they are back (sm#2494).
+        scope.launch { li.rajeshgo.sm.ui.overnight.OvernightController.reportDnd(applicationContext, force = true) }
         // Turned off in Settings: nothing is shown or acknowledged, so sm emails
         // instead, even when unregistering the token failed (offline, say).
         if (!enabled) return
+        if (message.data["kind"] == NoticePush.KIND_OVERNIGHT_SUMMARY) {
+            NoticePush.showOvernightSummary(applicationContext, message.data)
+            return
+        }
         if (message.data["kind"] == NoticePush.KIND_GITHUB_CODEX_PAUSED) {
             NoticePush.showGithubCodexPaused(applicationContext, message.data)
             return

@@ -170,3 +170,11 @@ test('agent details retain completed tickets and PRs without duplicate claim lin
   assert.equal(agents.namespace.detailClaims([], [old, { ...old, repo: 'rajeshgoli/other' }]).length, 2);
   assert.deepEqual(agents.namespace.detailClaims(), []);
 });
+
+test('a blocked agent leads the strip and its You line is red (sm#2494)', () => {
+  assert.deepEqual(summaryCounts({ needs_you: 3, blocked: 1, moving: 2 }).map((c) => `${c.n} ${c.label}`),
+    ['1 blocked on you', '2 needs you', '2 moving']);
+  const fact = youFact({ facts: { you: { kind: 'blocked', since: new Date(Date.now() - 5 * 60000).toISOString(), text: 'Log in to GitHub', more: 0, dismissible: true } } });
+  assert.equal(fact.tone, 'red');
+  assert.match(fact.text, /^◆ Blocked · 5m: Log in to GitHub$/);
+});

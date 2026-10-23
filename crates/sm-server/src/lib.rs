@@ -61,6 +61,7 @@ pub mod managed_artifacts;
 pub mod mobile_devices;
 pub mod notes;
 pub mod opencode;
+pub mod overnight;
 pub mod owner_doc_render;
 pub mod owner_docs;
 pub mod owner_events;

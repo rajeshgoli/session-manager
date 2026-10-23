@@ -951,6 +951,7 @@ async fn managed_artifacts_system_messages_refuse_replies() {
             title: "Disk space".into(),
             body_markdown: "Use the artifact list".into(),
             blocking: true,
+            blocked: false,
         })
         .unwrap();
     let CreateOwnerMessage::Created(message) = result else {
@@ -994,6 +995,7 @@ async fn managed_artifacts_recovered_pressure_closes_blocking_message() {
                 title: "Disk space".into(),
                 body_markdown: "Space needed".into(),
                 blocking: true,
+                blocked: false,
             },
             Some(key),
         )
