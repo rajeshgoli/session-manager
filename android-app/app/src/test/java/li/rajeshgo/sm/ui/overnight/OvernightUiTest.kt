@@ -21,12 +21,12 @@ class OvernightUiTest {
             """{"on":true,"away":{"source":"bedtime","since":"x","since_label":"11:20 PM","until":"y","until_label":"7:00 AM","holds_alerts":true},
                "waiting":{"blocked":["sm-2494"],"unread":3},"manual":false,"dnd":false,"settings":{}}""",
         )
-        assertEquals("Overnight · past bedtime · since 11:20 PM", overnightHeadline(bedtime))
+        assertEquals("Past bedtime · since 11:20 PM", overnightHeadline(bedtime))
         assertEquals("Agents work on their own; alerts wait until 7:00 AM.", overnightDetail(bedtime))
         assertEquals("sm-2494 is blocked on you · 3 new messages", overnightWaitingLine(bedtime))
 
         val dnd = status("""{"on":true,"away":{"source":"dnd","since_label":"2:05 PM","holds_alerts":false},"waiting":{"blocked":[],"unread":0}}""")
-        assertEquals("Overnight · Do Not Disturb · since 2:05 PM", overnightHeadline(dnd))
+        assertEquals("Do Not Disturb · since 2:05 PM", overnightHeadline(dnd))
         assertEquals("Agents work on their own; your phone silences alerts.", overnightDetail(dnd))
         assertNull(overnightWaitingLine(dnd))
 

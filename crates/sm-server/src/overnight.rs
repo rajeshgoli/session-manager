@@ -264,7 +264,7 @@ fn away_reason(owner: &str, away: &Away, offset: UtcOffset) -> String {
     match away.source {
         Source::Manual => format!("{owner} is away or asleep (overnight mode since {since})."),
         Source::Bedtime => {
-            format!("{owner} is probably asleep: it is past bedtime and {owner} has been quiet since {since}.")
+            format!("{owner} is probably asleep (past bedtime, away since {since}).")
         }
         Source::Dnd => format!("{owner}'s phone is on Do Not Disturb (since {since})."),
     }

@@ -67,7 +67,7 @@ code, .mono { font-family: var(--mono); font-size: .9rem; }
 .rail .item .lb { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .rail .item b { font-weight: 600; font-size: .867rem; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .rail .item b.amber { color: var(--amber); }
-.rail .item b.magenta { color: var(--magenta); }
+.rail .item b.magenta { color: var(--magenta); } .rail .item b.red { color: var(--red); }
 .rail .grow { flex: 1; }
 .dash { display: flex; flex-direction: column; gap: 7px; padding: 8px 7px 10px; margin: 0 -7px 4px; border-top: 1px solid var(--line); font-size: .8rem; font-variant-numeric: tabular-nums; }
 .dash .dh { color: var(--ink-3); font-size: .733rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0 -3px; text-decoration: none; }
@@ -95,7 +95,7 @@ code, .mono { font-family: var(--mono); font-size: .9rem; }
 .folded .rail .item b { position: absolute; top: 3px; right: 5px; width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3); font-size: 0; }
 .folded .rail .item b.zero { display: none; }
 .folded .rail .item b.amber { background: var(--amber); }
-.folded .rail .item b.magenta { background: var(--magenta); }
+.folded .rail .item b.magenta { background: var(--magenta); } .folded .rail .item b.red { background: var(--red); }
 
 /* ---- top bar ---------------------------------------------------------------- */
 .bar { display: flex; align-items: center; gap: 12px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); min-height: 44px; flex-wrap: nowrap; container-type: inline-size; }

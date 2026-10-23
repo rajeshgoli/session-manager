@@ -866,6 +866,8 @@ data class InboxResponse(
     val filter: String = "open",
     /** Open rows that need the owner: the tab badge. */
     @SerialName("needs_you_count") val needsYouCount: Int = 0,
+    /** Threads whose agent ran `sm blocked` (sm#2494); also counted in [needsYouCount]. */
+    @SerialName("blocked_count") val blockedCount: Int = 0,
     /** Any Open row is new: the tab dot. */
     @SerialName("has_new") val hasNew: Boolean = false,
     val rows: List<InboxRow> = emptyList(),

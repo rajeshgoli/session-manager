@@ -92,7 +92,7 @@ fun OvernightSection() {
             color = TextSecondary,
         )
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
+            Column(Modifier.weight(1f).padding(end = 12.dp)) {
                 Text("When my phone is on Do Not Disturb")
                 Text("Your phone silences the alerts; agents learn you're away.", style = MaterialTheme.typography.bodySmall, color = TextMuted)
             }
@@ -101,7 +101,7 @@ fun OvernightSection() {
             })
         }
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
+            Column(Modifier.weight(1f).padding(end = 12.dp)) {
                 Text("After bedtime, once I go quiet")
                 Text("Alerts wait until morning; one summary when the night ends.", style = MaterialTheme.typography.bodySmall, color = TextMuted)
             }

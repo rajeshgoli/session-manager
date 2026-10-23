@@ -273,12 +273,14 @@ function useRailData() {
 
 // ---- overnight (sm#2494) ----------------------------------------------------
 
-/** The banner's first line: why overnight is on, and since when. */
+/** The banner's first line: why overnight is on, and since when; the phone's words. */
 export function nightHeadline(status) {
   const away = status?.away;
   if (!away) return 'Overnight';
-  const why = { bedtime: ' · past bedtime', dnd: ' · Do Not Disturb' }[away.source] || '';
-  return `Overnight${why}${away.since_label ? ` · since ${away.since_label}` : ''}`;
+  const since = away.since_label;
+  if (away.source === 'bedtime') return `Past bedtime${since ? ` · since ${since}` : ''}`;
+  if (away.source === 'dnd') return `Do Not Disturb${since ? ` · since ${since}` : ''}`;
+  return `Overnight${since ? ` since ${since}` : ''}`;
 }
 
 /** The second line: what sm does about it. */
@@ -317,7 +319,7 @@ function MoonButton() {
   const status = useShared('overnight');
   const on = !!status?.on;
   const auto = on && status?.away && !status.manual;
-  const title = on ? `${nightHeadline(status)} · click when you're back` : 'Overnight mode: tell agents you are away';
+  const title = on ? `${nightHeadline(status)}. Click when you're back.` : 'Overnight mode: tell agents you are away';
   return html`<button type="button" class=${['moon', on && 'on', auto && 'auto'].filter(Boolean).join(' ')}
     aria-pressed=${on} aria-label="Overnight mode" title=${title} onClick=${() => setOvernight(!on)}>
     <${Icon} name=${on ? 'moonFill' : 'moon'} size=${17} /></button>`;
@@ -347,7 +349,9 @@ function badges(queue, inbox, board) {
     const long = waiting.some((job) => job.queued_at && Date.now() - Date.parse(job.queued_at) >= 30 * 60 * 1000);
     out.queue = { count: waiting.length, tone: long ? 'amber' : '' };
   }
-  if (inbox) out.inbox = { count: inbox.needs_you_count || 0, tone: inbox.needs_you_count ? 'magenta' : '' };
+  // A blocked agent (sm#2494) turns the badge red.
+  const blocked = (inbox?.rows || []).some((row) => row.group === 'blocked');
+  if (inbox) out.inbox = { count: inbox.needs_you_count || 0, tone: blocked ? 'red' : inbox.needs_you_count ? 'magenta' : '' };
   return out;
 }
 

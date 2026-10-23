@@ -117,14 +117,15 @@ fun OvernightButton() {
     }
 }
 
-/** Why overnight is on, in the banner's first line. */
+/** Why overnight is on, in the banner's first line; short enough for a phone. */
 fun overnightHeadline(status: OvernightStatus): String {
     val away = status.away ?: return "Overnight"
+    val since = away.sinceLabel.takeIf { it.isNotBlank() }
     return when (away.source) {
-        "bedtime" -> "Overnight · past bedtime"
-        "dnd" -> "Overnight · Do Not Disturb"
-        else -> "Overnight"
-    } + if (away.sinceLabel.isNotBlank()) " · since ${away.sinceLabel}" else ""
+        "bedtime" -> "Past bedtime" + (since?.let { " · since $it" } ?: "")
+        "dnd" -> "Do Not Disturb" + (since?.let { " · since $it" } ?: "")
+        else -> "Overnight" + (since?.let { " since $it" } ?: "")
+    }
 }
 
 /** What sm does about it, in the banner's second line. */
@@ -210,7 +211,7 @@ fun OvernightBanner(modifier: Modifier = Modifier) {
                             line,
                             style = MaterialTheme.typography.labelMedium,
                             color = if (shown.waiting?.blocked.isNullOrEmpty()) TextMuted else Rose,
-                            maxLines = 1,
+                            maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
                         )
                     }

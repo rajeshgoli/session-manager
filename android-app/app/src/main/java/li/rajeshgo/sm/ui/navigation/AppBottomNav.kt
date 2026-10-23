@@ -63,7 +63,11 @@ fun AppBottomNav(
                     else -> "Inbox"
                 },
                 selected = currentRoute == Routes.INBOX,
-                icon = { Icon(Icons.Rounded.Inbox, contentDescription = null, modifier = Modifier.size(18.dp), tint = if (inboxBadge > 0) Amber else androidx.compose.material3.LocalContentColor.current) },
+                icon = { Icon(Icons.Rounded.Inbox, contentDescription = null, modifier = Modifier.size(18.dp), tint = when {
+                    InboxBadge.blocked > 0 -> li.rajeshgo.sm.ui.theme.Rose
+                    inboxBadge > 0 -> Amber
+                    else -> androidx.compose.material3.LocalContentColor.current
+                }) },
                 onClick = onInbox,
             )
             AppBottomNavItem(

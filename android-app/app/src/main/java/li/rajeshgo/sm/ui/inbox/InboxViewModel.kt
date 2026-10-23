@@ -28,10 +28,12 @@ import li.rajeshgo.sm.ui.watch.loadDocReaderAuth
  */
 object InboxBadge {
     var needsYou by mutableStateOf(0)
+    var blocked by mutableStateOf(0)
     var hasNew by mutableStateOf(false)
 
     fun update(response: InboxResponse) {
         needsYou = response.needsYouCount
+        blocked = response.blockedCount
         hasNew = response.hasNew
     }
 }
