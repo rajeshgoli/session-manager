@@ -81,7 +81,7 @@ fn file_response(cwd: &str, path: &str) -> Result<Response, ApiError> {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let mime = match extension.as_str() {
+    let mut mime = match extension.as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -94,10 +94,21 @@ fn file_response(cwd: &str, path: &str) -> Result<Response, ApiError> {
         }
         _ => return Err(bad_file("This file type cannot be previewed")),
     };
+    if mime.starts_with("text/plain") {
+        let escape = crate::owner_docs::escape_html;
+        let title = escape(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("File"),
+        );
+        let text = escape(std::str::from_utf8(&bytes).expect("text preview validated above"));
+        bytes = format!("<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>:root{{color-scheme:light dark}}body{{margin:1rem}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.5 monospace}}</style><pre>{text}</pre>").into_bytes();
+        mime = "text/html; charset=utf-8";
+    }
     // Chrome refuses synthetic text/image documents with CSP sandbox. Only
     // authored active documents need an opaque origin; passive MIME types use
     // nosniff and a restrictive resource policy instead.
-    let policy = if matches!(extension.as_str(), "html" | "htm" | "svg") {
+    let policy = if mime.starts_with("text/html") || extension == "svg" {
         "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     } else {
         "default-src 'none'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
@@ -149,11 +160,17 @@ mod tests {
         assert!(file_response(dir.to_str().unwrap(), "missing").is_err());
         std::fs::write(dir.join("source.rs"), "fn main() {}\n").unwrap();
         let text = file_response(dir.to_str().unwrap(), "source.rs").unwrap();
-        assert_eq!(text.headers()["content-type"], "text/plain; charset=utf-8");
-        assert!(!text.headers()["content-security-policy"]
+        assert_eq!(text.headers()["content-type"], "text/html; charset=utf-8");
+        assert!(text.headers()["content-security-policy"]
             .to_str()
             .unwrap()
             .contains("sandbox"));
+        std::fs::write(dir.join("escaped.txt"), "<script>alert(1)</script>&").unwrap();
+        let escaped = file_response(dir.to_str().unwrap(), "escaped.txt").unwrap();
+        let body = to_bytes(escaped.into_body(), 1024 * 1024).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("&lt;script&gt;alert(1)&lt;/script&gt;&amp;"));
+        assert!(!body.contains("<script>"));
         std::fs::write(dir.join("binary"), [0, 255]).unwrap();
         assert!(file_response(dir.to_str().unwrap(), "binary").is_err());
         let large = std::fs::File::create(dir.join("large.txt")).unwrap();
