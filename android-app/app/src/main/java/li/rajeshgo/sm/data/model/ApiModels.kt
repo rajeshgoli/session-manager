@@ -866,6 +866,8 @@ data class InboxResponse(
     val filter: String = "open",
     /** Open rows that need the owner: the tab badge. */
     @SerialName("needs_you_count") val needsYouCount: Int = 0,
+    /** Threads whose agent ran `sm blocked` (sm#2494); also counted in [needsYouCount]. */
+    @SerialName("blocked_count") val blockedCount: Int = 0,
     /** Any Open row is new: the tab dot. */
     @SerialName("has_new") val hasNew: Boolean = false,
     val rows: List<InboxRow> = emptyList(),
@@ -984,6 +986,8 @@ data class InboxThreadItem(
     /** A message's state: `new`, `read`, `needs you`, `replied` or `handled`. */
     val state: String? = null,
     @SerialName("needs_you") val needsYou: Boolean = false,
+    /** Sent with `sm blocked` (sm#2494): shown as "Blocked on you". */
+    val blocked: Boolean = false,
     val body: String? = null,
     val quotes: List<InboxQuote> = emptyList(),
     /** Who an owner item went to, when not the thread's own agent. */

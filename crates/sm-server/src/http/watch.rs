@@ -390,8 +390,10 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
         "schema_version": WATCH_SCHEMA_VERSION,
         "generated_at": generated_at(now),
         "sessions": out,
-        "counts": {"live": live, "waiting_on_owner": counts.get("you").copied().unwrap_or(0),
-                   "needs_you": counts.get("you").copied().unwrap_or(0),
+        "counts": {"live": live,
+                   "waiting_on_owner": counts.get("you").copied().unwrap_or(0) + counts.get("blocked").copied().unwrap_or(0),
+                   "needs_you": counts.get("you").copied().unwrap_or(0) + counts.get("blocked").copied().unwrap_or(0),
+                   "blocked": counts.get("blocked").copied().unwrap_or(0),
                    "finished": counts.get("finished").copied().unwrap_or(0),
                    "waiting_long": counts.get("waiting_long").copied().unwrap_or(0),
                    "moving": counts.get("moving").copied().unwrap_or(0),
@@ -767,8 +769,12 @@ fn agent_facts(
             .iter()
             .max_by_key(|message| &message.created_at)
             .unwrap();
-        let preview: String = newest.body_markdown.chars().take(120).collect();
-        json!({"kind": "message", "since": oldest.created_at, "text": preview,
+        // `sm blocked` (sm#2494) outranks any other ask from the agent.
+        let blocked = open_messages.iter().find(|message| message.blocked);
+        let shown = blocked.unwrap_or(newest);
+        let preview: String = shown.body_markdown.chars().take(120).collect();
+        json!({"kind": if blocked.is_some() { "blocked" } else { "message" },
+            "since": blocked.map_or(&oldest.created_at, |message| &message.created_at), "text": preview,
             "more": open_messages.len() - 1 + doc_reviews.len() + usize::from(prompt),
             "message_ids": open_messages.iter().map(|message| &message.id).collect::<Vec<_>>(),
             "dismissible": true})
@@ -820,6 +826,8 @@ fn agent_facts(
     let stalled = idle_with_claim && note.is_none();
     let (section, reason, key) = if stopped {
         ("stopped", Value::Null, inverse_time(last))
+    } else if s(&you, "kind") == "blocked" {
+        ("blocked", json!("blocked"), s(&you, "since").to_owned())
     } else if !you.is_null() {
         ("you", json!(s(&you, "kind")), s(&you, "since").to_owned())
     } else if !finished.is_null() && finished["read"] != true {
@@ -1569,6 +1577,7 @@ mod facts_tests {
                 title: "Check Chrome".to_owned(),
                 body_markdown: "Please check Chrome".to_owned(),
                 blocking: true,
+                blocked: false,
                 created_at: "2026-09-30T19:40:00Z".to_owned(),
                 first_viewed_at: None,
                 handled_at: None,

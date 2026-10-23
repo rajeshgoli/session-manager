@@ -101,6 +101,7 @@ fn forward_one(
                 title: format!("Replied on PR #{pr} without a new revision"),
                 body_markdown: replies_message(&sender_name, &doc, pr, &replies),
                 blocking: false,
+                blocked: false,
             },
             Some(&key),
         )?;

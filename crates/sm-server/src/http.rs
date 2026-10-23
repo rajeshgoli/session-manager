@@ -387,6 +387,7 @@ mod messages;
 mod notes;
 mod notes_activity;
 mod opencode_readers;
+mod overnight;
 mod owner_events;
 mod plain_terminals;
 mod review_paired;
@@ -2195,6 +2196,15 @@ pub fn router(state: AppState) -> Router {
             "/client/settings",
             get(settings::get_settings).put(settings::put_settings),
         )
+        .route(
+            "/client/overnight",
+            get(overnight::get_overnight).put(overnight::put_overnight),
+        )
+        .route("/client/overnight/dnd", put(overnight::put_dnd))
+        .route(
+            "/client/overnight/summary/{id}/ack",
+            post(overnight::ack_summary),
+        )
         .route("/client/devices", get(list_mobile_terminal_devices))
         .route("/client/devices/enroll", post(enroll_browser_computer))
         .route(
@@ -2286,6 +2296,11 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/humans/{identifier}/messages",
             post(messages::create_owner_message),
+        )
+        .route("/owner/blocked", post(messages::create_blocked_message))
+        .route(
+            "/owner/blocked/done",
+            post(messages::withdraw_blocked_message),
         )
         .route("/inbox", get(inbox::get_inbox))
         .route("/inbox/done", post(inbox::post_done))
@@ -6232,6 +6247,7 @@ fn finish_github_review_step(
                     title: format!("PR #{} has no reviewer", finished.pr_number),
                     body_markdown: body,
                     blocking: true,
+                    blocked: false,
                 },
                 Some(&format!("review-no-reviewer:{}", finished.id)),
             )
@@ -24945,6 +24961,7 @@ mod tests {
                         title: format!("PR #{pr} has no reviewer"),
                         body_markdown: "GitHub Codex: out of code-review quota".into(),
                         blocking: true,
+                        blocked: false,
                     },
                     Some(&format!("review-no-reviewer:{}", request.id)),
                 )

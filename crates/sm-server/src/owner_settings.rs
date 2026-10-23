@@ -21,7 +21,7 @@ use crate::sessions::expand_home;
 /// Top-level key of the stored settings in the session store.
 pub const STORE_KEY: &str = "owner_settings";
 /// The settings keys, one stored row each.
-const KEYS: [&str; 7] = [
+const KEYS: [&str; 8] = [
     "new_agent",
     "queue_limits",
     "terminal_limits",
@@ -29,6 +29,7 @@ const KEYS: [&str; 7] = [
     "auto_retire",
     "host_restart",
     "autopm",
+    "overnight",
 ];
 /// Objects stored whole: a `PUT` replaces them rather than merging into them.
 const WHOLE_VALUES: [&str; 4] = ["repo_short", "reviewer", "agent_types", "agent"];
@@ -144,6 +145,15 @@ pub fn defaults() -> Value {
             "pm_points": {"claude": 4, "codex": 0},
             "review_points": {"claude": 1, "codex": 5},
             "app_updates_per_week": 1,
+        },
+        // Overnight mode (sm#2494): when sm decides on its own that the
+        // owner is away. The moon button needs no setting.
+        "overnight": {
+            "follow_dnd": true,
+            "bedtime_enabled": true,
+            "bedtime_start": "23:00",
+            "bedtime_end": "07:00",
+            "idle_minutes": 20,
         },
     })
 }
@@ -306,8 +316,36 @@ fn validate_key(key: &str, value: &Value) -> Result<(), String> {
             Ok(())
         }
         "autopm" => validate_autopm(value),
+        "overnight" => validate_overnight(value),
         other => Err(format!("unknown field {other}")),
     }
+}
+
+fn validate_overnight(value: &Value) -> Result<(), String> {
+    for key in ["follow_dnd", "bedtime_enabled"] {
+        if !value[key].is_boolean() {
+            return Err(format!("overnight.{key} must be a boolean"));
+        }
+    }
+    for key in ["bedtime_start", "bedtime_end"] {
+        if value[key]
+            .as_str()
+            .and_then(crate::overnight::parse_clock)
+            .is_none()
+        {
+            return Err(format!("overnight.{key} must be HH:MM"));
+        }
+    }
+    if value["bedtime_start"] == value["bedtime_end"] {
+        return Err("overnight bedtime must start and end at different times".to_owned());
+    }
+    if !value["idle_minutes"]
+        .as_i64()
+        .is_some_and(|minutes| (5..=120).contains(&minutes))
+    {
+        return Err("overnight.idle_minutes must be 5–120".to_owned());
+    }
+    Ok(())
 }
 
 fn validate_autopm(value: &Value) -> Result<(), String> {

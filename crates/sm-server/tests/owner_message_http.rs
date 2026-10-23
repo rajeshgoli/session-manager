@@ -78,6 +78,13 @@ fn fixture() -> Fixture {
 }
 
 fn fixture_with_push(sender: Option<Arc<RecordingSender>>) -> Fixture {
+    fixture_with(sender, |_| {})
+}
+
+fn fixture_with(
+    sender: Option<Arc<RecordingSender>>,
+    tweak: impl FnOnce(&mut AppConfig),
+) -> Fixture {
     let dir = temp_dir();
     let state_file = dir.join("sessions.json");
     let session = |id: &str, parent: Option<&str>, completion: Option<&str>| {
@@ -124,6 +131,7 @@ fn fixture_with_push(sender: Option<Arc<RecordingSender>>) -> Fixture {
     config.push.db_path = dir.join("owner_push.db").display().to_string();
     config.rust_core.fixture_writes_enabled = true;
     config.rust_core.log_dir = Some(dir.join("logs").display().to_string());
+    tweak(&mut config);
     let state =
         AppState::new(config).with_push_sender(sender.map(|sender| sender as Arc<dyn PushSender>));
     Fixture {
@@ -1968,4 +1976,301 @@ async fn the_stop_payloads_final_message_beats_a_stale_transcript_read() {
     stop_hook(&f, "eng00001", "From the transcript").await;
     let (_, turn) = request(&f.app, "GET", "/sessions/eng00001/last-turn", None).await;
     assert_eq!(turn["text"], "From the transcript");
+}
+
+// ---- Overnight mode and sm blocked (sm#2494) -------------------------------
+
+const OWNER_SECRET: &str = "overnight-test-secret";
+
+fn owner_fixture(sender: Arc<RecordingSender>) -> Fixture {
+    fixture_with(Some(sender), |config| {
+        config.google_auth.session_cookie_secret = Some(OWNER_SECRET.into());
+        config.google_auth.allowlist_emails = vec!["owner@example.com".into()];
+    })
+}
+
+/// A phone's device token for the owner, as `/client/*` writes need.
+fn owner_token() -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let body = URL_SAFE_NO_PAD.encode(json!({"v":1,"type":"device_access","email":"owner@example.com","name":"Owner","iat":now,"exp":now+3600}).to_string());
+    let mut mac = Hmac::<Sha256>::new_from_slice(OWNER_SECRET.as_bytes()).unwrap();
+    mac.update(body.as_bytes());
+    format!(
+        "smat_{body}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
+}
+
+async fn owner_put(f: &Fixture, uri: &str, body: Value) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header("authorization", format!("Bearer {}", owner_token()))
+        .header("content-type", "application/json")
+        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))))
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = f.app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn follow_pass(f: &Fixture) {
+    let state = f.state.clone();
+    tokio::task::spawn_blocking(move || state.run_follow_pass(false))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn overnight_tells_agents_holds_alerts_and_releases_them_quietly() {
+    let sender = Arc::new(RecordingSender::default());
+    let f = owner_fixture(sender.clone());
+    let (status, _) = owner_put(
+        &f,
+        "/client/push-token",
+        json!({"token": "tok1", "device_name": "Pixel"}),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    // A question from before the night: its agent hears once the night begins.
+    let (status, before) = create(&f, "eng00001", "# Keep it?\nx", json!({"blocking": true})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(before["autoreply"].is_null(), "{before}");
+    follow_pass(&f).await;
+    let pushed = || {
+        sender
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|data| data["kind"] != "withdraw")
+            .count()
+    };
+    assert_eq!(pushed(), 1);
+
+    let (status, on) = owner_put(&f, "/client/overnight", json!({"on": true})).await;
+    assert_eq!(status, StatusCode::OK, "{on}");
+    assert_eq!(on["on"], true);
+    assert_eq!(on["away"]["source"], "manual");
+    assert_eq!(on["away"]["holds_alerts"], true);
+    follow_pass(&f).await;
+    let told = queued(&f, "overnight-");
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert_eq!(told[0].0, "eng00001");
+    assert!(
+        told[0]
+            .1
+            .starts_with("[sm autoreply] Rajesh is away or asleep"),
+        "{}",
+        told[0].1
+    );
+    assert!(told[0].1.contains("sm blocked"));
+    follow_pass(&f).await;
+    assert_eq!(queued(&f, "overnight-").len(), 1, "told once");
+
+    // A send during the night: the sender is told at once, the phone is not.
+    let (status, during) = create(&f, "eng00001", "# Progress\nx", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(during["away"], "manual");
+    let autoreply = during["autoreply"].as_str().unwrap();
+    assert!(autoreply.contains("will not be alerted now"), "{autoreply}");
+    assert!(
+        autoreply.contains("`sm blocked 'why you are blocked'`"),
+        "{autoreply}"
+    );
+    follow_pass(&f).await;
+    assert_eq!(pushed(), 1, "held overnight");
+    let (_, status_now) = request(&f.app, "GET", "/client/overnight", None).await;
+    assert_eq!(status_now["waiting"]["unread"], 1, "{status_now}");
+
+    // Back: what waited is released without a push per agent.
+    let (status, off) = owner_put(&f, "/client/overnight", json!({"on": false})).await;
+    assert_eq!(status, StatusCode::OK, "{off}");
+    assert_eq!(off["on"], false);
+    follow_pass(&f).await;
+    follow_pass(&f).await;
+    let kinds: Vec<String> = sender
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|data| data["kind"].clone())
+        .filter(|kind| kind != "withdraw")
+        .collect();
+    assert!(
+        kinds[1..].iter().all(|kind| kind == "overnight_summary"),
+        "no per-message push after the night: {kinds:?}"
+    );
+    // A send now is an ordinary send again.
+    let (_, after) = create(&f, "eng00001", "# Done\nx", json!({})).await;
+    assert!(after["autoreply"].is_null(), "{after}");
+}
+
+#[tokio::test]
+async fn sm_blocked_files_a_blocked_on_you_thread_above_needs_you() {
+    let f = fixture();
+    created_id(&f, "orphan01", "# A question\nx", json!({"blocking": true})).await;
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/owner/blocked",
+        Some(json!({"sender_session_id": "eng00001", "reason": "Log in to GitHub on the Mac\nThe token expired."})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["blocked"], true);
+    assert_eq!(body["blocking"], true);
+    assert_eq!(body["title"], "Blocked: Log in to GitHub on the Mac");
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/owner/blocked",
+        Some(json!({"sender_session_id": "eng00001", "reason": "  "})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Five unread updates do not stop the escalation (the cap is for updates).
+    for n in 0..5 {
+        created_id(&f, "child001", &format!("# Update {n}\nx"), json!({})).await;
+    }
+    let (status, capped) = create(&f, "child001", "# One more\nx", json!({})).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{capped}");
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/owner/blocked",
+        Some(json!({"sender_session_id": "child001", "reason": "Plug in the test phone"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let listing = inbox(&f, "open").await;
+    assert_eq!(keys(&listing)[0], "agent:eng00001", "{listing}");
+    assert_eq!(row(&listing, "agent:eng00001")["group"], "blocked");
+    assert_eq!(
+        listing["needs_you_count"], 1,
+        "the ended agent's ask no longer needs you"
+    );
+    // child001 is retired, so its block is history rather than an ask.
+    assert_eq!(listing["blocked_count"], 1, "{listing}");
+
+    let (status, watch) = request(&f.app, "GET", "/watch/state", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let agent = watch["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "eng00001")
+        .cloned()
+        .unwrap();
+    assert_eq!(agent["attention"]["section"], "blocked", "{agent}");
+    assert_eq!(agent["facts"]["you"]["kind"], "blocked");
+    assert_eq!(watch["counts"]["blocked"], 1);
+
+    let (status, done) = request(
+        &f.app,
+        "POST",
+        "/owner/blocked/done",
+        Some(json!({"sender_session_id": "eng00001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(done["cleared"], 1);
+    let listing = inbox(&f, "open").await;
+    assert_ne!(
+        row(&listing, "agent:eng00001")["group"],
+        "blocked",
+        "{listing}"
+    );
+}
+
+#[tokio::test]
+async fn a_night_ends_with_one_summary_and_its_alerts_wait_for_the_phone_to_show_it() {
+    use sm_server::overnight::{Away, OvernightStore, Source, State};
+    let sender = Arc::new(RecordingSender::default());
+    let f = fixture_with_push(Some(sender.clone()));
+    let (status, _) = request(
+        &f.app,
+        "PUT",
+        "/client/push-token",
+        Some(json!({"token": "tok1", "device_name": "Pixel"})),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    // A night that held alerts has just ended, with a blocked agent waiting
+    // and the owner not back.
+    let since = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+    let store = OvernightStore::new(f.dir.join("message_queue.db"));
+    store
+        .update(|_| State {
+            seen: Some(Away {
+                source: Source::Manual,
+                since: sm_server::owner_push::format_ts(since),
+                until: None,
+            }),
+            ..State::default()
+        })
+        .unwrap();
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/owner/blocked",
+        Some(json!({"sender_session_id": "eng00001", "reason": "Log in to GitHub"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let kinds = || {
+        sender
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|data| data["kind"].clone())
+            .collect::<Vec<_>>()
+    };
+    follow_pass(&f).await;
+    follow_pass(&f).await;
+    assert_eq!(
+        kinds(),
+        vec!["overnight_summary".to_owned()],
+        "held until shown"
+    );
+    let summary = sender.sent.lock().unwrap()[0].clone();
+    assert_eq!(summary["title"], "1 agent is blocked on you");
+    assert_eq!(summary["reader_path"], "/inbox");
+
+    // A message after the summary waits with the rest while it is out...
+    created_id(&f, "eng00001", "# Later news\nx", json!({})).await;
+    follow_pass(&f).await;
+    assert_eq!(kinds(), vec!["overnight_summary".to_owned()]);
+
+    // ...and once the phone shows the summary, only what it described is
+    // released; the later message gets its own push.
+    let (status, _) = send(
+        &f.app,
+        "POST",
+        &format!("/client/overnight/summary/{}/ack", summary["summary_id"]),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    follow_pass(&f).await;
+    assert_eq!(
+        kinds(),
+        vec!["overnight_summary".to_owned(), "message".to_owned()]
+    );
+    assert_eq!(sender.sent.lock().unwrap()[1]["body"], "Later news");
 }

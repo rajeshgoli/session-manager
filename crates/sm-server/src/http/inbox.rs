@@ -102,7 +102,7 @@ pub(super) struct InboxRow {
     pub pr_number: Option<i64>,
     /// A doc's latest revision's publisher.
     pub author: Option<String>,
-    /// `needs_you`, `finished`, `new` or `earlier`.
+    /// `blocked` (sm#2494), `needs_you`, `finished`, `new` or `earlier`.
     pub group: &'static str,
     pub preview: String,
     pub newest_at: String,
@@ -126,10 +126,11 @@ pub(super) struct InboxRow {
 
 fn group_rank(group: &str) -> u8 {
     match group {
-        "needs_you" => 0,
-        "new" => 1,
-        "finished" => 2,
-        _ => 3,
+        "blocked" => 0,
+        "needs_you" => 1,
+        "new" => 2,
+        "finished" => 3,
+        _ => 4,
     }
 }
 
@@ -370,7 +371,15 @@ pub(super) struct InboxQuery {
 
 /// The rows a filter shows, in order, plus the badge values (which always
 /// count the Open list).
-fn inbox_listing(state: &AppState, filter: &str) -> Result<(Vec<InboxRow>, usize, bool), ApiError> {
+/// The rows a filter shows and the Open badge values.
+struct Listing {
+    rows: Vec<InboxRow>,
+    needs_you_count: usize,
+    blocked_count: usize,
+    has_new: bool,
+}
+
+fn inbox_listing(state: &AppState, filter: &str) -> Result<Listing, ApiError> {
     let mut rows = ThreadCatalog::load(state)?.rows(state)?;
     rows.extend(board_pings::board_row(state)?);
     let cutoff = format_ts(OffsetDateTime::now_utc() - OPEN_WINDOW);
@@ -380,13 +389,19 @@ fn inbox_listing(state: &AppState, filter: &str) -> Result<(Vec<InboxRow>, usize
     let open = |row: &InboxRow| {
         row.group == "folded"
             || (!row.done
-                && (matches!(row.group, "needs_you" | "finished") || row.newest_at >= cutoff))
+                && (matches!(row.group, "blocked" | "needs_you" | "finished")
+                    || row.newest_at >= cutoff))
     };
+    // Blocked threads count as needing the owner too.
     let needs_you_count = rows
         .iter()
-        .filter(|row| open(row) && row.group == "needs_you")
+        .filter(|row| open(row) && matches!(row.group, "blocked" | "needs_you"))
         .count();
     let has_new = rows.iter().any(|row| open(row) && row.group == "new");
+    let blocked_count = rows
+        .iter()
+        .filter(|row| open(row) && row.group == "blocked")
+        .count();
     let newest_first = |a: &InboxRow, b: &InboxRow| b.newest_at.cmp(&a.newest_at);
     let mut rows: Vec<InboxRow> = match filter {
         "done" => rows
@@ -409,7 +424,12 @@ fn inbox_listing(state: &AppState, filter: &str) -> Result<(Vec<InboxRow>, usize
         rows.sort_by(newest_first);
         rows.truncate(LIST_LIMIT);
     }
-    Ok((rows, needs_you_count, has_new))
+    Ok(Listing {
+        rows,
+        needs_you_count,
+        blocked_count,
+        has_new,
+    })
 }
 
 fn html(body: String) -> Response {
@@ -441,21 +461,22 @@ pub(super) async fn get_inbox(
     if let Some(shell) = web::shell_page(&state, &request) {
         return Ok(shell);
     }
-    let (rows, needs_you_count, has_new) = inbox_listing(&state, filter)?;
+    let listing = inbox_listing(&state, filter)?;
     if query.format.as_deref() == Some("json") || web::wants_json(&request) {
         return Ok(Json(json!({
             "filter": filter,
-            "needs_you_count": needs_you_count,
-            "has_new": has_new,
-            "rows": rows,
+            "needs_you_count": listing.needs_you_count,
+            "blocked_count": listing.blocked_count,
+            "has_new": listing.has_new,
+            "rows": listing.rows,
         }))
         .into_response());
     }
     Ok(html(render_inbox_page(
         &state,
         filter,
-        &rows,
-        needs_you_count,
+        &listing.rows,
+        listing.needs_you_count,
     )))
 }
 
@@ -469,6 +490,7 @@ const INBOX_STYLE: &str = r#"
 .row-card .m { flex-shrink: 0; }
 .row-card .p { margin: 2px 0; }
 .card.nw { border-left-color: #F0ABFC; }
+.card.bl { border-left-color: #FB7185; } .lbl.bl { color: #FB7185; }
 .lbl.a { color: var(--ka); } .lbl.nw { color: #F0ABFC; } .lbl.fin { color: var(--kc); }
 .card.fin { border-left-color: var(--kc); }
 button.done { font: 11px var(--mono); color: var(--kt2); background: var(--k2); border: 1px solid var(--kl);
@@ -480,6 +502,7 @@ button.done { font: 11px var(--mono); color: var(--kt2); background: var(--k2); 
 
 fn render_row(row: &InboxRow, now: OffsetDateTime, show_done: bool) -> String {
     let edge = match row.group {
+        "blocked" => "bl",
         "needs_you" => "a",
         "finished" => "fin",
         "new" => "nw",
@@ -551,6 +574,7 @@ fn render_inbox_page(
         body.push_str(r#"<p class="empty">Nothing here.</p>"#);
     } else if filter == "open" {
         for (group, label, class) in [
+            ("blocked", "Blocked on you", "bl"),
             ("needs_you", "Needs you", "a"),
             ("new", "New", "nw"),
             ("finished", "Finished", "fin"),
@@ -658,8 +682,10 @@ impl Item<'_> {
             Item::Message(message, state) => json!({
                 "kind": "message", "id": message.id, "at": self.at(),
                 "title": message.title, "markdown": message.body_markdown,
-                "state": message_state_label(*state),
-                "needs_you": *state == OwnerMessageState::NeedsYou, "html": html(),
+                "state": message_label(message, *state),
+                "needs_you": *state == OwnerMessageState::NeedsYou,
+                "blocked": message.blocked && *state == OwnerMessageState::NeedsYou,
+                "html": html(),
                 "alert": match world.alert_action(message) {
                     alerts::AlertAction::Assign => json!({"action": "assign"}),
                     alerts::AlertAction::Assigned(agent) => json!({"action": "assigned",
@@ -790,6 +816,15 @@ const THREAD_STYLE: &str = r#"
 /// A small spark: an agent takes this.
 const ASSIGN_ICON: &str = r#"<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 1.8v2.4M8 11.8v2.4M1.8 8h2.4M11.8 8h2.4M3.6 3.6l1.6 1.6M10.8 10.8l1.6 1.6M12.4 3.6l-1.6 1.6M5.2 10.8l-1.6 1.6"/><circle cx="8" cy="8" r="1.6" fill="currentColor" stroke="none"/></svg>"#;
 
+/// A blocked ask reads "blocked on you" (sm#2494).
+fn message_label(message: &OwnerMessage, state: OwnerMessageState) -> &'static str {
+    if message.blocked && state == OwnerMessageState::NeedsYou {
+        "blocked on you"
+    } else {
+        message_state_label(state)
+    }
+}
+
 fn message_state_label(state: OwnerMessageState) -> &'static str {
     match state {
         OwnerMessageState::New => "new",
@@ -838,7 +873,7 @@ fn render_item(item: &Item<'_>, world: &World, session_id: &str, now: OffsetDate
                 format!(
                     r#"<span class="m">{} · {}</span>"#,
                     when(&message.created_at),
-                    message_state_label(*state)
+                    message_label(message, *state)
                 )
             };
             let action = match action {
@@ -862,7 +897,9 @@ fn render_item(item: &Item<'_>, world: &World, session_id: &str, now: OffsetDate
                 r#"<div class="b{ask_class}" id="{id}">{chip}<h3>{title}</h3><div class="md" data-msg="{id}">{body}</div><div class="foot">{meta}{action}</div></div>"#,
                 ask_class = if ask { " ask" } else { "" },
                 id = escape_html(&message.id),
-                chip = if ask {
+                chip = if ask && message.blocked {
+                    r#"<span class="chip r">BLOCKED ON YOU</span>"#
+                } else if ask {
                     r#"<span class="chip a">NEEDS YOU</span>"#
                 } else {
                     ""

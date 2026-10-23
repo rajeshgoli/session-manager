@@ -728,6 +728,7 @@ impl AppState {
                         body_markdown: body.into(),
                         // Only the owner can plug the drive back in (sm#2414).
                         blocking: true,
+                        blocked: false,
                     },
                     Some(key),
                 )?;
@@ -923,6 +924,7 @@ impl AppState {
                     body_markdown: body.into(),
                     // Agent work: the message carries Assign to agent (sm#2414).
                     blocking: false,
+                    blocked: false,
                 },
                 Some(key),
             )?;

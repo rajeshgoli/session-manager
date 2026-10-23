@@ -85,6 +85,33 @@ object NoticePush {
         return runCatching { NotificationManagerCompat.from(context).notify(message.notificationId, notification) }.isSuccess
     }
 
+    /** sm#2494: a held night ended on its own; one notification for what waited, opening the Inbox. */
+    const val KIND_OVERNIGHT_SUMMARY = "overnight_summary"
+
+    fun showOvernightSummary(context: Context, data: Map<String, String>): Boolean {
+        if (!canNotify(context)) return false
+        val title = data["title"]?.takeIf { it.isNotBlank() } ?: return false
+        val body = data["body"].orEmpty()
+        val intent = Intent(context, MainActivity::class.java).apply {
+            action = FollowPush.ACTION_OPEN_FOLLOW
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(FollowPush.EXTRA_READER_PATH, "/inbox")
+            putExtra(FollowPush.EXTRA_TITLE, "Inbox")
+            putExtra(FollowPush.EXTRA_INBOX, true)
+        }
+        val id = KIND_OVERNIGHT_SUMMARY.hashCode()
+        val pendingIntent = PendingIntent.getActivity(context, id, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setAutoCancel(true)
+            .setContentIntent(pendingIntent)
+            .build()
+        return runCatching { NotificationManagerCompat.from(context).notify(id, notification) }.isSuccess
+    }
+
     /** sm#1768 G5: GitHub Codex ran out of review quota; tapping opens Settings › Reviews. */
     const val KIND_GITHUB_CODEX_PAUSED = "github_codex_paused"
 

@@ -232,6 +232,7 @@ fn why_not(
     }
     let facts = &item["facts"];
     match facts["you"]["kind"].as_str() {
+        Some("blocked") => return Some("is blocked on you"),
         Some("message") => return Some("asked you a question"),
         Some("doc_review") => return Some("waits on your doc review"),
         Some(_) => return Some("waits on you"),

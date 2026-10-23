@@ -54,6 +54,10 @@ enum Command {
     Who(EmptyArgs),
     All(EmptyArgs),
     Send(SendArgs),
+    /// Tell the owner you cannot continue without them (sm#2494). Use it
+    /// only for what you cannot do yourself: a login, a physical device, a
+    /// decision only the owner can make. Then wait for the reply.
+    Blocked(BlockedArgs),
     #[command(alias = "btw")]
     What(WhatArgs),
     Usage(UsageArgs),
@@ -244,6 +248,15 @@ struct SendArgs {
     /// A message to a person: you cannot continue until they answer.
     #[arg(long)]
     blocking: bool,
+}
+
+#[derive(Args)]
+struct BlockedArgs {
+    /// Why you are blocked, as markdown. Omit it, or pass `-`, to read piped stdin.
+    reason: Vec<String>,
+    /// You got unblocked another way: withdraw your open "Blocked on you".
+    #[arg(long, conflicts_with = "reason")]
+    done: bool,
 }
 
 #[derive(Args)]
@@ -1181,6 +1194,7 @@ fn run() -> Result<()> {
             args.node,
         )?,
         Command::Send(args) => run_send(&client, args)?,
+        Command::Blocked(args) => run_blocked(&client, args)?,
         Command::What(args) => run_what(&client, args)?,
         Command::Usage(args) => run_usage(&client, args)?,
         Command::Remind(args) => run_remind(&client, args)?,
@@ -1829,6 +1843,72 @@ fn send_message_to_human(
             .or_else(|| payload["reader_path"].as_str())
             .unwrap_or_default()
     );
+    print_autoreply(&payload);
+    Ok(())
+}
+
+/// The owner is away (sm#2494): what the server says to do instead of waiting.
+fn print_autoreply(payload: &Value) {
+    if let Some(autoreply) = payload["autoreply"]
+        .as_str()
+        .filter(|text| !text.is_empty())
+    {
+        println!("\n{autoreply}");
+    }
+}
+
+fn response_detail(response: &ApiResponse) -> String {
+    serde_json::from_str::<Value>(&response.body)
+        .ok()
+        .and_then(|body| body["detail"].as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| format!("HTTP {}: {}", response.status, response.body))
+}
+
+/// `sm blocked <reason>`: a "Blocked on you" message to the owner; with
+/// `--done`, withdraw it.
+fn run_blocked(client: &ApiClient, args: BlockedArgs) -> Result<()> {
+    let sender = optional_current_session_id().ok_or_else(|| {
+        anyhow!("sm blocked needs a managed session, so the reply has somewhere to go")
+    })?;
+    if args.done {
+        let response = client.request(
+            "POST",
+            "/owner/blocked/done",
+            Some(json!({ "sender_session_id": sender })),
+        )?;
+        if !(200..300).contains(&response.status) {
+            bail!("{}", response_detail(&response));
+        }
+        let cleared = response.into_json()?["cleared"].as_u64().unwrap_or(0);
+        println!(
+            "{}",
+            if cleared == 0 {
+                "You had no open \"Blocked on you\"."
+            } else {
+                "Withdrew your \"Blocked on you\"."
+            }
+        );
+        return Ok(());
+    }
+    let reason = read_send_text(&args.reason)?;
+    let response = client.request(
+        "POST",
+        "/owner/blocked",
+        Some(json!({ "sender_session_id": sender, "reason": reason })),
+    )?;
+    if !(200..300).contains(&response.status) {
+        bail!("{}", response_detail(&response));
+    }
+    let payload = response.into_json()?;
+    println!(
+        "{} sees \"Blocked on you\" in the sm app → {}\nWait for the reply; it arrives here. Run `sm blocked --done` if you get unblocked another way.",
+        payload["owner_name"].as_str().unwrap_or("The owner"),
+        payload["reader_url"]
+            .as_str()
+            .or_else(|| payload["reader_path"].as_str())
+            .unwrap_or_default()
+    );
+    print_autoreply(&payload);
     Ok(())
 }
 

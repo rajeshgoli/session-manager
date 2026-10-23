@@ -122,6 +122,7 @@ fun AppTopBar(
                     }
                 }
                 actions?.invoke()
+                li.rajeshgo.sm.ui.overnight.OvernightButton()
                 IconButton(onClick = menu.onReportBug) {
                     Icon(Icons.Rounded.BugReport, contentDescription = "Report a bug", tint = TextSecondary)
                 }
@@ -161,6 +162,7 @@ fun AppTopBar(
         Box(Modifier.fillMaxWidth().padding(horizontal = 14.dp).height(2.dp)) {
             if (refreshBar) LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp), color = Cyan, trackColor = Border)
         }
+        li.rajeshgo.sm.ui.overnight.OvernightBanner()
     }
 }
 

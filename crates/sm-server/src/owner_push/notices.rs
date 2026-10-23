@@ -338,6 +338,44 @@ impl OwnerPushStore {
         Ok(exists)
     }
 
+    /// The message notices created since `since` that have not gone out:
+    /// what an overnight summary stands for (sm#2494).
+    pub fn held_message_notices(
+        &self,
+        user_id: &str,
+        since: OffsetDateTime,
+    ) -> Result<Vec<String>> {
+        let conn = self.open()?;
+        let mut statement = conn.prepare(
+            "SELECT id FROM owner_notices WHERE notified_at IS NULL AND kind = ?2 \
+             AND user_id = ?3 AND created_at >= ?1 ORDER BY created_at, rowid",
+        )?;
+        let ids = statement
+            .query_map(params![format_ts(since), NOTICE_MESSAGE, user_id], |row| {
+                row.get(0)
+            })?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
+    }
+
+    /// One overnight summary stood for these notices (sm#2494): those still
+    /// unsent are marked sent without a push, so the phone does not buzz
+    /// once per agent. Returns how many.
+    pub fn release_held(&self, ids: &[String], now: OffsetDateTime) -> Result<usize> {
+        let mut conn = self.open()?;
+        let tx = conn.transaction()?;
+        let mut released = 0;
+        for id in ids {
+            released += tx.execute(
+                "UPDATE owner_notices SET notified_at = ?2, notified_via = 'overnight' \
+                 WHERE id = ?1 AND notified_at IS NULL",
+                params![id, format_ts(now)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(released)
+    }
+
     /// The owner's notices from the last 7 days, newest first.
     pub fn list_notices(&self, user_id: &str, now: OffsetDateTime) -> Result<Vec<Notice>> {
         let cutoff = format_ts(now - RECENT_NOTICE_WINDOW);
@@ -476,8 +514,25 @@ pub fn deliver_notices(
     mailer: &dyn NoticeMailer,
     now: OffsetDateTime,
 ) -> Result<Vec<String>> {
+    deliver_notices_holding(store, world, sender, mailer, now, None)
+}
+
+/// [`deliver_notices`], leaving `held_user`'s notices untouched while
+/// overnight mode holds that owner's alerts (sm#2494).
+pub fn deliver_notices_holding(
+    store: &OwnerPushStore,
+    world: &dyn NoticeWorld,
+    sender: Option<&dyn PushSender>,
+    mailer: &dyn NoticeMailer,
+    now: OffsetDateTime,
+    held_user: Option<&str>,
+) -> Result<Vec<String>> {
+    let held = |notice: &Notice| held_user == Some(notice.user_id.as_str());
     let mut problems = Vec::new();
     for mut notice in store.pending_notices(now)? {
+        if held(&notice) {
+            continue;
+        }
         if !world.still_wanted(&notice)? || world.opened(&notice)? {
             close_resolved(&mut notice, now);
             store.save_notice_delivery(&notice)?;
@@ -556,6 +611,9 @@ pub fn deliver_notices(
         store.save_notice_delivery(&notice)?;
     }
     for mut notice in store.notice_ack_fallback_due(now)? {
+        if held(&notice) {
+            continue;
+        }
         if !world.still_wanted(&notice)? || world.opened(&notice)? {
             close_resolved(&mut notice, now);
             store.save_notice_delivery(&notice)?;

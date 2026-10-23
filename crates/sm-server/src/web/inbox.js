@@ -33,8 +33,9 @@ const docRevision = item => {
 };
 // What reached the owner's phone (Needs you, New) comes before agents that
 // merely finished a turn (sm#2249).
-const GROUPS = ['needs_you','new','finished','earlier'];
-const GROUP_LABELS = {needs_you:'Needs you', new:'New', finished:'Finished', earlier:'Earlier'};
+// An agent that ran `sm blocked` leads everything (sm#2494).
+const GROUPS = ['blocked','needs_you','new','finished','earlier'];
+const GROUP_LABELS = {blocked:'Blocked on you', needs_you:'Needs you', new:'New', finished:'Finished', earlier:'Earlier'};
 /** Rows in the order the list shows them; Folded rows only while the fold is open. */
 export function shownRows(rows, filter, foldOpen) {
   if (filter !== 'open') return rows;
@@ -143,7 +144,7 @@ export function InboxPage({ openRef }) {
       ${!data ? html`<p class="empty">Loading…</p>` : data.rows.length === 0 ? html`<p class="empty">${filter === 'open' ? 'You are caught up.' : 'Nothing here.'}</p>` : null}
       ${(filter === 'open' ? GROUPS : ['all']).map(group => {
         const rows = (data?.rows || []).filter(r => group === 'all' || r.group === group);
-        return rows.length ? html`<div>${group !== 'all' ? html`<h2 class=${({needs_you:'magenta',new:'cyan'})[group] || ''}>${GROUP_LABELS[group]} <span class="count">${rows.length}</span></h2>` : null}
+        return rows.length ? html`<div>${group !== 'all' ? html`<h2 class=${({blocked:'red',needs_you:'magenta',new:'cyan'})[group] || ''}>${GROUP_LABELS[group]} <span class="count">${rows.length}</span></h2>` : null}
           ${rows.map(row)}</div>` : null;
       })}
       ${filter === 'open' && folded.length ? html`<div class="inbox-fold">

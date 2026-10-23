@@ -1,5 +1,6 @@
 {
   "counts": {
+    "blocked": 0,
     "finished": 0,
     "idle": 0,
     "live": 1,

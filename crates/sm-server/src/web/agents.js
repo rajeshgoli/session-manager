@@ -12,18 +12,18 @@ import { isShell, shellFact, ShellMenu, ShellTiles, createShell, shellError, hid
 // ---- facts and attention (1782 B: the server computes both) ------------------
 
 /** Attention sections, in display order. */
-export const SECTIONS = ['you', 'finished', 'waiting_long', 'moving', 'waiting', 'idle', 'stopped'];
+export const SECTIONS = ['blocked', 'you', 'finished', 'waiting_long', 'moving', 'waiting', 'idle', 'stopped'];
 export const SECTION_LABEL = {
-  you: 'Needs you', finished: 'Finished', waiting_long: 'Waiting long', moving: 'Moving',
+  blocked: 'Blocked on you', you: 'Needs you', finished: 'Finished', waiting_long: 'Waiting long', moving: 'Moving',
   waiting: 'Waiting', idle: 'Idle', stopped: 'Stopped',
 };
 /** The summary strip's words for each count. */
 const COUNT_LABEL = {
-  you: 'needs you', finished: 'finished', waiting_long: 'waiting long', moving: 'moving', waiting: 'waiting', idle: 'idle',
+  blocked: 'blocked on you', you: 'needs you', finished: 'finished', waiting_long: 'waiting long', moving: 'moving', waiting: 'waiting', idle: 'idle',
 };
 /** Section colours (1782 A3). */
 export const SECTION_TONE = {
-  you: 'magenta', finished: 'cyan', waiting_long: 'amber', moving: 'green', waiting: 'amber', idle: 'muted', stopped: 'muted',
+  blocked: 'red', you: 'magenta', finished: 'cyan', waiting_long: 'amber', moving: 'green', waiting: 'amber', idle: 'muted', stopped: 'muted',
 };
 
 const sectionOf = (agent) => (agent.attention && agent.attention.section) || 'idle';
@@ -83,7 +83,8 @@ export function foldText(folded, now = Date.now()) {
 export function summaryCounts(counts) {
   const c = counts || {};
   return Object.keys(COUNT_LABEL)
-    .map((section) => ({ section, n: c[section === 'you' ? 'needs_you' : section] || 0, label: COUNT_LABEL[section] }))
+    // needs_you counts blocked agents too; the strip shows them apart.
+    .map((section) => ({ section, n: section === 'you' ? Math.max(0, (c.needs_you || 0) - (c.blocked || 0)) : c[section] || 0, label: COUNT_LABEL[section] }))
     .filter(({ section, n }) => n > 0 || section === 'you');
 }
 
@@ -155,9 +156,10 @@ export function youFact(agent, now = Date.now()) {
   const facts = agent.facts || {};
   if (facts.you) {
     const more = facts.you.more ? ` +${facts.you.more}` : '';
+    const blocked = facts.you.kind === 'blocked';
     return {
-      text: `◆ ${age(facts.you.since, now) || 'now'}: ${facts.you.text}${more}`,
-      tone: 'magenta',
+      text: `◆ ${blocked ? 'Blocked · ' : ''}${age(facts.you.since, now) || 'now'}: ${facts.you.text}${more}`,
+      tone: blocked ? 'red' : 'magenta',
       dismissible: !!facts.you.dismissible,
     };
   }
@@ -165,7 +167,7 @@ export function youFact(agent, now = Date.now()) {
   return null;
 }
 
-const CLEARED = { message: 'Marked answered', doc_review: 'No review needed', finished: 'Marked read' };
+const CLEARED = { blocked: 'Marked answered', message: 'Marked answered', doc_review: 'No review needed', finished: 'Marked read' };
 
 /** ✓: clear what the card shows — a question, a review request or a
  * Finished summary — as Inbox Done would (1782 C4, sm#1851). */

@@ -410,6 +410,7 @@ impl Actions for Runtime<'_> {
             title: "Auto PM paused".into(),
             body_markdown: format!("Auto PM paused: four cycles, nothing kept. Readouts: {links}"),
             blocking: false,
+            blocked: false,
         };
         match super::super::messages::owner_message_store(state)
             .create_once(message, Some(&format!("autopm-pause:{at}")))?

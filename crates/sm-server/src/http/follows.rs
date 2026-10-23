@@ -497,7 +497,7 @@ pub(super) async fn list_notices(
 /// Whom a notice goes to (appendix F1): the identity the app's push tokens
 /// are registered under. The human's email when it is an allowlisted
 /// Google email, else the first allowlisted email, else the local bypass.
-fn notice_user_id(state: &AppState, human: Option<&str>) -> String {
+pub(super) fn notice_user_id(state: &AppState, human: Option<&str>) -> String {
     let email = EmailBridge::load(&state.config).ok().and_then(|bridge| {
         let name = match human {
             Some(name) => name.to_owned(),
@@ -527,6 +527,9 @@ fn message_notice(state: &AppState, message: &OwnerMessage) -> NewNotice {
         &message.title,
         message.blocking,
     );
+    if message.blocked {
+        notice.title = format!("{} is blocked on you", message.sender_session_name);
+    }
     if message.blocking
         && message.title.starts_with("PR #")
         && message.title.ends_with(" has no reviewer")
@@ -951,12 +954,21 @@ impl AppState {
         if sweep {
             owner_push::sweep(&store, &world, now)?;
         }
-        let mut problems = owner_push::deliver(
+        // Overnight mode (sm#2494): while it holds alerts, follows and
+        // notices wait undelivered; withdrawals still go.
+        let held = self.overnight_tick(now).unwrap_or_else(|error| {
+            eprintln!("overnight step failed: {error:#}");
+            false
+        });
+        // Only the owner's alerts wait; other humans' still go out.
+        let held_user = held.then(|| super::overnight::owner_notice_user(self));
+        let mut problems = owner_push::deliver_holding(
             &store,
             &world,
             self.push_sender.as_deref(),
             &AppFollowMailer { state: self },
             now,
+            held_user.as_deref(),
         )?;
         // Notices ride the same pass, after follows (sm#1580); the repair
         // pass runs on sweep passes, every third.
@@ -965,12 +977,13 @@ impl AppState {
             owner_push::repair_notices(&store, &notice_world, now)?;
             self.sweep_approval_waits(&store, now)?;
         }
-        problems.extend(owner_push::deliver_notices(
+        problems.extend(owner_push::deliver_notices_holding(
             &store,
             &notice_world,
             self.push_sender.as_deref(),
             &AppNoticeMailer { state: self },
             now,
+            held_user.as_deref(),
         )?);
         problems.extend(owner_push::withdraw_notices(
             &store,

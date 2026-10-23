@@ -18,6 +18,7 @@ fn new_message(sender: &str, blocking: bool) -> NewOwnerMessage {
         title: "Keep the old fills table or drop it?".into(),
         body_markdown: "# Keep the old fills table or drop it?\nBody".into(),
         blocking,
+        blocked: false,
     }
 }
 
@@ -37,6 +38,7 @@ fn message(blocking: bool) -> OwnerMessage {
         title: "Keep the old fills table or drop it?".into(),
         body_markdown: String::new(),
         blocking,
+        blocked: false,
         created_at: "2026-09-26T10:00:00Z".into(),
         first_viewed_at: None,
         handled_at: None,

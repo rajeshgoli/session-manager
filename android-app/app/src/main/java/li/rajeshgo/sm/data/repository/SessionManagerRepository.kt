@@ -439,6 +439,23 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).setOwnerSettings(patch) }.mapFailure(::classifyWriteFailure)
     }
 
+    /** Overnight mode (sm#2494). */
+    suspend fun fetchOvernight(baseUrl: String, token: String) = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getOvernight() }
+    }
+
+    suspend fun setOvernight(baseUrl: String, token: String, on: Boolean) = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).setOvernight(li.rajeshgo.sm.data.model.OvernightSwitch(on)) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun ackOvernightSummary(baseUrl: String, token: String, summaryId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).ackOvernightSummary(summaryId) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun reportDnd(baseUrl: String, token: String, on: Boolean) = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).reportDnd(li.rajeshgo.sm.data.model.OvernightSwitch(on)) }.mapFailure(::classifyWriteFailure)
+    }
+
     /** The live auto PM switches (spec 2170 B.1), read in the background. */
     suspend fun fetchSwitches(baseUrl: String, token: String): Map<String, Boolean> = withContext(Dispatchers.IO) {
         val settings = executeReadRequest(baseUrl, token) { it.getSwitchSettings() }

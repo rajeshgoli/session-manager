@@ -469,6 +469,7 @@ impl ask::Effects for Runtime<'_> {
                 title: title.into(),
                 body_markdown: body.into(),
                 blocking: false,
+                blocked: false,
             },
             Some(key),
         )? {

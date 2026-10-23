@@ -1235,6 +1235,7 @@ private fun SectionHeading(title: String, color: Color) {
 
 /** Section heading colours (spec 1782 A3). */
 private fun sectionColor(section: String): Color = when (section) {
+    "blocked" -> Rose
     "you" -> Fuchsia
     "finished" -> Cyan
     "waiting_long", "waiting" -> Amber
@@ -1460,7 +1461,8 @@ private fun SessionRow(
                     val finished = finishedLine(session)
                     if (you != null) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(you, style = MaterialTheme.typography.bodySmall, color = Fuchsia, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            val youTone = if (session.facts?.you?.kind == "blocked") Rose else Fuchsia
+                            Text(you, style = MaterialTheme.typography.bodySmall, color = youTone, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                             if (session.facts?.you?.dismissible == true) {
                                 Text(
                                     "✓",
