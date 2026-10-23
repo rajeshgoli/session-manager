@@ -166,8 +166,9 @@ every restart after.
 ### Signing
 
 The script signs the server with a persistent code-signing certificate and
-refuses ad-hoc signing, so macOS treats each new build as the same program
-and keychain and privacy permissions survive restarts.
+refuses ad-hoc signing, preserving the signing identity across builds. macOS
+privacy grants for standalone executables can also depend on their installed
+path; check both server paths when granting access to protected files.
 
 1. Create a certificate: Keychain Access → Certificate Assistant → Create a
    Certificate, type **Code Signing**, in the login keychain.
@@ -184,6 +185,36 @@ export SM_SIGN_DESIGNATED_REQUIREMENT='designated => identifier "com.rajeshgoli.
 For a self-signed certificate the root is the certificate itself, so both lines
 carry the same fingerprint. The script refuses to stop the running server if the
 new build's signature does not match exactly.
+
+### Verify external-volume access
+
+A direct shell read does not prove that queued jobs can read the same file:
+macOS attributes queue children to the launchd-managed server. In **System
+Settings → Privacy & Security**, check **Files and Folders** and **Full Disk
+Access** for both installed executables, `.local/bin/sm-server-blue` and
+`.local/bin/sm-server-green` in the deployed checkout. A signing certificate
+alone does not grant file access. Full Disk Access also grants access to other
+protected files; the owner must authorize that permission change. Do not reset
+the privacy database or move shared inputs as a repair.
+
+Choose a stable existing reference file of at most 64 KiB on the external
+volume. Submit its alias and resolved path to the check from this checkout:
+
+```bash
+sm queue run --type background --label external-read-check --cwd "$PWD" \
+  --input <artifact-name> --timeout 1m --memory 1G -- \
+  /absolute/path/to/python3 scripts/check-queue-external-read.py \
+  /path/to/alias/reference.json /Volumes/Volume/path/to/reference.json
+```
+
+The check changes no volume files. It bounds each cat and Python read, reports
+byte counts and content hashes, and exits nonzero on errors, timeouts, or content
+differences. It skips on non-macOS hosts; macOS requires an explicit file under
+`/Volumes`. The selected file must remain small and unchanged during the check.
+Inspect `sandboxd` and `tccd` (the macOS privacy service) logs for matching
+process IDs if opens time out. Re-run the queued check after a permission
+change; if macOS requires a service restart, use the supported restart script.
+Submit a new job for scoring that was already cancelled or timed out.
 
 ### What a restart does
 
