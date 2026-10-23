@@ -957,8 +957,23 @@ pub fn deliver(
     mailer: &dyn FollowMailer,
     now: OffsetDateTime,
 ) -> Result<Vec<String>> {
+    deliver_holding(store, world, sender, mailer, now, None)
+}
+
+/// [`deliver`], leaving `held_user`'s follows untouched while overnight
+/// mode holds that owner's alerts (sm#2494).
+pub fn deliver_holding(
+    store: &OwnerPushStore,
+    world: &dyn FollowWorld,
+    sender: Option<&dyn PushSender>,
+    mailer: &dyn FollowMailer,
+    now: OffsetDateTime,
+    held_user: Option<&str>,
+) -> Result<Vec<String>> {
+    let held = |follow: &Follow| held_user == Some(follow.user_id.as_str());
     let mut problems = Vec::new();
-    let pending = store.pending_delivery(now)?;
+    let mut pending = store.pending_delivery(now)?;
+    pending.retain(|follow| !held(follow));
     let names = if pending.is_empty() {
         BTreeMap::new()
     } else {
@@ -1065,6 +1080,9 @@ pub fn deliver(
         store.save_delivery(&follow)?;
     }
     for mut follow in store.ack_fallback_due(now)? {
+        if held(&follow) {
+            continue;
+        }
         let notification = notification_for(&follow);
         let due_since = follow
             .notified_at

@@ -140,27 +140,44 @@ pub struct PendingSummary {
 
 pub const SUMMARY_ACK_WINDOW: Duration = Duration::minutes(15);
 
+/// The local UTC offset at an instant: [`local_offset`] in production, a
+/// fixed or switching offset in tests.
+pub type OffsetAt = fn(OffsetDateTime) -> UtcOffset;
+
+/// A local wall time as an instant, with the offset in force then, so a
+/// window across a daylight-saving change keeps both ends right.
+fn at_local(
+    date: time::Date,
+    clock: Time,
+    offset_at: OffsetAt,
+    near: OffsetDateTime,
+) -> OffsetDateTime {
+    let wall = date.with_time(clock);
+    let guess = wall.assume_offset(offset_at(near));
+    wall.assume_offset(offset_at(guess))
+}
+
 /// The bedtime window containing `now` in local time, as UTC instants.
 fn bedtime_window(
     now: OffsetDateTime,
-    offset: UtcOffset,
+    offset_at: OffsetAt,
     start: Time,
     end: Time,
 ) -> Option<(OffsetDateTime, OffsetDateTime)> {
     if start == end {
         return None;
     }
-    let local = now.to_offset(offset);
+    let local = now.to_offset(offset_at(now));
     let today = local.date();
     // Windows that could contain now: the one starting yesterday and today.
     for start_date in [today.previous_day()?, today] {
-        let window_start = start_date.with_time(start).assume_offset(offset);
+        let window_start = at_local(start_date, start, offset_at, now);
         let end_date = if end > start {
             start_date
         } else {
             start_date.next_day()?
         };
-        let window_end = end_date.with_time(end).assume_offset(offset);
+        let window_end = at_local(end_date, end, offset_at, now);
         if window_start <= now && now < window_end {
             return Some((window_start, window_end));
         }
@@ -172,7 +189,7 @@ fn bedtime_window(
 /// owner's latest action in any sm surface.
 pub fn evaluate(
     now: OffsetDateTime,
-    offset: UtcOffset,
+    offset_at: OffsetAt,
     settings: &Settings,
     state: &State,
     last_activity: Option<OffsetDateTime>,
@@ -198,7 +215,7 @@ pub fn evaluate(
             .and_then(parse_ts)
             .is_some_and(|until| now < until);
         if let Some((start, end)) =
-            bedtime_window(now, offset, settings.bedtime_start, settings.bedtime_end)
+            bedtime_window(now, offset_at, settings.bedtime_start, settings.bedtime_end)
                 .filter(|_| !dismissed)
         {
             return Some(Away {
@@ -239,7 +256,7 @@ pub fn set_manual(
     state: &State,
     on: bool,
     now: OffsetDateTime,
-    offset: UtcOffset,
+    offset_at: OffsetAt,
     settings: &Settings,
 ) -> State {
     let mut next = state.clone();
@@ -249,7 +266,7 @@ pub fn set_manual(
     }
     next.manual_since = None;
     if let Some((_, end)) =
-        bedtime_window(now, offset, settings.bedtime_start, settings.bedtime_end)
+        bedtime_window(now, offset_at, settings.bedtime_start, settings.bedtime_end)
     {
         next.bedtime_dismissed_until = Some(format_ts(end));
     }

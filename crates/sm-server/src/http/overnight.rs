@@ -26,7 +26,7 @@ pub(super) fn evaluate(state: &AppState, now: OffsetDateTime) -> anyhow::Result<
         .and_then(|ms| OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).ok());
     let away = overnight::evaluate(
         now,
-        overnight::local_offset(now),
+        overnight::local_offset,
         &settings,
         &stored,
         last_activity,
@@ -161,13 +161,7 @@ pub(super) async fn put_overnight(
         let now = OffsetDateTime::now_utc();
         let settings = Settings::from_effective(&work.session_store.owner_settings()?);
         store(&work).update(|current| {
-            overnight::set_manual(
-                current,
-                body.on,
-                now,
-                overnight::local_offset(now),
-                &settings,
-            )
+            overnight::set_manual(current, body.on, now, overnight::local_offset, &settings)
         })?;
         Ok(())
     })

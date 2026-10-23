@@ -960,17 +960,16 @@ impl AppState {
             eprintln!("overnight step failed: {error:#}");
             false
         });
-        let mut problems = if held {
-            Vec::new()
-        } else {
-            owner_push::deliver(
-                &store,
-                &world,
-                self.push_sender.as_deref(),
-                &AppFollowMailer { state: self },
-                now,
-            )?
-        };
+        // Only the owner's alerts wait; other humans' still go out.
+        let held_user = held.then(|| super::overnight::owner_notice_user(self));
+        let mut problems = owner_push::deliver_holding(
+            &store,
+            &world,
+            self.push_sender.as_deref(),
+            &AppFollowMailer { state: self },
+            now,
+            held_user.as_deref(),
+        )?;
         // Notices ride the same pass, after follows (sm#1580); the repair
         // pass runs on sweep passes, every third.
         let notice_world = AppNoticeWorld { state: self };
@@ -978,8 +977,6 @@ impl AppState {
             owner_push::repair_notices(&store, &notice_world, now)?;
             self.sweep_approval_waits(&store, now)?;
         }
-        // Only the owner's alerts wait; other humans' still go out.
-        let held_user = held.then(|| super::overnight::owner_notice_user(self));
         problems.extend(owner_push::deliver_notices_holding(
             &store,
             &notice_world,
