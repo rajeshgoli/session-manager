@@ -411,12 +411,16 @@ fn abandon_unneeded_thaw(manager: &ManagedArtifacts, op: &Operation) -> Result<b
     }
     let mut conn = manager.store.open()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let phase: String = tx.query_row(
-        "SELECT phase FROM artifact_operations WHERE id=?1",
+    // An explicit request may have adopted it since this pass loaded the batch.
+    let (phase, actor): (String, String) = tx.query_row(
+        "SELECT phase,actor FROM artifact_operations WHERE id=?1",
         [op.id],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    if phase != "queued" || !waiting_readers(&tx, &op.root.path, &op.members)?.is_empty() {
+    if phase != "queued"
+        || actor != "sm"
+        || !waiting_readers(&tx, &op.root.path, &op.members)?.is_empty()
+    {
         return Ok(false);
     }
     cancel_queued(
