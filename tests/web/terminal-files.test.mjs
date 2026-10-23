@@ -9,6 +9,17 @@ test('paths, line suffixes, punctuation and URL boundaries', () => {
   assert.equal(fileHref('a/b', '/tmp/a#b.txt'), '/client/terminal/file?session=a%2Fb&path=%2Ftmp%2Fa%23b.txt');
 });
 
+test('compiler diagnostic delimiters are excluded before stripping line and column suffixes', () => {
+  for (const path of ['/tmp/main.rs', '~/src/main.rs', './src/main.rs', '../src/main.rs', 'src/main.rs']) {
+    for (const suffix of [':42:', ':42:3:']) {
+      const text = `error in ${path}${suffix} error: unexpected token`;
+      const token = `${path}${suffix.slice(0, -1)}`;
+      assert.deepEqual(fileMatches(text), [{ text: token, path, index: 9 }]);
+      assert.equal(new URL(fileHref('agent', fileMatches(text)[0].path), 'https://example.com').searchParams.get('path'), path);
+    }
+  }
+});
+
 test('wrapped xterm links use terminal cells, including wide and astral characters', () => {
   const rows = [
     [{ chars: '😀', width: 2 }, { chars: '', width: 0 }, { chars: ' ', width: 1 }, ...Array.from('/tmp/long', chars => ({ chars, width: 1 }))],

@@ -4,7 +4,8 @@ export function fileMatches(text) {
   const pattern = /(?:^|[\s("'`\[=])((?:~\/|\.{1,2}\/|\/)[^\s<>"'`|?*]+|[\w@.-]+(?:\/[\w@.+-]+)*\.[a-zA-Z][\w-]*(?::\d+(?::\d+)?)?)/g;
   const matches = [];
   for (const match of text.matchAll(pattern)) {
-    const token = match[1].replace(/[.,;!?)\]}]+$/, '');
+    // A compiler diagnostic adds a delimiter colon after its line/column suffix.
+    const token = match[1].replace(/[.,;!?)\]}]+$/, '').replace(/(:\d+(?::\d+)?):$/, '$1');
     if (!token || token === '/' || token.endsWith('/')) continue;
     const path = token.replace(/(?::\d+(?::\d+)?|#L\d+(?:C\d+)?)$/, '');
     matches.push({ text: token, path, index: match.index + match[0].length - match[1].length });
