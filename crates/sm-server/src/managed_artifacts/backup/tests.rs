@@ -1574,9 +1574,10 @@ fn failed_weekly_integrity_check_never_confirms_and_blocks_unrepaired_retry() {
                 return Ok((200, serde_json::json!({})));
             }
             self.requests += 1;
+            // Exercise integrity failure independently of the host disk free space.
             Ok((
                 200,
-                serde_json::json!({"id":"weekly","state":"ready","estimate_bytes":0,"parts":[],"manifest":self.transfer,"deletions":[],"allow_deletes":false,"max_delete_fraction":0.1}),
+                serde_json::json!({"id":"weekly","state":"ready","estimate_bytes":0,"space_floor_bytes":0,"parts":[],"manifest":self.transfer,"deletions":[],"allow_deletes":false,"max_delete_fraction":0.1}),
             ))
         }
         fn download(
@@ -1609,7 +1610,11 @@ fn failed_weekly_integrity_check_never_confirms_and_blocks_unrepaired_retry() {
         ack: None,
         requests: 0,
     };
-    assert!(pull::pull_with_check(&mut dest, &mut fake, true).is_err());
+    let error = pull::pull_with_check(&mut dest, &mut fake, true).unwrap_err();
+    assert!(
+        error.to_string().contains("backup integrity check failed"),
+        "unexpected pull failure: {error:#}"
+    );
     let ack = fake.ack.as_ref().unwrap();
     assert!(!ack.applied);
     assert!(!ack.check.as_ref().unwrap().ok);
