@@ -500,7 +500,7 @@ test('route: another server on localhost and a failed direct socket both use Clo
   } finally { await browser.close(); }
 });
 
-test('links: a printed URL and an OSC 8 link open in a new tab, with tmux mouse mode on', async () => {
+test('links: URLs, OSC 8 and local file paths open in a new tab with tmux mouse mode on', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
     const { page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
@@ -509,7 +509,9 @@ test('links: a printed URL and an OSC 8 link open in a new tab, with tmux mouse 
       window.termOutput = '\x1b[?1000h\x1b[?1006h'
         + 'PR: https://github.com/rajeshgoli/session-manager/pull/2177\r\n'
         + '\x1b]8;;https://sm.example.com/docs/memo\x07the memo\x1b]8;;\x07\r\n'
-        + '\x1b]8;;javascript:alert(1)\x07bad\x1b]8;;\x07\r\n';
+        + '\x1b]8;;javascript:alert(1)\x07bad\x1b]8;;\x07\r\n'
+        + '/Users/rajesh/memo.html\r\n'
+        + 'src/main.rs:42\r\n';
       window.opened = [];
       window.open = (url, target, features) => { window.opened.push([url, target, features]); return null; };
     });
@@ -536,9 +538,13 @@ test('links: a printed URL and an OSC 8 link open in a new tab, with tmux mouse 
     await click(10, 0);
     await click(2, 1);
     await click(1, 2);
+    await click(3, 3);
+    await click(3, 4);
     assert.deepEqual(await page.evaluate(() => window.opened), [
       ['https://github.com/rajeshgoli/session-manager/pull/2177', '_blank', 'noopener,noreferrer'],
       ['https://sm.example.com/docs/memo', '_blank', 'noopener,noreferrer'],
+      ['/client/terminal/file?session=iter8-run&path=%2FUsers%2Frajesh%2Fmemo.html', '_blank', 'noopener,noreferrer'],
+      ['/client/terminal/file?session=iter8-run&path=src%2Fmain.rs', '_blank', 'noopener,noreferrer'],
     ]);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }

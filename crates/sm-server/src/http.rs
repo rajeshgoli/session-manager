@@ -395,6 +395,7 @@ mod review_policies;
 mod review_runs;
 mod settings;
 mod ssh_transport;
+mod terminal_files;
 mod watch;
 mod web;
 mod worktrees;
@@ -2527,6 +2528,7 @@ pub fn router(state: AppState) -> Router {
             "/client/sessions/{session_id}/terminal-images",
             post(browser_terminal::upload_image),
         )
+        .route("/client/terminal/file", get(terminal_files::read_file))
         .route("/client/sessions/{session_id}", get(get_client_session))
         .route("/autopm/events", get(owner_events::list_events))
         .route("/autopm/switches", get(autopm::list_switches))
@@ -22517,7 +22519,8 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 34] = [
+    const OWNER_WEB_READS: [&str; 35] = [
+        "/client/terminal/file?session=fork1001&path=missing.txt",
         "/notes/activity",
         "/notes/missing/activity",
         "/notes/missing/activity/missing",
