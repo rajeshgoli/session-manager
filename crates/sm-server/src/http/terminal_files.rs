@@ -94,14 +94,26 @@ fn file_response(cwd: &str, path: &str) -> Result<Response, ApiError> {
         }
         _ => return Err(bad_file("This file type cannot be previewed")),
     };
-    Ok(([
-        ("content-type", mime),
-        ("cache-control", "no-store"),
-        ("x-content-type-options", "nosniff"),
-        ("referrer-policy", "no-referrer"),
-        // Authored HTML/SVG must never execute with the owner's SM origin.
-        ("content-security-policy", "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
-    ], bytes).into_response())
+    // Chrome refuses synthetic text/image documents with CSP sandbox. Only
+    // authored active documents need an opaque origin; passive MIME types use
+    // nosniff and a restrictive resource policy instead.
+    let policy = if matches!(extension.as_str(), "html" | "htm" | "svg") {
+        "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    } else {
+        "default-src 'none'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    };
+    Ok((
+        [
+            ("content-type", mime),
+            ("cache-control", "no-store"),
+            ("x-content-type-options", "nosniff"),
+            ("referrer-policy", "no-referrer"),
+            // Authored HTML/SVG must never execute with the owner's SM origin.
+            ("content-security-policy", policy),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 #[cfg(test)]
@@ -135,6 +147,13 @@ mod tests {
         assert!(file_response("/", dir.join("memo.html").to_str().unwrap()).is_ok());
         assert!(file_response(dir.to_str().unwrap(), ".").is_err());
         assert!(file_response(dir.to_str().unwrap(), "missing").is_err());
+        std::fs::write(dir.join("source.rs"), "fn main() {}\n").unwrap();
+        let text = file_response(dir.to_str().unwrap(), "source.rs").unwrap();
+        assert_eq!(text.headers()["content-type"], "text/plain; charset=utf-8");
+        assert!(!text.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("sandbox"));
         std::fs::write(dir.join("binary"), [0, 255]).unwrap();
         assert!(file_response(dir.to_str().unwrap(), "binary").is_err());
         let large = std::fs::File::create(dir.join("large.txt")).unwrap();
