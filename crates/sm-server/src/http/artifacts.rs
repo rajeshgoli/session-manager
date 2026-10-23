@@ -20,6 +20,7 @@ fn refusal(error: anyhow::Error) -> ApiError {
         || detail.contains("input of")
         || detail.contains("requires your")
         || detail.contains("busy")
+        || detail.contains("cancel")
     {
         StatusCode::CONFLICT
     } else {
@@ -256,6 +257,7 @@ pub(super) async fn owner_action(
         let result = (|| -> anyhow::Result<Value> {
             match action {
                 "delete" => svc.delete_owner(root, &name, &email),
+                "cancel" => ma::ops::cancel(svc, root, &name, &email, true),
                 "keep_live" => {
                     let result = ma::ops::keep_live(svc, root, &name, &email)?;
                     ma::ops::kick(svc.clone());
@@ -614,6 +616,7 @@ fn mutate(
                 },
                 &actor.id,
             ),
+            "cancel" => ma::ops::cancel(svc, root, &name, &actor.id, false),
             "done" => svc.done(root, &name, &actor.id),
             "consumers" | "marks" => svc.edit(root, &name, &action, &body, &actor.id),
             "delete" => svc.delete(
