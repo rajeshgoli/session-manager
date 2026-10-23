@@ -34,6 +34,7 @@ def read_case(case, timeout):
         os.killpg(process.pid, signal.SIGKILL)
         process.communicate()
         result = {'reader': kind, 'path': path, 'timeout': True}
+    result['pid'] = process.pid
     result['seconds'] = round(time.monotonic() - started, 3)
     return result
 

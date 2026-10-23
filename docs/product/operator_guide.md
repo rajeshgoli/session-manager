@@ -202,14 +202,18 @@ volume. Submit its alias and resolved path to the check from this checkout:
 
 ```bash
 sm queue run --type background --label external-read-check --cwd "$PWD" \
-  --input <artifact-name> --timeout 1m --memory 1G -- \
+  --timeout 1m --memory 1G -- \
   /absolute/path/to/python3 scripts/check-queue-external-read.py \
   /path/to/alias/reference.json /Volumes/Volume/path/to/reference.json
 ```
 
+For a managed artifact, add `--input <registered-artifact-name>` before `--` so
+the queue protects it during the read. Find that registered name with
+`sm artifact list`; an arbitrary external file needs no artifact declaration.
+
 The check changes no volume files. It bounds each cat and Python read, reports
-byte counts and content hashes, and exits nonzero on errors, timeouts, or content
-differences. It skips on non-macOS hosts; macOS requires an explicit file under
+reader process IDs, byte counts and content hashes, and exits nonzero on errors,
+timeouts, or content differences. It skips on non-macOS hosts; macOS requires an explicit file under
 `/Volumes`. The selected file must remain small and unchanged during the check.
 Inspect `sandboxd` and `tccd` (the macOS privacy service) logs for matching
 process IDs if opens time out. Re-run the queued check after a permission
