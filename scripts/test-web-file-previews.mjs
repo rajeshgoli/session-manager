@@ -8,6 +8,28 @@ const source = await readFile(new URL('../crates/sm-server/src/http/terminal_fil
 // separately verify the MIME-to-policy choice and owner authentication.
 const active = source.match(/"(sandbox; default-src[^"\n]+)"/)[1];
 const passive = source.match(/"(default-src[^"\n]+)"/)[1];
+// Decode the handler's Rust string literal so Chrome parses its actual wrapper.
+const textTemplate = JSON.parse(source.match(/bytes = format!\((".*")\)\.into_bytes\(\);/)[1]);
+
+test('Chrome preserves leading blank lines in terminal text readers', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const page = await browser.newPage();
+    for (const text of ['first\nsecond\n', '\nfirst\n', '\r\nfirst\r\n', '\n\nfirst\n', '']) {
+      const body = textTemplate.replaceAll('{{', '{').replaceAll('}}', '}')
+        .replace('{title}', 'source.txt').replace('{text}', text);
+      await page.route('https://sm.example.com/source.txt', route => route.fulfill({
+        contentType: 'text/html; charset=utf-8',
+        headers: { 'content-security-policy': active, 'x-content-type-options': 'nosniff' },
+        body,
+      }));
+      await page.goto('https://sm.example.com/source.txt');
+      assert.equal(await page.locator('pre').textContent(), text.replaceAll('\r\n', '\n'),
+        `reader preserves blank lines for ${JSON.stringify(text)}`);
+      await page.unroute('https://sm.example.com/source.txt');
+    }
+  } finally { await browser.close(); }
+});
 
 test('Chrome displays text, images and sandboxed HTML previews', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });

@@ -102,7 +102,8 @@ fn file_response(cwd: &str, path: &str) -> Result<Response, ApiError> {
                 .unwrap_or("File"),
         );
         let text = escape(std::str::from_utf8(&bytes).expect("text preview validated above"));
-        bytes = format!("<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>:root{{color-scheme:light dark}}body{{margin:1rem}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.5 monospace}}</style><pre>{text}</pre>").into_bytes();
+        // HTML parsing consumes one initial newline after <pre>; preserve the file's own.
+        bytes = format!("<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{title}</title><style>:root{{color-scheme:light dark}}body{{margin:1rem}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.5 monospace}}</style><pre>\n{text}</pre>").into_bytes();
         mime = "text/html; charset=utf-8";
     }
     // Chrome refuses synthetic text/image documents with CSP sandbox. Only
