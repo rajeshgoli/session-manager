@@ -7,6 +7,7 @@ import { chooseRoute, shellBrowserAllowed, relayRoute, rememberRoute, routeText,
 import { NotesView } from './notes.js';
 import { CONTRAST_FLOOR, THEME_KEY, isLight, terminalTheme } from './terminal-theme.js';
 import { installImagePaste } from './terminal-images.js';
+import { installFileLinks } from './terminal-files.js';
 import { isShell, shellFact, ShellCloseButton, ShellAwayPanel, ShellMenu, ShellName, setShellHidden, hiddenShells, HiddenShells } from './shell.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
@@ -214,6 +215,10 @@ export function TerminalPage({ id, open }) {
     const fit = new window.FitAddon.FitAddon();
     terminal.loadAddon(fit);
     terminal.loadAddon(new window.WebLinksAddon.WebLinksAddon(openLink));
+    installFileLinks(terminal, id, (event, uri) => {
+      event?.preventDefault?.();
+      window.open(uri, '_blank', 'noopener,noreferrer');
+    });
     terminal.open(host.current);
     // Follow Settings › Appearance and, on System, the OS switching light or dark (#2304).
     const scheme = matchMedia('(prefers-color-scheme: dark)');
