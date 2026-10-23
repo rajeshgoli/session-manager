@@ -5544,10 +5544,12 @@ fn next_admissible_queue_job_id_conn(
     admission_policy: QueueAdmissionPolicy,
     summary: &mut QueueAdmissionSummary,
 ) -> Result<Option<String>> {
+    // Measured at most once per pass: it lists every process.
+    let mut committed: Option<i64> = None;
     for job_type in QUEUE_JOB_TYPE_ORDER {
-        let Some(oldest) = oldest_pending_queue_job(jobs, job_type) else {
+        if oldest_pending_queue_job(jobs, job_type).is_none() {
             continue;
-        };
+        }
         if (job_type != "review"
             && running_queue_job_count(jobs, None) as i64 >= admission_policy.max_running_jobs)
             || running_queue_job_count(jobs, Some(job_type))
@@ -5583,7 +5585,44 @@ fn next_admissible_queue_job_id_conn(
             let Some(job) = ready else { continue };
             job
         } else {
-            oldest
+            // A declared budget must fit beside what running jobs declared
+            // and have not used yet, or a job growing within its budget is
+            // the one the host memory guard stops later (sm#2507). A job that
+            // does not fit waits under its own reason while later jobs that
+            // fit start; its --max-wait bounds the wait. Unknown host memory
+            // does not hold work.
+            let mut ready = None;
+            for pending in pending_queue_jobs_in_order(jobs, job_type) {
+                let fits = match (
+                    pending.memory_bytes.filter(|budget| *budget > 0),
+                    host_memory_capacity(),
+                ) {
+                    (Some(budget), Some((_, available))) => {
+                        let committed = *committed
+                            .get_or_insert_with(|| running_unused_memory_commitments(jobs));
+                        committed_memory_headroom_is_safe(
+                            budget,
+                            committed,
+                            effective_memory_reserve_bytes(admission_policy.memory_min_free_bytes),
+                            available,
+                        )
+                    }
+                    _ => true,
+                };
+                if fits {
+                    ready = Some(pending);
+                    break;
+                }
+                summary.held += mark_pending_queue_jobs_holding_conn(
+                    conn,
+                    Some(&pending.id),
+                    "memory_pressure",
+                )?;
+                summary.retry_after_seconds =
+                    Some(admission_policy.resource_retry_interval_seconds);
+            }
+            let Some(job) = ready else { continue };
+            job
         };
         if job_type == "perf" && perf_cooldown_active(jobs, admission_policy) {
             summary.held +=
@@ -5671,6 +5710,69 @@ pub(crate) fn host_memory_capacity() -> Option<(i64, i64)> {
 fn host_below_memory_reserve(admission_policy: QueueAdmissionPolicy) -> bool {
     let reserve = effective_memory_reserve_bytes(admission_policy.memory_min_free_bytes);
     host_memory_capacity().is_some_and(|(_, available)| available < reserve)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for running jobs' measured memory by process group in this test thread.
+    static TEST_JOB_MEMORY: std::cell::RefCell<Option<HashMap<i64, i64>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Measured memory of each running job's process tree, by process group.
+fn running_job_memory(pgids: &[i64]) -> HashMap<i64, i64> {
+    #[cfg(test)]
+    if let Some(memory) = TEST_JOB_MEMORY.with(|memory| memory.borrow().clone()) {
+        return memory;
+    }
+    process_listing().map_or_else(HashMap::new, |listing| {
+        job_memory_by_process_group(&listing, pgids, job_process_footprint)
+    })
+}
+
+/// Memory running jobs declared but do not use yet: each budget less the
+/// job's measured footprint, never below zero. A job whose memory cannot be
+/// measured counts its whole budget. Admission keeps this free so a job
+/// growing within its budget is not squeezed by work started after it (sm#2507).
+fn unused_memory_commitments(
+    running: impl IntoIterator<Item = (Option<i64>, Option<i64>)>,
+    memory_by_pgid: &HashMap<i64, i64>,
+) -> i64 {
+    running
+        .into_iter()
+        .filter_map(|(budget, pgid)| {
+            let budget = budget.filter(|budget| *budget > 0)?;
+            let used = pgid
+                .and_then(|pgid| memory_by_pgid.get(&pgid))
+                .copied()
+                .unwrap_or(0);
+            Some(budget.saturating_sub(used).max(0))
+        })
+        .fold(0i64, i64::saturating_add)
+}
+
+/// Unused budgets of the running jobs in `jobs`, measured now.
+fn running_unused_memory_commitments(jobs: &[QueueJobRuntimeRecord]) -> i64 {
+    let running: Vec<_> = jobs
+        .iter()
+        .filter(|job| job.state == "running" && job.memory_bytes.is_some_and(|b| b > 0))
+        .map(|job| (job.memory_bytes, job.process_group_id.or(job.pid)))
+        .collect();
+    if running.is_empty() {
+        return 0;
+    }
+    let pgids: Vec<i64> = running.iter().filter_map(|(_, pgid)| *pgid).collect();
+    unused_memory_commitments(running, &running_job_memory(&pgids))
+}
+
+/// Whether a job declaring `budget` fits in `available` beside the memory
+/// running jobs are still owed and the safety reserve.
+fn committed_memory_headroom_is_safe(
+    budget: i64,
+    committed: i64,
+    reserve: i64,
+    available: i64,
+) -> bool {
+    budget.saturating_add(committed).saturating_add(reserve) <= available
 }
 
 fn perf_memory_headroom_is_safe(
@@ -8558,13 +8660,29 @@ pub fn queue_hold_explanation(
             "waiting for safe memory headroom".into(),
             {
                 let reserve = effective_memory_reserve_bytes(policy.memory_min_free_bytes);
-                let required = job.memory_bytes.unwrap_or(0).saturating_add(reserve);
+                let owed: Vec<_> = jobs
+                    .iter()
+                    .filter(|j| j.state == "running" && j.memory_bytes.is_some_and(|b| b > 0))
+                    .map(|j| (j.memory_bytes, j.process_group_id.or(j.pid)))
+                    .collect();
+                let committed = if owed.is_empty() {
+                    0
+                } else {
+                    let pgids: Vec<i64> = owed.iter().filter_map(|(_, pgid)| *pgid).collect();
+                    unused_memory_commitments(owed, &running_job_memory(&pgids))
+                };
+                let required = job
+                    .memory_bytes
+                    .unwrap_or(0)
+                    .saturating_add(committed)
+                    .saturating_add(reserve);
                 let available = host_memory_capacity().map(|(_, available)| available);
                 format!(
-                    "Available memory: {}. Required: {} ({} job budget + {} safety reserve). Admission retries every {} seconds and gives up after {} seconds.",
+                    "Available memory: {}. Required: {} ({} job budget + {} that running jobs declared and have not used yet + {} safety reserve). Admission retries every {} seconds and gives up after {} seconds.",
                     available.map_or_else(|| "unknown".to_owned(), memory_amount_text),
                     memory_amount_text(required),
                     memory_amount_text(job.memory_bytes.unwrap_or(0)),
+                    memory_amount_text(committed),
                     memory_amount_text(reserve),
                     policy.resource_retry_interval_seconds,
                     job.max_wait_seconds
@@ -12185,6 +12303,120 @@ mod tests {
                 .unwrap();
         assert_eq!(admitted.started, 1);
         TEST_HOST_MEMORY.with(|host| host.set(None));
+        release_queue_admission_retry(&state_dir);
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn unused_memory_commitments_count_each_budget_less_its_measured_use() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let measured = HashMap::from([(10, 106 * GIB), (11, 40 * GIB)]);
+        // 180 GiB scorer using 106; 32 GiB cache over its budget counts zero;
+        // an unmeasured 8 GiB job counts in full; undeclared jobs count nothing.
+        let owed = unused_memory_commitments(
+            [
+                (Some(180 * GIB), Some(10)),
+                (Some(32 * GIB), Some(11)),
+                (Some(8 * GIB), Some(12)),
+                (None, Some(13)),
+            ],
+            &measured,
+        );
+        assert_eq!(owed, 74 * GIB + 8 * GIB);
+        assert!(committed_memory_headroom_is_safe(
+            32 * GIB,
+            74 * GIB,
+            8 * GIB,
+            114 * GIB
+        ));
+        assert!(!committed_memory_headroom_is_safe(
+            32 * GIB,
+            74 * GIB,
+            8 * GIB,
+            113 * GIB
+        ));
+    }
+
+    #[test]
+    fn a_declared_job_waits_while_running_jobs_are_still_owed_their_budgets() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("admission-committed-memory");
+        let message_queue_db = state_dir.join("messages.db");
+        let declared = |label: &str, memory: i64| {
+            RetainedQueueStore::create_queue_job_in_state_dir(
+                &state_dir,
+                CreateQueueJob {
+                    local_submitter: None,
+                    job_type: "background".into(),
+                    label: label.into(),
+                    requester_session_id: Some("requester".into()),
+                    notify_session_id: "notify".into(),
+                    cwd: "/tmp".into(),
+                    argv: Some(vec!["true".into()]),
+                    script: None,
+                    env: BTreeMap::new(),
+                    timeout_seconds: 60,
+                    cpu_percent: None,
+                    gpu_percent: None,
+                    memory_bytes: Some(memory),
+                    rank_tickets: None,
+                },
+            )
+            .unwrap()
+        };
+        let scorer = declared("scorer", 180 * GIB);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'running', started_at = ?2, pid = 501, process_group_id = 501 WHERE id = ?1",
+            params![scorer.id, now_rfc3339()],
+        )
+        .unwrap();
+        let cache = declared("cache", 32 * GIB);
+        let small = declared("small", 4 * GIB);
+        let policy = QueueAdmissionPolicy {
+            max_running_jobs: 4,
+            background_max_concurrent: 4,
+            ..QueueAdmissionPolicy::default()
+        };
+        let reserve = effective_memory_reserve_bytes(policy.memory_min_free_bytes);
+
+        // The scorer uses 106 of its 180 GiB: 74 GiB is still owed to it, so
+        // 32 GiB more needs 106 GiB plus the reserve free. The 4 GiB job
+        // queued behind it fits and starts.
+        TEST_JOB_MEMORY
+            .with(|memory| *memory.borrow_mut() = Some(HashMap::from([(501, 106 * GIB)])));
+        TEST_HOST_MEMORY.with(|host| host.set(Some((256 * GIB, 106 * GIB + reserve - 1))));
+        let held =
+            admit_pending_queue_jobs_conn(&conn, &state_dir, &message_queue_db, 0, policy, true)
+                .unwrap();
+        assert_eq!(held.started, 1);
+        let small = get_queue_job_conn(&conn, &small.id).unwrap().unwrap();
+        assert_ne!(small.state, "pending");
+        let row = get_queue_job_conn(&conn, &cache.id).unwrap().unwrap();
+        assert_eq!(row.state, "pending");
+        assert_eq!(row.holding_reason.as_deref(), Some("memory_pressure"));
+        let all = [
+            get_queue_job_conn(&conn, &scorer.id).unwrap().unwrap(),
+            row.clone(),
+        ];
+        let context = queue_hold_explanation(&row, &all, policy).unwrap();
+        assert!(
+            context["detail"]
+                .as_str()
+                .unwrap()
+                .contains("74.0 GiB that running jobs declared and have not used yet"),
+            "{context}"
+        );
+
+        // A still-running 4 GiB job is owed its whole unmeasured budget too.
+        TEST_HOST_MEMORY.with(|host| host.set(Some((256 * GIB, 110 * GIB + reserve))));
+        let admitted =
+            admit_pending_queue_jobs_conn(&conn, &state_dir, &message_queue_db, 0, policy, true)
+                .unwrap();
+        assert_eq!(admitted.started, 1);
+        TEST_HOST_MEMORY.with(|host| host.set(None));
+        TEST_JOB_MEMORY.with(|memory| *memory.borrow_mut() = None);
         release_queue_admission_retry(&state_dir);
         drop(conn);
         let _ = fs::remove_dir_all(state_dir);
