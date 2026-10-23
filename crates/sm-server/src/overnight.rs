@@ -133,6 +133,9 @@ pub struct PendingSummary {
     /// The night's start: what it held was created since then.
     pub since: String,
     pub sent_at: String,
+    /// The message notices it stands for; only these are released.
+    #[serde(default)]
+    pub notices: Vec<String>,
 }
 
 pub const SUMMARY_ACK_WINDOW: Duration = Duration::minutes(15);

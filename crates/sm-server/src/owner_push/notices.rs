@@ -338,27 +338,36 @@ impl OwnerPushStore {
         Ok(exists)
     }
 
-    /// Notices created since `since` that have not gone out: what an
-    /// overnight night held (sm#2494).
-    pub fn held_count(&self, since: OffsetDateTime) -> Result<usize> {
-        let count: i64 = self.open()?.query_row(
-            "SELECT COUNT(*) FROM owner_notices WHERE notified_at IS NULL AND created_at >= ?1",
-            params![format_ts(since)],
-            |row| row.get(0),
+    /// The message notices created since `since` that have not gone out:
+    /// what an overnight summary stands for (sm#2494).
+    pub fn held_message_notices(&self, since: OffsetDateTime) -> Result<Vec<String>> {
+        let conn = self.open()?;
+        let mut statement = conn.prepare(
+            "SELECT id FROM owner_notices WHERE notified_at IS NULL AND kind = ?2 \
+             AND created_at >= ?1 ORDER BY created_at, rowid",
         )?;
-        Ok(usize::try_from(count).unwrap_or(0))
+        let ids = statement
+            .query_map(params![format_ts(since), NOTICE_MESSAGE], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
     }
 
-    /// Overnight mode stopped holding alerts and one summary covers them
-    /// (sm#2494): the notices that waited since `since` are marked sent
-    /// without a push, so the phone does not buzz once per agent. Follows
-    /// the owner asked for still go out. Returns how many.
-    pub fn release_held(&self, since: OffsetDateTime, now: OffsetDateTime) -> Result<usize> {
-        Ok(self.open()?.execute(
-            "UPDATE owner_notices SET notified_at = ?2, notified_via = 'overnight' \
-             WHERE notified_at IS NULL AND created_at >= ?1",
-            params![format_ts(since), format_ts(now)],
-        )?)
+    /// One overnight summary stood for these notices (sm#2494): those still
+    /// unsent are marked sent without a push, so the phone does not buzz
+    /// once per agent. Returns how many.
+    pub fn release_held(&self, ids: &[String], now: OffsetDateTime) -> Result<usize> {
+        let mut conn = self.open()?;
+        let tx = conn.transaction()?;
+        let mut released = 0;
+        for id in ids {
+            released += tx.execute(
+                "UPDATE owner_notices SET notified_at = ?2, notified_via = 'overnight' \
+                 WHERE id = ?1 AND notified_at IS NULL",
+                params![id, format_ts(now)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(released)
     }
 
     /// The owner's notices from the last 7 days, newest first.

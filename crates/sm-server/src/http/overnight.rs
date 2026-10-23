@@ -197,7 +197,7 @@ pub(super) async fn ack_summary(
         let mut released = None;
         store(&state).update(|current| match &current.summary {
             Some(summary) if summary.id == id => {
-                released = Some(summary.since.clone());
+                released = Some(summary.notices.clone());
                 overnight::State {
                     summary: None,
                     ..current.clone()
@@ -205,8 +205,9 @@ pub(super) async fn ack_summary(
             }
             _ => current.clone(),
         })?;
-        if let Some(since) = released.as_deref().and_then(parse_ts) {
-            follows::push_store(&state).release_held(since, at)?;
+        // Only what the summary described.
+        if let Some(notices) = released {
+            follows::push_store(&state).release_held(&notices, at)?;
         }
         Ok(())
     })
@@ -232,11 +233,10 @@ impl AppState {
             .as_ref()
             .is_some_and(|away| away.source.holds_alerts());
         if let Some(summary) = &now.stored.summary {
-            let since = parse_ts(&summary.since).unwrap_or(at);
             let sent = parse_ts(&summary.sent_at).unwrap_or(at);
             let owner_back = now.last_activity.is_some_and(|last| last > sent);
             if owner_back {
-                push.release_held(since, at)?;
+                push.release_held(&summary.notices, at)?;
             }
             if owner_back || at - sent >= overnight::SUMMARY_ACK_WINDOW {
                 store(self).update(|current| overnight::State {
@@ -259,15 +259,18 @@ impl AppState {
         if let (Some(night), false) = (held_before, holds) {
             let since = parse_ts(&night.since).unwrap_or(at);
             let owner_back = now.last_activity.is_some_and(|last| last > since);
+            // Read before the summary is counted, so it covers at least these.
+            let held = push.held_message_notices(since)?;
             if owner_back {
-                push.release_held(since, at)?;
-            } else if push.held_count(since)? > 0 {
+                push.release_held(&held, at)?;
+            } else if !held.is_empty() {
                 let id = format!("ovs-{}", since.unix_timestamp());
                 if self.send_overnight_summary(&night.since, &id) {
                     pending = Some(overnight::PendingSummary {
                         id,
                         since: night.since.clone(),
                         sent_at: format_ts(at),
+                        notices: held,
                     });
                     holds = true;
                 }
@@ -362,7 +365,8 @@ impl AppState {
             ("summary_id".to_owned(), id.to_owned()),
         ]);
         let store = follows::push_store(self);
-        let user = follows::notice_user_id(self, None);
+        let owner = owner_human(&self.config).map(|human| human.name);
+        let user = follows::notice_user_id(self, owner.as_deref());
         let tokens = match store.valid_tokens(&user) {
             Ok(tokens) => tokens,
             Err(error) => {

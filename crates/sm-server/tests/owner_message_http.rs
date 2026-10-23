@@ -2252,7 +2252,13 @@ async fn a_night_ends_with_one_summary_and_its_alerts_wait_for_the_phone_to_show
     assert_eq!(summary["title"], "1 agent is blocked on you");
     assert_eq!(summary["reader_path"], "/inbox");
 
-    // Shown on the phone: the alert it stands for is released, never pushed.
+    // A message after the summary waits with the rest while it is out...
+    created_id(&f, "eng00001", "# Later news\nx", json!({})).await;
+    follow_pass(&f).await;
+    assert_eq!(kinds(), vec!["overnight_summary".to_owned()]);
+
+    // ...and once the phone shows the summary, only what it described is
+    // released; the later message gets its own push.
     let (status, _) = send(
         &f.app,
         "POST",
@@ -2262,5 +2268,9 @@ async fn a_night_ends_with_one_summary_and_its_alerts_wait_for_the_phone_to_show
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     follow_pass(&f).await;
-    assert_eq!(kinds(), vec!["overnight_summary".to_owned()]);
+    assert_eq!(
+        kinds(),
+        vec!["overnight_summary".to_owned(), "message".to_owned()]
+    );
+    assert_eq!(sender.sent.lock().unwrap()[1]["body"], "Later news");
 }

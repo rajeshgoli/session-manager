@@ -115,7 +115,9 @@ fn policy(method: &str, route: &str) -> Option<Policy> {
             "POST",
             "/sessions/{session_id}/input"
             | "/sessions/input-batch"
-            | "/humans/{identifier}/messages",
+            | "/humans/{identifier}/messages"
+            | "/owner/blocked"
+            | "/owner/blocked/done",
         ) => SENDER,
         ("POST", "/claims/waits" | "/claims/waits/cancel") => WAITER,
         (
