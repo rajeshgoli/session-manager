@@ -278,7 +278,8 @@ mod tests {
         // for these shipped features while continuing to bound source growth.
         // The Queue page's per-job usage and pins (#2475) add ~10 KiB.
         // Overnight mode's moon, banner and settings (#2494) add ~4 KiB.
-        const BUDGET: usize = 492 * 1024;
+        // Clickable terminal file paths (#2502) add ~3 KiB.
+        const BUDGET: usize = 496 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",

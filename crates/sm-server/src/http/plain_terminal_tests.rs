@@ -13,6 +13,8 @@ fn plain_test_state() -> (AppState, PlainTestTmux) {
     fixture["sessions"][0]["working_dir"] = json!(path.parent().unwrap());
     fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
     state.config.rust_core.runtime_enabled = true;
+    // Queue jobs run with a cleared environment, so never fall back to $USER.
+    state.config.external_access.ssh_username = Some("tester".into());
     let socket = format!(
         "sm-2333-{}-{}",
         std::process::id(),

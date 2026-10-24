@@ -516,6 +516,7 @@ pub const ACTIONS: &[(&str, &str, &str, Option<&str>)] = &[
     ("POST", "/client/sessions/{session_id}/terminal-images", "terminal.image", Some("session")),
     ("GET", "/client/terminal", "terminal.attach", None),
     ("GET", "/client/terminal/probe", "terminal.probe", None),
+    ("GET", "/client/terminal/file", "terminal.file", None),
     ("POST", "/client/mobile-terminal/disable", "terminal.disable", None),
     ("GET", "/admin/studio-ssh", "admin.studio_ssh", None),
     ("POST", "/admin/studio-ssh", "admin.studio_ssh_set", Some("setting")),
