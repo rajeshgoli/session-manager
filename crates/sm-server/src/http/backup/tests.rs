@@ -581,6 +581,7 @@ fn serve_tls(f: &Fixture) -> Tls {
     }
 }
 use crate::managed_artifacts::backup::{
+    disk,
     pull::{HttpRemote, Remote},
     Part,
 };
@@ -600,14 +601,19 @@ impl Remote for Mini {
         path: &str,
         body: Option<Value>,
     ) -> anyhow::Result<(u16, Value)> {
-        let response = self.remote.json(method, path, body)?;
+        let mut response = self.remote.json(method, path, body)?;
         if method == "POST" && path == "/backup/requests" && response.0 == 202 {
             self.requests += 1;
             let id = response.1["id"].as_str().unwrap();
             life::prepare_request(&self.manager, id)?;
-            return self
+            response = self
                 .remote
-                .json("GET", &format!("/backup/requests/{id}"), None);
+                .json("GET", &format!("/backup/requests/{id}"), None)?;
+        }
+        // Pull independently of the host disk free space: the floor is 10% of
+        // the real disk, which can exceed what is free.
+        if path.starts_with("/backup/requests") && response.1.get("parts").is_some() {
+            response.1[disk::FLOOR_KEY] = serde_json::json!(0);
         }
         if path.ends_with("/ack") && self.lose_ack {
             self.lose_ack = false;
