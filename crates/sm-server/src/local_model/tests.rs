@@ -792,6 +792,23 @@ pub(super) fn register_outbox_fixture(
     host
 }
 
+/// A ready model whose queue is `state_dir`, with a 150 GB footprint.
+pub(super) fn register_queue_fixture(state_dir: &Path) -> Arc<ModelHost> {
+    let (mut host, _, unused_root) = fixture();
+    host.db_path = state_dir.join("message_queue.db");
+    host.state_file = state_dir.join("sessions.json");
+    host.sessions = SessionStore::new_with_queue(host.state_file.clone(), host.db_path.clone());
+    host.queue_dir = state_dir.to_path_buf();
+    ready(&host);
+    let host = Arc::new(host);
+    hosts()
+        .lock()
+        .unwrap()
+        .insert(fs::canonicalize(state_dir).unwrap(), host.clone());
+    let _ = fs::remove_dir_all(unused_root);
+    host
+}
+
 fn root_path(host: &ModelHost) -> String {
     host.queue_dir.display().to_string()
 }
