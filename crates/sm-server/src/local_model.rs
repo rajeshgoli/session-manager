@@ -1098,6 +1098,25 @@ pub fn hold_perf(state_dir: &Path, label: &str) -> Result<bool> {
         h.request_yield(format!("perf {label}"), false)
     })
 }
+/// Yields to a queued job held for memory, only when the model's footprint
+/// covers what the job lacks: unloading for a job that still cannot start
+/// strands the model's agents until that job's wait ends (sm#2515).
+pub fn yield_for_queued_job(state_dir: &Path, label: &str, shortfall: i64) -> Result<bool> {
+    let Some(host) = live(state_dir) else {
+        return Ok(false);
+    };
+    let Some(model) = host.record()?.filter(ModelRecord::resident) else {
+        return Ok(false);
+    };
+    if host
+        .backend
+        .footprint(&model)?
+        .is_none_or(|bytes| bytes < shortfall)
+    {
+        return Ok(false);
+    }
+    host.request_yield(format!("queued job {label}"), false)
+}
 pub fn guard_model(state_dir: &Path, host: Option<(i64, i64)>, reserve: i64) -> Result<bool> {
     let Some(model) = live(state_dir) else {
         return Ok(false);
@@ -1145,7 +1164,10 @@ impl ModelHost {
         }
         let eligible = model.state == "yielded"
             && model.desired
-            && block != ModelReloadBlock::PerfJob
+            && !matches!(
+                block,
+                ModelReloadBlock::PerfJob | ModelReloadBlock::QueuedJob
+            )
             && available
                 .is_some_and(|a| a >= model.reservation_bytes.saturating_add(self.yield_line()));
         let mut since = self
@@ -1244,6 +1266,7 @@ impl ModelHost {
             gb(required.unwrap_or(0)), self.config.reload_hold, held,
             match block {
                 ModelReloadBlock::PerfJob => "; waiting for the perf run",
+                ModelReloadBlock::QueuedJob => "; a queued job is waiting for this memory",
                 ModelReloadBlock::Cooldown => "; load waits for the queue cooldown",
                 ModelReloadBlock::None => "",
             })
@@ -1294,7 +1317,15 @@ pub(crate) fn register_outbox_fixture(
 }
 
 #[cfg(test)]
+pub(crate) fn register_queue_fixture(state_dir: &Path) -> Arc<ModelHost> {
+    tests::register_queue_fixture(state_dir)
+}
+
+#[cfg(test)]
 impl ModelHost {
+    pub(crate) fn yield_worker_busy_for_test(&self) -> bool {
+        self.yield_worker.load(Ordering::SeqCst)
+    }
     pub(crate) fn set_reload_hold_for_test(&self, seconds: u64) {
         *self.reload_since.lock().unwrap() = Some(Instant::now() - Duration::from_secs(seconds));
     }

@@ -4744,6 +4744,9 @@ struct QueueAdmissionSummary {
     held: usize,
     failed_start: usize,
     retry_after_seconds: Option<u64>,
+    /// The non-perf job the latest evaluation held for memory that is
+    /// closest to fitting: its label and the bytes it lacks.
+    memory_shortfall: Option<(String, i64)>,
 }
 
 pub(crate) fn with_model_load_admission<T>(
@@ -4960,6 +4963,13 @@ fn admit_pending_queue_jobs_conn(
             }
         }
     }
+    // A job held for memory the resident model could free asks it to yield,
+    // as a perf job does (sm#2515). A failed footprint reading only skips it.
+    if let Some((label, shortfall)) = summary.memory_shortfall.take() {
+        if let Err(error) = crate::local_model::yield_for_queued_job(state_dir, &label, shortfall) {
+            eprintln!("local model yield for queued job {label}: {error:#}");
+        }
+    }
     let deadline_retry = list_queue_job_runtime_records_recent_conn(
         conn,
         &runtime_finished_since(admission_policy),
@@ -5034,6 +5044,22 @@ fn expire_pending_queue_jobs_conn(
                 )?;
                 job.termination_detail_json = Some(detail);
             }
+            if job.holding_reason.as_deref() == Some("memory_pressure") {
+                // Record the requirement admission held it to at the deadline,
+                // running jobs' unused budgets included (sm#2514). Callers may
+                // pass only the expiring job, so read the running jobs here.
+                let current = list_queue_job_runtime_records_recent_conn(
+                    conn,
+                    &runtime_finished_since(admission_policy),
+                )?;
+                let detail =
+                    memory_pressure_wait_detail(&job, &current, admission_policy).to_string();
+                conn.execute(
+                    "UPDATE queue_jobs SET termination_detail_json = ?2 WHERE id = ?1 AND state = 'pending'",
+                    params![job.id, detail],
+                )?;
+                job.termination_detail_json = Some(detail);
+            }
             let result = finish_queue_job_conn_with_policy(
                 conn,
                 &job,
@@ -5057,6 +5083,33 @@ fn expire_pending_queue_jobs_conn(
         }
     }
     Ok(expired)
+}
+
+/// What a job held at `memory_pressure` needed and what the host had, measured
+/// now. Running jobs' unused budgets count only against a non-perf job with a
+/// budget, as in admission.
+fn memory_pressure_wait_detail(
+    job: &QueueJobRuntimeRecord,
+    jobs: &[QueueJobRuntimeRecord],
+    admission_policy: QueueAdmissionPolicy,
+) -> JsonValue {
+    let budget = job.memory_bytes.filter(|budget| *budget > 0);
+    let committed = (job.job_type != "perf" && budget.is_some())
+        .then(|| running_unused_memory_commitments(jobs));
+    let reserve = effective_memory_reserve_bytes(admission_policy.memory_min_free_bytes);
+    let required = budget
+        .unwrap_or(0)
+        .saturating_add(committed.unwrap_or(0))
+        .saturating_add(reserve);
+    serde_json::json!({
+        "cause": "memory_pressure",
+        "available_bytes": host_memory_capacity().map(|(_, available)| available),
+        "required_bytes": required,
+        "memory_budget_bytes": budget.unwrap_or(0),
+        "unused_commitments_bytes": committed,
+        "safety_reserve_bytes": reserve,
+        "sampled_at": now_rfc3339(),
+    })
 }
 
 /// Why a job held at `concurrency_cap` never started: the limit that was full,
@@ -5546,6 +5599,7 @@ fn next_admissible_queue_job_id_conn(
 ) -> Result<Option<String>> {
     // Measured at most once per pass: it lists every process.
     let mut committed: Option<i64> = None;
+    summary.memory_shortfall = None;
     for job_type in QUEUE_JOB_TYPE_ORDER {
         if oldest_pending_queue_job(jobs, job_type).is_none() {
             continue;
@@ -5593,26 +5647,26 @@ fn next_admissible_queue_job_id_conn(
             // does not hold work.
             let mut ready = None;
             for pending in pending_queue_jobs_in_order(jobs, job_type) {
-                let fits = match (
+                let shortfall = match (
                     pending.memory_bytes.filter(|budget| *budget > 0),
                     host_memory_capacity(),
                 ) {
                     (Some(budget), Some((_, available))) => {
                         let committed = *committed
                             .get_or_insert_with(|| running_unused_memory_commitments(jobs));
-                        committed_memory_headroom_is_safe(
+                        committed_memory_shortfall(
                             budget,
                             committed,
                             effective_memory_reserve_bytes(admission_policy.memory_min_free_bytes),
                             available,
                         )
                     }
-                    _ => true,
+                    _ => None,
                 };
-                if fits {
+                let Some(shortfall) = shortfall else {
                     ready = Some(pending);
                     break;
-                }
+                };
                 summary.held += mark_pending_queue_jobs_holding_conn(
                     conn,
                     Some(&pending.id),
@@ -5620,6 +5674,13 @@ fn next_admissible_queue_job_id_conn(
                 )?;
                 summary.retry_after_seconds =
                     Some(admission_policy.resource_retry_interval_seconds);
+                if summary
+                    .memory_shortfall
+                    .as_ref()
+                    .is_none_or(|(_, least)| shortfall < *least)
+                {
+                    summary.memory_shortfall = Some((pending.label.clone(), shortfall));
+                }
             }
             let Some(job) = ready else { continue };
             job
@@ -5764,15 +5825,17 @@ fn running_unused_memory_commitments(jobs: &[QueueJobRuntimeRecord]) -> i64 {
     unused_memory_commitments(running, &running_job_memory(&pgids))
 }
 
-/// Whether a job declaring `budget` fits in `available` beside the memory
-/// running jobs are still owed and the safety reserve.
-fn committed_memory_headroom_is_safe(
+/// How many bytes a job declaring `budget` lacks to fit in `available` beside
+/// the memory running jobs are still owed and the safety reserve; `None` when
+/// it fits.
+fn committed_memory_shortfall(
     budget: i64,
     committed: i64,
     reserve: i64,
     available: i64,
-) -> bool {
-    budget.saturating_add(committed).saturating_add(reserve) <= available
+) -> Option<i64> {
+    let required = budget.saturating_add(committed).saturating_add(reserve);
+    (required > available).then(|| required.saturating_sub(available))
 }
 
 fn perf_memory_headroom_is_safe(
@@ -6149,6 +6212,22 @@ pub fn queue_wait_blocker_text(detail: &JsonValue) -> Option<String> {
         SCHEDULER_ERROR_HOLD => Some(format!(
             "scheduler could not evaluate this job{since} ({error})"
         )),
+        "memory_pressure" => {
+            let amount = |key: &str| detail[key].as_i64().map(memory_amount_text);
+            let committed = amount("unused_commitments_bytes")
+                .map(|committed| {
+                    format!(" + {committed} that running jobs declared and have not used yet")
+                })
+                .unwrap_or_default();
+            Some(format!(
+                "host had {} available at {} against {} required ({} job budget{committed} + {} safety reserve)",
+                amount("available_bytes").unwrap_or_else(|| "unknown".to_owned()),
+                detail["sampled_at"].as_str().unwrap_or("the deadline"),
+                amount("required_bytes")?,
+                amount("memory_budget_bytes")?,
+                amount("safety_reserve_bytes")?,
+            ))
+        }
         _ => None,
     }
 }
@@ -8849,17 +8928,33 @@ fn queue_job_completion_text_with_policy(
     let wait_text = if state == "wait_expired" {
         let reason = job.holding_reason.as_deref().unwrap_or("not_admitted");
         if reason == "memory_pressure" {
-            let reserve = effective_memory_reserve_bytes(
-                admission_policy.unwrap_or_default().memory_min_free_bytes,
-            );
-            let required = job.memory_bytes.unwrap_or(0).saturating_add(reserve);
-            let available = host_memory_capacity().map(|(_, available)| available);
+            // Jobs that expired before sm#2514 recorded no reading; measure now.
+            let detail = job
+                .termination_detail_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<JsonValue>(raw).ok())
+                .filter(|detail| detail["cause"].as_str() == Some(reason))
+                .unwrap_or_else(|| {
+                    let reserve = effective_memory_reserve_bytes(
+                        admission_policy.unwrap_or_default().memory_min_free_bytes,
+                    );
+                    serde_json::json!({
+                        "available_bytes": host_memory_capacity().map(|(_, available)| available),
+                        "required_bytes": job.memory_bytes.unwrap_or(0).saturating_add(reserve),
+                        "memory_budget_bytes": job.memory_bytes.unwrap_or(0),
+                        "safety_reserve_bytes": reserve,
+                    })
+                });
+            let amount = |key: &str| detail[key].as_i64().map(memory_amount_text);
             format!(
-                " wait_reason=memory_pressure available={} required={} memory_budget={} safety_reserve={} max_wait={}s",
-                available.map_or_else(|| "unknown".to_owned(), memory_amount_text),
-                memory_amount_text(required),
-                memory_amount_text(job.memory_bytes.unwrap_or(0)),
-                memory_amount_text(reserve),
+                " wait_reason=memory_pressure available={} required={} memory_budget={}{} safety_reserve={} max_wait={}s",
+                amount("available_bytes").unwrap_or_else(|| "unknown".to_owned()),
+                amount("required_bytes").unwrap_or_default(),
+                amount("memory_budget_bytes").unwrap_or_default(),
+                amount("unused_commitments_bytes")
+                    .map(|committed| format!(" unused_commitments={committed}"))
+                    .unwrap_or_default(),
+                amount("safety_reserve_bytes").unwrap_or_default(),
                 job.max_wait_seconds
             )
         } else {
@@ -12324,18 +12419,14 @@ mod tests {
             &measured,
         );
         assert_eq!(owed, 74 * GIB + 8 * GIB);
-        assert!(committed_memory_headroom_is_safe(
-            32 * GIB,
-            74 * GIB,
-            8 * GIB,
-            114 * GIB
-        ));
-        assert!(!committed_memory_headroom_is_safe(
-            32 * GIB,
-            74 * GIB,
-            8 * GIB,
-            113 * GIB
-        ));
+        assert_eq!(
+            committed_memory_shortfall(32 * GIB, 74 * GIB, 8 * GIB, 114 * GIB),
+            None
+        );
+        assert_eq!(
+            committed_memory_shortfall(32 * GIB, 74 * GIB, 8 * GIB, 113 * GIB),
+            Some(GIB)
+        );
     }
 
     #[test]
@@ -12417,6 +12508,158 @@ mod tests {
         assert_eq!(admitted.started, 1);
         TEST_HOST_MEMORY.with(|host| host.set(None));
         TEST_JOB_MEMORY.with(|memory| *memory.borrow_mut() = None);
+        release_queue_admission_retry(&state_dir);
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    fn background_job_with_memory(
+        state_dir: &Path,
+        label: &str,
+        memory: i64,
+        max_wait_seconds: i64,
+    ) -> QueueJobRecord {
+        RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
+            state_dir,
+            CreateQueueJob {
+                local_submitter: None,
+                job_type: "background".into(),
+                label: label.into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 60,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: Some(memory),
+                rank_tickets: None,
+            },
+            max_wait_seconds,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn memory_wait_receipt_keeps_running_jobs_unused_budgets() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("memory-wait-receipt");
+        let message_queue_db = state_dir.join("messages.db");
+        let scorer = background_job_with_memory(&state_dir, "scorer", 180 * GIB, 7200);
+        let gate = background_job_with_memory(&state_dir, "gate", 16 * GIB, 1);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'running', started_at = ?2, pid = 501, process_group_id = 501 WHERE id = ?1",
+            params![scorer.id, now_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET queued_at = '2020-01-01T00:00:00Z', holding_reason = 'memory_pressure' WHERE id = ?1",
+            params![gate.id],
+        )
+        .unwrap();
+        let policy = QueueAdmissionPolicy::default();
+        let reserve = effective_memory_reserve_bytes(policy.memory_min_free_bytes);
+        // The scorer uses 106 of its 180 GiB: 74 GiB is still owed to it.
+        // 80 GiB free covers the gate's own 16 GiB and the reserve, not that.
+        TEST_JOB_MEMORY
+            .with(|memory| *memory.borrow_mut() = Some(HashMap::from([(501, 106 * GIB)])));
+        TEST_HOST_MEMORY.with(|host| host.set(Some((256 * GIB, 80 * GIB))));
+        let gate_only = [get_queue_job_runtime_conn(&conn, &gate.id)
+            .unwrap()
+            .unwrap()];
+        assert_eq!(
+            expire_pending_queue_jobs_conn(&conn, &gate_only, &message_queue_db, policy).unwrap(),
+            1
+        );
+        TEST_HOST_MEMORY.with(|host| host.set(None));
+        TEST_JOB_MEMORY.with(|memory| *memory.borrow_mut() = None);
+
+        let notifications = RetainedQueueStore::new(message_queue_db)
+            .pending_messages_for_target_by_category("notify", "queue-completion", 10)
+            .unwrap();
+        let expected = format!(
+            "wait_reason=memory_pressure available=80.0 GiB required={} memory_budget=16.0 GiB unused_commitments=74.0 GiB safety_reserve={}",
+            memory_amount_text(90 * GIB + reserve),
+            memory_amount_text(reserve)
+        );
+        assert!(
+            notifications[0].text.contains(&expected),
+            "{}",
+            notifications[0].text
+        );
+        let expired = get_queue_job_conn(&conn, &gate.id).unwrap().unwrap();
+        let blocker =
+            queue_wait_blocker_text(expired.termination_detail.as_ref().unwrap()).unwrap();
+        assert!(
+            blocker.contains(
+                "16.0 GiB job budget + 74.0 GiB that running jobs declared and have not used yet"
+            ),
+            "{blocker}"
+        );
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn a_job_held_for_memory_the_local_model_holds_yields_it_and_blocks_its_reload() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        const GB: i64 = 1_000_000_000;
+        let state_dir = unique_temp_path("memory-wait-model-yield");
+        let message_queue_db = state_dir.join("messages.db");
+        let read = background_job_with_memory(&state_dir, "seed read", 180 * GIB, 7200);
+        // The fixture model is ready with a 150 GB footprint.
+        let model = crate::local_model::register_queue_fixture(&state_dir);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let policy = QueueAdmissionPolicy::default();
+        let reserve = effective_memory_reserve_bytes(policy.memory_min_free_bytes);
+        let model_state = || model.record().unwrap().unwrap().state;
+
+        // 160 GB short: unloading the model would not let the job start.
+        TEST_HOST_MEMORY.with(|host| host.set(Some((512 * GIB, 180 * GIB + reserve - 160 * GB))));
+        admit_pending_queue_jobs_conn(&conn, &state_dir, &message_queue_db, 0, policy, true)
+            .unwrap();
+        let row = get_queue_job_conn(&conn, &read.id).unwrap().unwrap();
+        assert_eq!(row.holding_reason.as_deref(), Some("memory_pressure"));
+        assert_eq!(model_state(), "ready");
+        assert_eq!(
+            model_reload_block_conn(&conn, policy).unwrap(),
+            ModelReloadBlock::QueuedJob
+        );
+
+        // 100 GB short: the model's 150 GB covers it, so the model yields.
+        TEST_HOST_MEMORY.with(|host| host.set(Some((512 * GIB, 180 * GIB + reserve - 100 * GB))));
+        admit_pending_queue_jobs_conn(&conn, &state_dir, &message_queue_db, 0, policy, true)
+            .unwrap();
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        while model_state() != "yielded" || model.yield_worker_busy_for_test() {
+            assert!(Instant::now() < deadline, "model did not yield");
+            std::thread::sleep(StdDuration::from_millis(20));
+        }
+        let record = model.record().unwrap().unwrap();
+        assert_eq!(
+            record.last_yield_reason.as_deref(),
+            Some("queued job seed read")
+        );
+
+        // Ample memory and a long-satisfied reload hold: the waiting job still
+        // keeps the model from reloading.
+        TEST_HOST_MEMORY.with(|host| host.set(Some((1024 * GIB, 1000 * GIB))));
+        model.set_reload_hold_for_test(3600);
+        crate::local_model::retry_reload(&state_dir).unwrap();
+        assert_eq!(model_state(), "yielded");
+        // Once the job no longer waits, the same pass reloads it.
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'cancelled', finished_at = ?2 WHERE id = ?1",
+            params![read.id, now_rfc3339()],
+        )
+        .unwrap();
+        model.set_reload_hold_for_test(3600);
+        crate::local_model::retry_reload(&state_dir).unwrap();
+        assert_eq!(model_state(), "ready");
+        TEST_HOST_MEMORY.with(|host| host.set(None));
         release_queue_admission_retry(&state_dir);
         drop(conn);
         let _ = fs::remove_dir_all(state_dir);
@@ -16161,6 +16404,9 @@ pub(crate) enum ModelReloadBlock {
     /// A perf job is running or waiting to run: it owns the machine, so the
     /// reload hold restarts and a waiting job is not delayed by a model load.
     PerfJob,
+    /// A queued job with a memory budget is held for memory: it was waiting
+    /// first, so the reload hold restarts rather than take that memory (sm#2515).
+    QueuedJob,
     /// A perf or tests job finished moments ago. The load waits for the
     /// cooldown to end, but the free-memory hold keeps running.
     Cooldown,
@@ -16186,9 +16432,16 @@ pub(crate) fn model_reload_block_conn(
     let perf_waiting = jobs
         .iter()
         .any(|job| job.job_type == "perf" && job.state == "pending");
+    let memory_waiting = jobs.iter().any(|job| {
+        job.state == "pending"
+            && job.holding_reason.as_deref() == Some("memory_pressure")
+            && job.memory_bytes.is_some_and(|budget| budget > 0)
+    });
     Ok(
         if running_queue_job_count(&jobs, Some("perf")) > 0 || perf_waiting {
             ModelReloadBlock::PerfJob
+        } else if memory_waiting {
+            ModelReloadBlock::QueuedJob
         } else if perf_cooldown_active(&jobs, policy) {
             ModelReloadBlock::Cooldown
         } else {
