@@ -357,9 +357,11 @@ impl TmuxRuntime {
 
     pub fn from_app_config(config: &AppConfig) -> Self {
         let mut runtime = Self::from_config(&config.rust_core);
+        // Absolute, because sessions run elsewhere and export it on PATH.
         runtime.client_shim_dir = crate::sessions::expand_home(&config.paths.state_file)
             .parent()
-            .map(|state_dir| state_dir.join("bin"));
+            .map(|state_dir| state_dir.join("bin"))
+            .and_then(|shim_dir| std::path::absolute(shim_dir).ok());
         runtime.opencode = Some(OpencodeRuntime {
             config: config.opencode.clone(),
             state_file: crate::sessions::expand_home(&config.paths.state_file),
@@ -433,6 +435,30 @@ impl TmuxRuntime {
                 Some(install_dir)
             }
         }
+    }
+
+    /// Point the shim at this server's install once its `sm` exists.
+    ///
+    /// The restart script installs `sm` beside the server only after the new
+    /// server passes its health checks, so on a fresh checkout there is
+    /// nothing to point at during startup. Wait for it in the background, once
+    /// per process, rather than leave the shim on the previous install until
+    /// something spawns.
+    pub fn point_client_shim_when_installed(&self) {
+        static STARTED: OnceLock<()> = OnceLock::new();
+        if self.client_shim_dir.is_none() || STARTED.set(()).is_err() {
+            return;
+        }
+        let runtime = self.clone();
+        thread::spawn(move || {
+            let deadline = Instant::now() + CLIENT_SHIM_INSTALL_WAIT;
+            while runtime.session_client_dir().as_deref() != runtime.client_shim_dir.as_deref() {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                thread::sleep(Duration::from_secs(5));
+            }
+        });
     }
 
     pub fn socket_name(&self) -> Option<&str> {
@@ -3192,6 +3218,9 @@ fn managed_client_dir(server_exe: &Path) -> Option<PathBuf> {
     let dir = server_exe.parent()?;
     is_executable_file(&dir.join("sm")).then(|| dir.to_path_buf())
 }
+
+/// How long a starting server waits for the restart script to install `sm`.
+const CLIENT_SHIM_INSTALL_WAIT: Duration = Duration::from_secs(15 * 60);
 
 /// Atomically make `shim_dir/sm` a symlink to `install_dir/sm`.
 #[cfg(unix)]
