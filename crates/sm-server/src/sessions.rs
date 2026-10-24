@@ -8731,6 +8731,16 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(SubagentStartOutcome::NotFound);
         };
+        // A hook registered at two settings levels fires twice; a second record
+        // would outlive the one stop and read as a forever-running agent (sm#2522).
+        if let Some(running) = ensure_subagents_array_mut(session).iter().find(|subagent| {
+            subagent.get("agent_id").and_then(Value::as_str) == Some(request.agent_id.as_str())
+                && subagent.get("status").and_then(Value::as_str) == Some("running")
+        }) {
+            return Ok(SubagentStartOutcome::Registered(
+                subagent_response_from_value(running)?,
+            ));
+        }
         let subagent = json!({
             "agent_id": request.agent_id,
             "agent_type": request.agent_type,
@@ -8762,23 +8772,47 @@ impl SessionStore {
             return Ok(SubagentStopOutcome::SessionNotFound);
         };
         let subagents = ensure_subagents_array_mut(session);
-        let Some(subagent) = subagents
-            .iter_mut()
-            .find(|subagent| subagent.get("agent_id").and_then(Value::as_str) == Some(agent_id))
-        else {
+        let matching: Vec<usize> = subagents
+            .iter()
+            .enumerate()
+            .filter(|(_, subagent)| {
+                subagent.get("agent_id").and_then(Value::as_str) == Some(agent_id)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let Some(&first) = matching.first() else {
             return Ok(SubagentStopOutcome::SubagentNotFound(agent_id.to_owned()));
         };
-        if let Some(subagent) = subagent.as_object_mut() {
-            subagent.insert("stopped_at".to_owned(), Value::String(now));
-            subagent.insert("status".to_owned(), Value::String("completed".to_owned()));
-            if let Some(transcript_path) = request.transcript_path {
-                subagent.insert("transcript_path".to_owned(), Value::String(transcript_path));
-            }
-            if let Some(summary) = request.summary {
-                subagent.insert("summary".to_owned(), Value::String(summary));
+        // Close every running record for this agent, so duplicates written by a
+        // doubly registered start hook cannot stay running forever (sm#2522).
+        let running: Vec<usize> = matching
+            .iter()
+            .copied()
+            .filter(|&index| {
+                subagents[index].get("status").and_then(Value::as_str) == Some("running")
+            })
+            .collect();
+        let targets = if running.is_empty() {
+            vec![first]
+        } else {
+            running
+        };
+        for &index in &targets {
+            if let Some(subagent) = subagents[index].as_object_mut() {
+                subagent.insert("stopped_at".to_owned(), Value::String(now.clone()));
+                subagent.insert("status".to_owned(), Value::String("completed".to_owned()));
+                if let Some(transcript_path) = &request.transcript_path {
+                    subagent.insert(
+                        "transcript_path".to_owned(),
+                        Value::String(transcript_path.clone()),
+                    );
+                }
+                if let Some(summary) = &request.summary {
+                    subagent.insert("summary".to_owned(), Value::String(summary.clone()));
+                }
             }
         }
-        let summary = subagent
+        let summary = subagents[targets[0]]
             .get("summary")
             .and_then(Value::as_str)
             .map(str::to_owned);
@@ -8789,6 +8823,77 @@ impl SessionStore {
             status: "stopped".to_owned(),
             summary,
         }))
+    }
+
+    /// Make the recorded running subagents match the `background_tasks` list a
+    /// Claude `Stop` hook carries (sm#2522). That list is what Claude itself
+    /// still runs as the parent goes idle, so it is authoritative: the start and
+    /// stop hooks are not installed for every repo, and a subagent that pauses on
+    /// its own background work and resumes fires a second start with no final
+    /// stop. Returns whether anything changed.
+    pub fn reconcile_background_subagents(
+        &self,
+        session_id: &str,
+        background_tasks: &[Value],
+    ) -> Result<bool> {
+        let running: Vec<&Value> = background_tasks
+            .iter()
+            .filter(|task| {
+                task.get("type").and_then(Value::as_str) == Some("subagent")
+                    && task.get("status").and_then(Value::as_str) == Some("running")
+                    && task.get("id").and_then(Value::as_str).is_some()
+            })
+            .collect();
+        let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[session_id])?;
+        let mut state = self.load_raw_json_value()?;
+        let now = now_python_naive_iso();
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(false);
+        };
+        let subagents = ensure_subagents_array_mut(session);
+        let is_running =
+            |subagent: &Value| subagent.get("status").and_then(Value::as_str) == Some("running");
+        let mut changed = false;
+        for subagent in subagents.iter_mut().filter(|subagent| is_running(subagent)) {
+            let agent_id = subagent.get("agent_id").and_then(Value::as_str);
+            if running
+                .iter()
+                .any(|task| task.get("id").and_then(Value::as_str) == agent_id)
+            {
+                continue;
+            }
+            if let Some(subagent) = subagent.as_object_mut() {
+                subagent.insert("stopped_at".to_owned(), Value::String(now.clone()));
+                subagent.insert("status".to_owned(), Value::String("completed".to_owned()));
+                changed = true;
+            }
+        }
+        for task in running {
+            let id = task.get("id").and_then(Value::as_str);
+            if subagents.iter().any(|subagent| {
+                is_running(subagent) && subagent.get("agent_id").and_then(Value::as_str) == id
+            }) {
+                continue;
+            }
+            subagents.push(json!({
+                "agent_id": id,
+                "agent_type": task.get("agent_type").and_then(Value::as_str).unwrap_or("unknown"),
+                "description": task.get("description"),
+                "parent_session_id": session_id,
+                "transcript_path": null,
+                "started_at": now,
+                "stopped_at": null,
+                "status": "running",
+                "summary": null
+            }));
+            changed = true;
+        }
+        if changed {
+            self.write_raw_json_value(&state)?;
+        }
+        Ok(changed)
     }
 
     pub fn list_subagents(&self, session_id: &str) -> Result<Option<SubagentListResponse>> {

@@ -731,7 +731,12 @@ fn agent_facts(
     let background_agents = array(session, "background_agents");
     if !background_agents.is_empty() {
         let text = match background_agents.as_slice() {
-            [only] => format!("Background agent working: {}", s(only, "agent_type")),
+            [only] => format!(
+                "Background agent working: {}",
+                Some(s(only, "description"))
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or_else(|| s(only, "agent_type"))
+            ),
             many => format!("{} background agents working", many.len()),
         };
         if tone.is_null() {
