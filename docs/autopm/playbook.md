@@ -39,5 +39,5 @@ merge or drop the weakest entries. Keep these six sections.
   the live files fails in the agent sandbox. (2026-10-23)
 
 ## Open hypotheses
-1. Pushes reaching Rajesh at the desk (149 of 204, Oct 16–23; active on web, terminal or agent prompt in the
+1. Pushes reaching Rajesh at the desk (149 of 217, Oct 16–23; active on web, terminal or agent prompt in the
    prior 5 min) are redundant. Test: does he act on the pushed item at the desk within 10 min? (readout 2026-W43)
