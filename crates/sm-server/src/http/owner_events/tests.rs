@@ -123,6 +123,35 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn doc_reader_head_poll_is_background_but_view_is_owner_activity() {
+    let f = fixture();
+    let owner =
+        test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+    let auth = ("cf-access-jwt-assertion", owner.as_str());
+    f.send(request(
+        Method::GET,
+        "/docs/0123abcd/head?sha=abc123",
+        "sm.example.com",
+        &[auth, ("x-sm-bg", "1")],
+        "",
+    ))
+    .await;
+    f.send(request(
+        Method::GET,
+        "/docs/0123abcd/view",
+        "sm.example.com",
+        &[auth],
+        "",
+    ))
+    .await;
+
+    let rows = f.settled_rows(1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].action, "doc.open");
+    assert_eq!(rows[0].target_id.as_deref(), Some("0123abcd"));
+}
+
+#[tokio::test]
 async fn records_owner_requests_by_surface_and_never_agents_or_strangers() {
     let f = fixture();
     let bearer = f.bearer.as_str();
