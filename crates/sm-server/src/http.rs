@@ -23230,6 +23230,20 @@ mod tests {
                 .collect()
         };
         assert_eq!(running(&state), ["resumed"]);
+        // A hook-recorded agent takes its description from the snapshot.
+        let hooked = [
+            json!({"id": "resumed", "type": "subagent", "status": "running",
+            "description": "Chain consumer inventory", "agent_type": "general-purpose"}),
+        ];
+        assert!(store
+            .reconcile_background_subagents("bgagent2", &hooked)
+            .unwrap());
+        assert_eq!(running(&state), ["resumed"]);
+        let doc = watch::watch_state(&state, &watch::WatchParams::default()).unwrap();
+        assert_eq!(
+            doc["sessions"][0]["facts"]["jobs"]["text"],
+            "◷ Background agent working: Chain consumer inventory"
+        );
 
         let tasks = [
             json!({"id": "bzshell", "type": "shell", "status": "running", "command": "sleep 45"}),

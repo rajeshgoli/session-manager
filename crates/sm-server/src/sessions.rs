@@ -8872,9 +8872,18 @@ impl SessionStore {
         }
         for task in running {
             let id = task.get("id").and_then(Value::as_str);
-            if subagents.iter().any(|subagent| {
+            if let Some(recorded) = subagents.iter_mut().find(|subagent| {
                 is_running(subagent) && subagent.get("agent_id").and_then(Value::as_str) == id
             }) {
+                // The start hook does not know the task description; the snapshot does.
+                let description = task.get("description").filter(|value| value.is_string());
+                if let (Some(description), Some(recorded)) = (description, recorded.as_object_mut())
+                {
+                    if recorded.get("description") != Some(description) {
+                        recorded.insert("description".to_owned(), description.clone());
+                        changed = true;
+                    }
+                }
                 continue;
             }
             subagents.push(json!({
