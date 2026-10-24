@@ -78,6 +78,8 @@ impl Drop for SessionInputGuard {
 #[derive(Debug, Clone)]
 pub struct TmuxRuntime {
     opencode: Option<OpencodeRuntime>,
+    /// Stable directory whose `sm` links to the serving install (sm#2523).
+    client_shim_dir: Option<PathBuf>,
     socket_name: Option<String>,
     tmux_binary: String,
     custom_runtime_command: bool,
@@ -349,11 +351,15 @@ impl TmuxRuntime {
             ),
             claude_projects_roots: Vec::new(),
             opencode: None,
+            client_shim_dir: None,
         }
     }
 
     pub fn from_app_config(config: &AppConfig) -> Self {
         let mut runtime = Self::from_config(&config.rust_core);
+        runtime.client_shim_dir = crate::sessions::expand_home(&config.paths.state_file)
+            .parent()
+            .map(|state_dir| state_dir.join("bin"));
         runtime.opencode = Some(OpencodeRuntime {
             config: config.opencode.clone(),
             state_file: crate::sessions::expand_home(&config.paths.state_file),
@@ -399,6 +405,34 @@ impl TmuxRuntime {
     pub fn with_claude_transcript_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.claude_projects_roots = roots;
         self
+    }
+
+    /// The directory a managed session puts first on PATH to find `sm`.
+    ///
+    /// A session keeps its PATH for life, but the serving install moves: an
+    /// agent restarting from its ticket worktree installs there, and that
+    /// worktree is deleted when the ticket closes. The shim directory is stable
+    /// and every server repoints its `sm` at its own install, so a session
+    /// spawned during that window follows the service home (sm#2523). Falls back
+    /// to the install directory when the shim cannot be written.
+    pub fn session_client_dir(&self) -> Option<PathBuf> {
+        let install_dir = env::current_exe()
+            .ok()
+            .and_then(|server| managed_client_dir(&server))?;
+        let Some(shim_dir) = self.client_shim_dir.as_deref() else {
+            return Some(install_dir);
+        };
+        match point_client_shim(shim_dir, &install_dir) {
+            Ok(()) => Some(shim_dir.to_path_buf()),
+            Err(error) => {
+                eprintln!(
+                    "could not point sm shim {} at {}: {error:#}",
+                    shim_dir.display(),
+                    install_dir.display()
+                );
+                Some(install_dir)
+            }
+        }
     }
 
     pub fn socket_name(&self) -> Option<&str> {
@@ -744,9 +778,7 @@ impl TmuxRuntime {
         let has_initial_stdin_prompt = initial_stdin_prompt(spec, &prompt_mode).is_some();
 
         let mut command = self.launch_command(spec, &prompt_mode)?;
-        let client_dir = env::current_exe()
-            .ok()
-            .and_then(|server| managed_client_dir(&server));
+        let client_dir = self.session_client_dir();
         if spec.provider != "shell" {
             command = managed_session_command(
                 &command,
@@ -3161,6 +3193,33 @@ fn managed_client_dir(server_exe: &Path) -> Option<PathBuf> {
     is_executable_file(&dir.join("sm")).then(|| dir.to_path_buf())
 }
 
+/// Atomically make `shim_dir/sm` a symlink to `install_dir/sm`.
+#[cfg(unix)]
+fn point_client_shim(shim_dir: &Path, install_dir: &Path) -> Result<()> {
+    let link = shim_dir.join("sm");
+    let target = install_dir.join("sm");
+    if fs::read_link(&link).is_ok_and(|current| current == target) {
+        return Ok(());
+    }
+    fs::create_dir_all(shim_dir)?;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staged = shim_dir.join(format!(
+        ".sm.{}.{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::os::unix::fs::symlink(&target, &staged)?;
+    fs::rename(&staged, &link).inspect_err(|_| {
+        let _ = fs::remove_file(&staged);
+    })?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn point_client_shim(_shim_dir: &Path, _install_dir: &Path) -> Result<()> {
+    bail!("sm shim needs symlinks")
+}
+
 fn managed_session_command(
     command: &str,
     session_id: &str,
@@ -4332,6 +4391,47 @@ esac
             client.display().to_string()
         );
         let _ = fs::remove_dir_all(install_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_spawned_from_a_deleted_install_follows_the_shim_home() {
+        let root = tempfile_path("client-shim");
+        let worktree = root.join("worktree/.local/bin");
+        let prod = root.join("prod/.local/bin");
+        let shim = root.join("state/bin");
+        for (dir, name) in [(&worktree, "worktree"), (&prod, "prod")] {
+            fs::create_dir_all(dir).unwrap();
+            let client = dir.join("sm");
+            fs::write(&client, format!("#!/bin/sh\necho {name}\n")).unwrap();
+            fs::set_permissions(&client, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // The worktree install serves when the session spawns.
+        point_client_shim(&shim, &worktree).unwrap();
+        point_client_shim(&shim, &worktree).unwrap();
+        let command = managed_session_command("sm", "session-1", None, Some(&shim));
+        let run = || {
+            Command::new("/bin/sh")
+                .args(["-c", command.as_str()])
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap()
+        };
+        assert_eq!(String::from_utf8_lossy(&run().stdout).trim(), "worktree");
+
+        // The service moves home and the worktree is deleted.
+        point_client_shim(&shim, &prod).unwrap();
+        fs::remove_dir_all(root.join("worktree")).unwrap();
+        let output = run();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "prod");
+        assert_eq!(
+            fs::read_dir(&shim).unwrap().count(),
+            1,
+            "no staged links left"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

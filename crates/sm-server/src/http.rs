@@ -805,6 +805,9 @@ impl AppState {
         if config.rust_core.runtime_enabled {
             let runtime = TmuxRuntime::from_app_config(&config)
                 .with_claude_transcript_roots(session_store.claude_transcript_roots());
+            // Repoint the sm shim now, so sessions spawned while an earlier
+            // install served find this one without waiting for a spawn.
+            runtime.session_client_dir();
             session_store = session_store.with_delivery_runtime(Some(runtime));
         }
         if should_use_configured_usage_db_path(&config.usage) {
