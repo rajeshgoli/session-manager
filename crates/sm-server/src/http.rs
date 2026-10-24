@@ -2983,6 +2983,13 @@ async fn claude_hook(
                 emitted_at,
             )?;
             if stop_applied {
+                // Claude lists what it still runs as the parent goes idle; older
+                // Claude versions omit the field, so absence changes nothing.
+                if let Some(tasks) = payload.get("background_tasks").and_then(Value::as_array) {
+                    state
+                        .session_store
+                        .reconcile_background_subagents(&session_id, tasks)?;
+                }
                 handoff::kick_handoff(state.clone(), session_id.clone());
             }
         }
@@ -23116,17 +23123,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(live_activity_state(&state, &record), Some("waiting"));
-        state
+        // sm#2522: a hook registered at user and project level fires twice.
+        for _ in 0..2 {
+            state
+                .session_store
+                .register_subagent_start(
+                    "bgagent1",
+                    SubagentStartRequest {
+                        agent_id: "child-one".into(),
+                        agent_type: "Explore".into(),
+                        transcript_path: None,
+                    },
+                )
+                .unwrap();
+        }
+        let listed = state
             .session_store
-            .register_subagent_start(
-                "bgagent1",
-                SubagentStartRequest {
-                    agent_id: "child-one".into(),
-                    agent_type: "Explore".into(),
-                    transcript_path: None,
-                },
-            )
+            .list_subagents("bgagent1")
+            .unwrap()
             .unwrap();
+        assert_eq!(listed.subagents.len(), 1);
         let record = state
             .session_store
             .get_session("bgagent1")
@@ -23163,6 +23179,98 @@ mod tests {
         let doc = watch::watch_state(&state, &params).unwrap();
         assert_eq!(doc["sessions"][0]["background_agents"], json!([]));
         assert_eq!(doc["sessions"][0]["facts"]["jobs"]["text"], "No jobs");
+    }
+
+    /// sm#2522: the `Stop` hook's `background_tasks` list is what Claude still
+    /// runs, so it closes records no stop hook ever closed and adds agents no
+    /// start hook ever recorded.
+    #[tokio::test]
+    async fn stop_hook_background_tasks_reconcile_running_subagents() {
+        let state_file = write_session_state("bgagent2", "idle");
+        let mut config = AppConfig::default();
+        config.paths.state_file = state_file;
+        let state = AppState::new(config);
+        let store = &state.session_store;
+        let start = |agent_id: &str| {
+            store
+                .register_subagent_start(
+                    "bgagent2",
+                    SubagentStartRequest {
+                        agent_id: agent_id.into(),
+                        agent_type: "general-purpose".into(),
+                        transcript_path: None,
+                    },
+                )
+                .unwrap();
+        };
+        // A subagent that paused on its own background work stopped once, then
+        // resumed with a second start; a later stop closes the running record.
+        start("resumed");
+        store
+            .register_subagent_stop(
+                "bgagent2",
+                "resumed",
+                SubagentStopRequest {
+                    summary: None,
+                    transcript_path: None,
+                },
+            )
+            .unwrap();
+        start("resumed");
+        let running = |state: &AppState| -> Vec<String> {
+            state
+                .session_store
+                .list_subagents("bgagent2")
+                .unwrap()
+                .unwrap()
+                .subagents
+                .into_iter()
+                .filter(|agent| agent.status == "running")
+                .map(|agent| agent.agent_id)
+                .collect()
+        };
+        assert_eq!(running(&state), ["resumed"]);
+        // A hook-recorded agent takes its description from the snapshot.
+        let hooked = [
+            json!({"id": "resumed", "type": "subagent", "status": "running",
+            "description": "Chain consumer inventory", "agent_type": "general-purpose"}),
+        ];
+        assert!(store
+            .reconcile_background_subagents("bgagent2", &hooked)
+            .unwrap());
+        assert_eq!(running(&state), ["resumed"]);
+        let doc = watch::watch_state(&state, &watch::WatchParams::default()).unwrap();
+        assert_eq!(
+            doc["sessions"][0]["facts"]["jobs"]["text"],
+            "◷ Background agent working: Chain consumer inventory"
+        );
+
+        let tasks = [
+            json!({"id": "bzshell", "type": "shell", "status": "running", "command": "sleep 45"}),
+            json!({"id": "unhooked", "type": "subagent", "status": "running",
+                "description": "Replay memory growth inventory", "agent_type": "general-purpose"}),
+        ];
+        assert!(store
+            .reconcile_background_subagents("bgagent2", &tasks)
+            .unwrap());
+        assert!(!store
+            .reconcile_background_subagents("bgagent2", &tasks)
+            .unwrap());
+        assert_eq!(running(&state), ["unhooked"]);
+        let record = store.get_session("bgagent2").unwrap().unwrap();
+        assert_eq!(live_activity_state(&state, &record), Some("waiting"));
+        let doc = watch::watch_state(&state, &watch::WatchParams::default()).unwrap();
+        assert_eq!(
+            doc["sessions"][0]["facts"]["jobs"]["text"],
+            "◷ Background agent working: Replay memory growth inventory"
+        );
+
+        assert!(store
+            .reconcile_background_subagents("bgagent2", &[])
+            .unwrap());
+        assert!(running(&state).is_empty());
+        let record = store.get_session("bgagent2").unwrap().unwrap();
+        assert_ne!(live_activity_state(&state, &record), Some("waiting"));
     }
 
     /// The web's agent panel and Clone read model, effort and folder, and
