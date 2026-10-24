@@ -51,10 +51,11 @@
     (window.crypto || { getRandomValues: function (b) { for (var i = 0; i < b.length; i++) b[i] = Math.random() * 256; return b; } }).getRandomValues(bytes);
     return Array.prototype.map.call(bytes, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
   }
-  function api(method, suffix, body) {
+  function api(method, suffix, body, background) {
     var headers = { Accept: 'application/json' };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     if (CONFIG.token) headers['X-SM-Doc-Token'] = CONFIG.token;
+    if (background) headers['x-sm-bg'] = '1';
     return fetch((CONFIG.apiBase || '/docs/' + CONFIG.docId) + suffix, {
       method: method, headers: headers, credentials: 'same-origin',
       body: body === undefined ? undefined : JSON.stringify(body)
@@ -358,7 +359,7 @@
 
   function pollHead() {
     if (MSG || document.visibilityState === 'hidden') return;
-    api('GET', '/head?sha=' + CONFIG.sha).then(function (head) {
+    api('GET', '/head?sha=' + CONFIG.sha, undefined, true).then(function (head) {
       S.head = head;
       if (head.pr_number) {CONFIG.prNumber = head.pr_number; CONFIG.prUrl = head.pr_url;}
       if (head.revisions) CONFIG.revisions = head.revisions;
