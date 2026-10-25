@@ -9,8 +9,9 @@ const shell = `<!doctype html><meta name="viewport" content="width=device-width,
 <script type="importmap">{"imports":{"preact":"/assets/vendor/preact.module.js","preact/hooks":"/assets/vendor/hooks.module.js","htm":"/assets/vendor/htm.module.js"}}</script>
 <script id="sm-config" type="application/json">{"inbox_token":"fixture"}</script>
 <div id="app"></div><script type="module">
-import {render} from 'preact'; import {html} from '/assets/ui.js';
+import {render} from 'preact'; import {html, bus} from '/assets/ui.js';
 import {NewAgentPopover} from '/assets/start.js';
+bus.on('navigate', path => { window.navigatedTo = path; });
 render(html\`<\${NewAgentPopover} onClose=\${()=>{window.closedPopover=true}}/>\`,document.getElementById('app'));
 </script>`;
 for (const width of [390, 1440]) test(`New agent offers project folders and submits home paths at ${width}px`, async () => {
@@ -72,6 +73,7 @@ for (const width of [390, 1440]) test(`New agent offers project folders and subm
     await page.getByRole('button', { name: 'Start', exact: true }).click();
     await page.waitForFunction(() => window.closedPopover);
     assert.equal(requests.at(-1).working_dir, '~/projects/another');
+    assert.equal(await page.evaluate(() => window.navigatedTo), '/terminal/new');
   } finally { await browser.close(); }
 });
 

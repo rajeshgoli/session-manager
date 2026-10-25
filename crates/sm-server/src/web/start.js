@@ -2,7 +2,7 @@
 // type and press Start, or Other for provider, model and effort; "Change"
 // opens the workspace, name and first message in the same panel.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, Popover, Seg, homeRelative, openPanel, toast } from './ui.js';
+import { html, api, Popover, Seg, homeRelative, navigate } from './ui.js';
 import { TypePicker, OTHER_TYPE, agentTypes, matchType } from './launch-fields.js';
 import { createShell, shellError } from './shell.js';
 const TERMINAL_TYPE = '__terminal__';
@@ -195,7 +195,8 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
     try {
       const started = await api('/client/sessions', { method: 'POST', body });
       onClose();
-      toast(`Started ${started.name}`, () => openPanel(`agent:${started.id}`));
+      // The owner opens the new agent's terminal after almost every start (sm#2529).
+      navigate(`/terminal/${encodeURIComponent(started.id)}`);
     } catch (e) {
       setError(e.message);
     } finally {
