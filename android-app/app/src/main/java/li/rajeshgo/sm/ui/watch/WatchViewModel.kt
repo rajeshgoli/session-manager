@@ -572,7 +572,12 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                 return@launch
             }
             val result = sessionRepository.createSession(serverUrl, accessToken, request)
-            result.onSuccess { refresh() }
+            // The owner opens a new agent's terminal after almost every start (sm#2529);
+            // the refresh restore path attaches it once the session list carries it.
+            result.onSuccess { created ->
+                savedState["terminalSessionId"] = created.id
+                refresh()
+            }
             onComplete(result.map { "Session created" })
         }
     }
