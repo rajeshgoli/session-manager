@@ -143,6 +143,26 @@ impl ManagedArtifacts {
                     {
                         continue;
                     }
+                    // Removing a cold artifact's root link (an agent's `rm -rf`
+                    // on the link) leaves its bytes on the cold store (sm#2527).
+                    if a["state"] == "live" && a["location"] == "cold" {
+                        match restore_cold_link(root, name) {
+                            Ok(true) => {
+                                event(&tx, &root.path, name, "link_restored", "sm", json!({}))?;
+                                continue;
+                            }
+                            // An unplugged cold store cannot show the folder is gone.
+                            Ok(false) if !super::moves::cold_mounted(root) => continue,
+                            Ok(false) => {}
+                            Err(error) => {
+                                eprintln!(
+                                    "artifact link not restored for {}/{name}: {error:#}",
+                                    root.path
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     tx.execute("UPDATE artifacts SET state='deleted',deleted_at=?3,deleted_by='unknown',delete_reason='vanished' WHERE root=?1 AND name=?2",params![root.path,name,now()])?;
                     event(&tx, &root.path, name, "vanished", "sm", json!({}))?;
                 }
@@ -175,6 +195,26 @@ impl ManagedArtifacts {
                     }
                 }
                 Ok(_) => {}
+            }
+        }
+        // Records marked vanished before sm#2527 whose cold copy survived.
+        for a in store::query(
+            &tx,
+            "SELECT name FROM artifacts WHERE root=?1 AND state='deleted' AND delete_reason='vanished' AND location='cold' AND op IS NULL",
+            &[&root.path],
+        )? {
+            let name = a["name"].as_str().unwrap();
+            match restore_cold_link(root, name) {
+                Ok(true) => {
+                    tx.execute("UPDATE artifacts SET state='live',deleted_at=NULL,deleted_by=NULL,delete_reason=NULL WHERE root=?1 AND name=?2",params![root.path,name])?;
+                    event(&tx, &root.path, name, "revived", "sm", json!({}))?;
+                    relocated.push(name.to_owned());
+                }
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "artifact link not restored for {}/{name}: {error:#}",
+                    root.path
+                ),
             }
         }
         store::set_meta(&tx, &key, &now())?;
@@ -234,6 +274,17 @@ impl ManagedArtifacts {
         }
         Ok(())
     }
+}
+/// Relink `<root>/<name>` to `<cold_store>/<name>` when the root entry is
+/// absent and the cold folder exists; false when there is no cold folder.
+fn restore_cold_link(root: &ArtifactRoot, name: &str) -> Result<bool> {
+    let link = Path::new(&root.path).join(name);
+    let cold = Path::new(&root.cold_store).join(name);
+    if link.symlink_metadata().is_ok() || !cold.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        return Ok(false);
+    }
+    std::os::unix::fs::symlink(&cold, &link)?;
+    Ok(true)
 }
 /// A root entry whose link resolves to `<cold_store>/<name>` lives on the cold store.
 fn on_cold_store(root: &ArtifactRoot, name: &str, resolved: &Path) -> bool {
