@@ -304,6 +304,54 @@ fn scan_missing_live_record_is_vanished() {
     assert_eq!(needs()["needs_owner"], false);
 }
 #[test]
+fn scan_restores_removed_cold_link_instead_of_vanishing() {
+    let f = Fixture::new();
+    f.create("123_data");
+    f.svc.done(&f.root, "123_data", "maker").unwrap();
+    let cold = PathBuf::from(&f.root.cold_store).join("123_data");
+    fs::rename(f.path("123_data"), &cold).unwrap();
+    symlink(&cold, f.path("123_data")).unwrap();
+    f.svc.scan(&f.root).unwrap();
+    let a = || f.svc.store.detail(&f.root.path, "123_data").unwrap();
+    assert_eq!(a()["location"], "cold");
+    // `rm -rf <root>/123_data` removes only the link (sm#2527).
+    fs::remove_file(f.path("123_data")).unwrap();
+    f.svc.scan(&f.root).unwrap();
+    assert_eq!(a()["state"], "live");
+    assert_eq!(fs::read_link(f.path("123_data")).unwrap(), cold);
+    let restored = f
+        .svc
+        .store
+        .open()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM artifact_events WHERE name='123_data' AND kind='link_restored'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(restored, 1);
+    // A record already marked vanished comes back while its cold copy remains.
+    fs::remove_file(f.path("123_data")).unwrap();
+    f.svc.store.open().unwrap().execute("UPDATE artifacts SET state='deleted',deleted_at='2026-10-25T06:48:37Z',deleted_by='unknown',delete_reason='vanished' WHERE name='123_data'",[]).unwrap();
+    f.svc.scan(&f.root).unwrap();
+    assert_eq!(a()["state"], "live");
+    assert_eq!(a()["delete_reason"], Value::Null);
+    assert_eq!(fs::read_link(f.path("123_data")).unwrap(), cold);
+    assert!(a()["disk_bytes"].as_u64().is_some());
+    // Link and cold copy both gone: vanished, but only once the cold store is
+    // known to be connected.
+    fs::remove_file(f.path("123_data")).unwrap();
+    fs::remove_dir_all(&cold).unwrap();
+    f.svc.scan(&f.root).unwrap();
+    assert_eq!(a()["state"], "live");
+    super::moves::TEST_MOUNTED.set(true);
+    f.svc.scan(&f.root).unwrap();
+    super::moves::TEST_MOUNTED.set(false);
+    assert_eq!(a()["delete_reason"], "vanished");
+    assert!(f.path("123_data").symlink_metadata().is_err());
+}
+#[test]
 fn initial_grace_is_persisted_once() {
     let f = Fixture::new();
     fs::create_dir(f.path("123_data")).unwrap();
