@@ -284,6 +284,12 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                         if (_uiState.value.terminal == null && restoreId != null) {
                             sessions.firstOrNull { it.id == restoreId }?.let { openMobileTerminal(it) {} }
                         }
+                        openAfterCreateId?.let { id ->
+                            sessions.firstOrNull { it.id == id }?.let { created ->
+                                openAfterCreateId = null
+                                if (_uiState.value.terminal == null && created.mobileTerminal?.supported == true) openMobileTerminal(created) {}
+                            }
+                        }
                         sessions
                             .filter { it.id in expandedSessionIds && it.id !in preservedDetails }
                             .forEach { loadDetail(it) }
@@ -563,6 +569,8 @@ class WatchViewModel(application: Application, private val savedState: androidx.
             supported = true, sshCommand = route.command, tmuxSession = route.tmuxSession)).getOrThrow()
     }
 
+    private var openAfterCreateId: String? = null
+
     fun createSession(request: li.rajeshgo.sm.data.model.CreateSessionRequest, onComplete: (Result<String>) -> Unit) {
         viewModelScope.launch {
             val serverUrl = settingsRepository.serverUrl.first()
@@ -573,9 +581,9 @@ class WatchViewModel(application: Application, private val savedState: androidx.
             }
             val result = sessionRepository.createSession(serverUrl, accessToken, request)
             // The owner opens a new agent's terminal after almost every start (sm#2529);
-            // the refresh restore path attaches it once the session list carries it.
+            // refresh attaches it once the session list carries it.
             result.onSuccess { created ->
-                savedState["terminalSessionId"] = created.id
+                openAfterCreateId = created.id
                 refresh()
             }
             onComplete(result.map { "Session created" })
