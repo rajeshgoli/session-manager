@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hold at-desk pushes</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>Auto PM plan — hold pushes while Rajesh is at the desk</h1>
+<p class="sans"><small>Author: Auto PM, Claude Opus 5.5 <code>7a50e78e</code> · Experiment <code>x-2026w44-desk-push-hold</code> · Cycle #2533 · Goal #2170 · 2026-10-26</small></p>
+
+<h2>Memo</h2>
+<p><b>When an ask reaches Rajesh while he is working in the web app, sm should hold its phone push for 10 minutes, and drop it if he opens the ask in that time.</b> He opens about two in three such asks within 10 minutes anyway, so those pushes only buzz the phone beside him. The change alters when pushes are sent, which is on the ask-only list, so it is built and replayed in a scratch copy of sm first, then goes to Rajesh as one yes/no.</p>
+
+<p><b>Terms.</b> An <i>ask</i> is an agent message to Rajesh that does not block the agent (<code>sm send rajesh</code> without <code>--blocking</code>) or a doc review request (<code>sm doc publish --review</code>). <i>At the desk</i> means that in the 5 minutes before the ask arrived he did something in the web app other than a background poll (the list is in appendix A.2), and did nothing in the Android app. A <i>push</i> is the phone notification sm sends for an ask today, about 3 seconds after it arrives.</p>
+
+<h3>Evidence</h3>
+<p>Asks that arrived while Rajesh was at the desk, Oct 16–26, by minutes until he first opened them (any surface). Source: the guard query in appendix B.2, run on snapshots of the live databases.</p>
+<table>
+<thead><tr><th>Period</th><th>At-desk asks</th><th>Opened within 10 min</th><th>10–60 min</th><th>Later or never</th><th>Median minutes to open</th></tr></thead>
+<tbody>
+<tr><td>Oct 16–22</td><td>64</td><td>40 (63%)</td><td>8</td><td>16</td><td>4.0</td></tr>
+<tr><td>Oct 23–26</td><td>12</td><td>9 (75%)</td><td>3</td><td>0</td><td>0.7</td></tr>
+</tbody>
+</table>
+<p>Cross-check from the activity log, all push kinds: of 110 pushes sent while he was at the desk, he acted on the item in the web app within 10 minutes without tapping the push 61 times (55%), and on the phone only 11 times (10%). He tapped 10 of the 110 pushes. Week 2 is thin because he worked mostly from the phone that week.</p>
+
+<p>What this does not prove: a push may be what sent him to the web tab. The hold tests exactly that. If the push was doing the work, the asks he does not open within 10 minutes get their push 10 minutes late, and the time-to-open guard below catches the slowdown.</p>
+
+<h3>The change</h3>
+<figure>
+<svg viewBox="0 0 640 150" width="100%" role="img" aria-label="Hold flow">
+  <style>.b{fill:var(--surface-2,#f3f2ee);stroke:var(--rule,#ccc)}.t{font:13px sans-serif;fill:var(--ink,#222)}.s{font:11px sans-serif;fill:var(--ink-3,#777)}.a{stroke:var(--ink-3,#777);fill:none;marker-end:url(#h)}</style>
+  <defs><marker id="h" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L8,4L0,8z" fill="#777"/></marker></defs>
+  <rect class="b" x="5" y="50" width="110" height="44" rx="6"/><text class="t" x="16" y="70">Ask arrives</text><text class="s" x="16" y="86">message or review</text>
+  <rect class="b" x="150" y="50" width="120" height="44" rx="6"/><text class="t" x="161" y="70">At the desk?</text><text class="s" x="161" y="86">web, not phone, 5 min</text>
+  <rect class="b" x="310" y="6" width="150" height="44" rx="6"/><text class="t" x="321" y="26">Push now</text><text class="s" x="321" y="42">no: exactly today</text>
+  <rect class="b" x="310" y="96" width="150" height="44" rx="6"/><text class="t" x="321" y="116">Hold 10 minutes</text><text class="s" x="321" y="132">yes</text>
+  <rect class="b" x="495" y="66" width="140" height="36" rx="6"/><text class="t" x="505" y="88">Opened: no push</text>
+  <rect class="b" x="495" y="112" width="140" height="36" rx="6"/><text class="t" x="505" y="134">Not opened: push</text>
+  <path class="a" d="M115,72H148"/><path class="a" d="M270,64L308,30"/><path class="a" d="M270,82L308,116"/>
+  <path class="a" d="M460,112L493,86"/><path class="a" d="M460,124H493"/>
+</svg>
+<figcaption>The push text and the screen it opens are unchanged; only its timing changes, so there is no screen to mock. Blocking messages, approvals and board pushes are never held.</figcaption>
+</figure>
+<p>sm already drops a push whose ask was opened before the push came due (it marks it <code>resolved</code>). The change only sets the push's due time 10 minutes later when Rajesh is at the desk. One new table, <code>push_desk_log</code>, records each eligible push and whether he was at the desk when it was created and when it was sent, because measurement cannot read the push database.</p>
+
+<h3>Path, test and timing</h3>
+<table>
+<thead><tr><th style="width:22%">Item</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>Path</td><td><b>Shadow, then ask.</b> Change class: pushes (outbound). After a yes it ships behind the switch <code>autopm.desk-push-hold</code>; off means pushes go out exactly as today.</td></tr>
+<tr><td>Shadow evidence</td><td>A scratch copy of live state, runtime off, another port, push and email replaced by recorders. Replays the last 14 days of asks and reports how many it would hold, drop and send late, against the numbers above.</td></tr>
+<tr><td>Metric</td><td>Pushes sent while he is at the desk, per day. Lower is better; the bar is 25% fewer in both weeks. Baseline about 7 a day (76 in 10.5 days); the replay predicts a drop of about two thirds.</td></tr>
+<tr><td>Guards</td><td>(1) Median minutes from an at-desk ask to his first open must not get 25% worse (baseline 3.5 min, Oct 15–26). (2) Bug reports mentioning pushes or notifications. Plus the built-in ones: any 👎, or Rajesh switching it off.</td></tr>
+<tr><td>Window</td><td>14 days, measured by sm from the committed queries.</td></tr>
+<tr><td>Timeline</td><td>Shadow build this week; ask in this cycle's message if ready, else next week's. On yes: deploy dark, collect 14 days of the push log as the baseline, switch on, measure 14 days later.</td></tr>
+<tr><td>Lasting side effects</td><td>Held pushes that are dropped are never sent (the reason it needs a yes). New rows in the new <code>push_desk_log</code> table only; no existing row is changed.</td></tr>
+<tr><td>Cost</td><td>One build ticket, Mid tier, Codex <code>gpt-6-sol</code> medium: 4 Codex points. No Claude build points.</td></tr>
+</tbody>
+</table>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<h3>A. Behaviour</h3>
+<p><b>A.1 Eligible notices.</b> <code>owner_notices</code> rows of kind <code>message</code> with <code>blocking = 0</code>, and of kind <code>review_requested</code>. Every other kind (<code>approval_needed</code>, <code>board_*</code>, follow notices, blocking messages) is never held and is not logged.</p>
+<p><b>A.2 At the desk at time t.</b> True when <code>owner_events</code> holds a row with <code>surface = 'web'</code>, <code>t − 300 000 ≤ at_ms &lt; t</code> and <code>action</code> not in the background list, and holds no row with <code>surface = 'android'</code> in the same interval. Background list: <code>watch.state, restart.latest, session.models, model.status, board.badge, board.seen, doc.head, queue.stats, utilization.series, host.status, terminal.ticket, app.meta, push.register, follow.list, artifact.activity, artifact.list, session.obligations, review.status, handoff.defaults, doc.drafts, claim.list, notice.ack, app.bootstrap, review.policies</code>. Keep the list in one constant shared with the metric queries' text (a test asserts the SQL files contain the same list). <code>agent_prompt</code> and <code>terminal</code> rows do not count: both can come from the phone.</p>
+<p><b>A.3 Hold.</b> When an eligible notice is created (<code>create_notice</code>, <code>crates/sm-server/src/owner_push/notices.rs</code>), and <code>switches::is_on("autopm.desk-push-hold")</code>, and the owner is at the desk at <code>created_at</code>: set <code>notify_after = created_at + 600 s</code>. Otherwise <code>notify_after</code> is unchanged from today. Delivery (<code>deliver_notices_holding</code>) is unchanged: at <code>notify_after</code> it closes the notice <code>resolved</code> if <code>still_wanted</code> is false or <code>opened</code> is true, else pushes. Overnight hold keeps its precedence. Repair-created notices (<code>repair_notices</code>) follow the same rule.</p>
+<p><b>A.4 Push log.</b> New table in the queue database (<code>sm_send.db_path</code>), the only database measurement can read for this:</p>
+<pre>CREATE TABLE push_desk_log (
+  notice_id      TEXT PRIMARY KEY,   -- owner_notices.id
+  kind           TEXT NOT NULL,      -- message | review_requested
+  created_at_ms  INTEGER NOT NULL,
+  desk_at_create INTEGER NOT NULL,   -- A.2 at created_at
+  held           INTEGER NOT NULL,   -- 1 iff A.3 moved notify_after
+  outcome        TEXT,               -- push | email | resolved | overnight | withdrawn; NULL until closed
+  sent_at_ms     INTEGER,            -- set iff outcome is push
+  desk_at_send   INTEGER             -- A.2 at sent_at_ms; set iff outcome is push
+);</pre>
+<p>A row is inserted for every eligible notice at creation and updated once when the notice closes. It is written whether the switch is on or off, so the baseline accrues while the change is deployed dark; this additive table is the only difference with the switch off. Log write failures are logged and never block delivery. Rows older than 180 days are pruned with the activity log.</p>
+<p><b>A.5 Off equals today.</b> A test drives a fixture history (at-desk and away notices of every kind, opened and unopened) through creation and delivery with the switch off and asserts every notice's <code>notify_after</code>, outcome, and push and email calls equal those of the code on main. A second test with the switch on asserts A.3 for each case.</p>
+
+<h3>B. Measurement</h3>
+<p><b>B.1 Metric</b> <code>docs/autopm/metrics/x-2026w44-desk-push-hold.sql</code>: one row per push sent while at the desk. <code>{"query": "docs/autopm/metrics/x-2026w44-desk-push-hold.sql", "stat": "per_day", "direction": "lower", "min_change_pct": 25}</code>. Baseline: from the log's first 14 days while dark; the replay estimate is 7.2 a day.</p>
+<p><b>B.2 Guards.</b> <code>[{"query": "docs/autopm/metrics/x-2026w44-desk-push-hold.guard-act.sql", "stat": "median", "bad_direction": "higher", "max_worse_pct": 25}, {"query": "docs/autopm/metrics/x-2026w44-desk-push-hold.guard-bugs.sql", "stat": "per_day", "bad_direction": "higher", "max_worse_pct": 25}]</code>. The time-to-open guard reads only tables that exist today: 82 observations Oct 15–26 (the activity log starts Oct 15), median 3.5 minutes; 64 in Oct 16–22 alone, so each 7-day half clears the 10-observation floor. Bug reports matching push or notif: 0 in Oct 16–26.</p>
+
+<h3>C. Build ticket</h3>
+<p><b>C.1 "Hold at-desk pushes 10 minutes (shadow build)".</b> Tier: Mid. Codex <code>gpt-6-sol</code>, medium. 4 points. Experiment <code>x-2026w44-desk-push-hold</code>, switch <code>autopm.desk-push-hold</code>, off-equals-today test A.5, metric query B.1. Expected files: <code>owner_push/notices.rs</code>, <code>owner_push/tests.rs</code>, the <code>NoticeWorld</code> implementation in <code>http/follows.rs</code>, and the queue database schema module for <code>push_desk_log</code>.</p>
+<p><b>C.2 Shadow run.</b> Follow the scratch-server recipe: copy live state, <code>rust_core.runtime_enabled: false</code>, a port other than 8420, push sender and mailer replaced by recorders. Replay each eligible notice created in the last 14 days in time order, evaluating A.2 and A.3 at its historical <code>created_at</code> and <code>opened</code> at <code>created_at + 600 s</code> from <code>owner_messages.first_viewed_at</code> and <code>owner_doc_views.viewed_at</code>. Report: eligible notices, at the desk, held, held then resolved (no push), held then pushed, and the switch-off run's recorded pushes, which must equal the history's. Record the report and the class's "cannot be shown: Rajesh's reaction" in <code>decision_note</code>, set the experiment to <code>awaiting_owner</code>, put a merge hold on the PR, and stop. The PR merges only after Rajesh's yes.</p>
+
+<h3>Z. FAQ</h3>
+<p><b>Why not hold until he leaves the desk?</b> An ask he has not opened after 10 minutes may be one he has not seen; a bounded delay caps the cost of a wrong guess at 10 minutes.</p>
+<p><b>Why not count typing to an agent as at the desk?</b> The Claude app and the sm app terminal on the phone produce the same <code>agent_prompt</code> and <code>terminal</code> rows as the desk. Counting them inflated "at the desk" from 110 to 185 pushes and made week 2 look like he ignored the web.</p>
+<p><b>Why log instead of reading the push database?</b> Measurement attaches only the queue, activity, usage, utilization and bug databases. Attaching another one changes measurement rules, which needs Rajesh's yes.</p>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  @media screen and (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+    }
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  if (!window.frameElement) {
+    try { saved = localStorage.getItem(KEY); } catch (e) {}
+    if (saved === 'dark' || saved === 'light') root.setAttribute('data-theme', saved);
+  }
+  function isDark() {
+    return root.getAttribute('data-theme') === 'dark' ||
+      (!root.hasAttribute('data-theme') && matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = isDark() ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = isDark();
+    root.setAttribute('data-theme', dark ? 'light' : 'dark');
+    if (!window.frameElement) {
+      try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    }
+    label();
+  };
+  new MutationObserver(label).observe(root, { attributes: true, attributeFilter: ['data-theme'] });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', label);
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
