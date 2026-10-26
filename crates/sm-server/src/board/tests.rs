@@ -1381,6 +1381,25 @@ fn iteration7_stage_d_example() {
     assert_eq!(first, vec![1813, 1747, 1818]);
 }
 
+/// sm#2531: a review request on a merged PR stops waiting on the owner as
+/// soon as the board reads the merge, before the doc sync ends the request.
+#[test]
+fn review_on_merged_pr_leaves_needs_you() {
+    let mut input = iteration7();
+    input.prs.insert(
+        ko(1813),
+        vec![PrRef {
+            repo: OTHER.into(),
+            number: 1814,
+            state: "MERGED".into(),
+            url: String::new(),
+        }],
+    );
+    let board = compute(&input, now());
+    assert_eq!(state(&board, &ko(1813)), TicketState::InProgress);
+    assert_eq!(board.facts[&ko(1813)].needs_you, None);
+}
+
 #[test]
 fn two_lanes_min_rank() {
     let (store, _dir) = temp_store();

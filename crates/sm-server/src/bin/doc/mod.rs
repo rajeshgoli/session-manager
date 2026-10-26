@@ -26,7 +26,9 @@ enum DocCommand {
     /// Show a doc's metadata, revisions and reader URL
     Show(DocShowArgs),
     /// Hide a doc from the session Docs row (git is untouched)
-    Retract(DocRetractArgs),
+    Retract(DocNameArgs),
+    /// Withdraw your review request, e.g. after the owner approved in chat
+    WithdrawReview(DocNameArgs),
 }
 
 #[derive(Args)]
@@ -72,7 +74,7 @@ struct DocShowArgs {
 }
 
 #[derive(Args)]
-struct DocRetractArgs {
+struct DocNameArgs {
     /// `<repo-name>/<path in repo>`, or the doc's URL as printed
     doc: String,
 }
@@ -93,6 +95,22 @@ pub(crate) fn run_doc(client: &ApiClient, args: DocArgs) -> Result<()> {
             )?;
             println!(
                 "Retracted \"{}\" ({}). The file in git is untouched; publish again to restore it.",
+                json_string(&doc, "title"),
+                json_string(&doc, "name")
+            );
+            Ok(())
+        }
+        DocCommand::WithdrawReview(args) => {
+            let found = client.get_json(&doc_metadata_path(&args.doc)?)?;
+            let doc = client.post_json(
+                &format!(
+                    "/docs/{}/withdraw-review",
+                    url_segment(&json_string(&found, "id"))
+                ),
+                json!({}),
+            )?;
+            println!(
+                "Withdrew the review request on \"{}\" ({}). It no longer waits on the owner.",
                 json_string(&doc, "title"),
                 json_string(&doc, "name")
             );

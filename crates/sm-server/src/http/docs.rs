@@ -2106,7 +2106,7 @@ pub(super) fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> R
         .map_err(|error| bad_request(format!("invalid JSON body: {error}")))
 }
 
-/// `POST /docs/{id}/retract|drafts|review`.
+/// `POST /docs/{id}/retract|withdraw-review|drafts|review`.
 pub(super) async fn post_owner_doc_subpath(
     State(state): State<Arc<AppState>>,
     Path((doc_id, rest)): Path<(String, String)>,
@@ -2120,6 +2120,7 @@ pub(super) async fn post_owner_doc_subpath(
     if !matches!(
         rest.as_str(),
         "retract"
+            | "withdraw-review"
             | "drafts"
             | "review"
             | "dismiss-review"
@@ -2146,7 +2147,26 @@ pub(super) async fn post_owner_doc_subpath(
         find_doc(&state, &doc_id)?;
         let store = owner_doc_store(&state);
         store.retract(&doc_id)?;
+        // A retracted doc's review request leaves the board's Needs you.
+        super::board::request_recompute(&state);
         let summary = store
+            .summary(&doc_id)?
+            .ok_or(ApiError::NotFound("Doc not found"))?;
+        return Ok(Json(summary_json(&state.config, &summary, &headers)?).into_response());
+    }
+    if rest == "withdraw-review" {
+        // The agent's side of No review needed (sm#2531): its author was
+        // answered elsewhere, such as in chat, so nothing waits on the owner.
+        ensure_session_allowed_from_parts(
+            &state.config,
+            &headers,
+            Some(peer_addr),
+            &format!("/docs/{doc_id}/{rest}"),
+        )?;
+        ensure_core_writes_enabled(&state)?;
+        let doc = find_doc(&state, &doc_id)?;
+        dismiss_review(&state, &doc).await?;
+        let summary = owner_doc_store(&state)
             .summary(&doc_id)?
             .ok_or(ApiError::NotFound("Doc not found"))?;
         return Ok(Json(summary_json(&state.config, &summary, &headers)?).into_response());
@@ -2388,8 +2408,8 @@ pub(super) fn end_closed_pr_review_requests(state: &AppState) -> anyhow::Result<
                         && now.doc.pr_number == summary.doc.pr_number
                         && now.publish_count == summary.publish_count
                 });
-                if still_requested {
-                    store.dismiss_review(&summary.doc.id)?;
+                if still_requested && store.dismiss_review(&summary.doc.id)? {
+                    super::board::request_recompute(state);
                 }
             }
             Ok(_) => {}
