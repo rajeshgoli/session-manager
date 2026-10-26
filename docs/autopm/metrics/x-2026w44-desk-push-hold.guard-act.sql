@@ -7,7 +7,7 @@ WITH asks AS (
   SELECT CAST((julianday(p.published_at) - 2440587.5) * 86400000 AS INTEGER),
          (SELECT MIN(e.at_ms) FROM q.owner_events e
             WHERE e.action IN ('doc.open', 'doc.review')
-              AND (e.target_id = p.doc_id OR e.target_id = d.repo || '/' || d.path)
+              AND (e.target_id = p.doc_id OR e.target_id = substr(d.repo, instr(d.repo, '/') + 1) || '/' || d.path)
               AND e.at_ms >= CAST((julianday(p.published_at) - 2440587.5) * 86400000 AS INTEGER))
   FROM q.owner_doc_publishes p JOIN q.owner_docs d ON d.id = p.doc_id
   WHERE p.review_requested = 1
