@@ -1331,6 +1331,110 @@ fn desk_background_actions_match_metric_query() {
     assert_eq!(listed, code);
 }
 
+/// Run only with SM2535_REPLAY_FILE pointing at a JSON fixture made from
+/// SQLite backups. No sender or mailer here can contact an external service.
+#[test]
+#[ignore]
+fn shadow_replay_desk_hold_from_snapshots() {
+    struct ShadowWorld {
+        current_ms: i64,
+        opened_ms: Option<i64>,
+        resolved_ms: Option<i64>,
+        desk: bool,
+    }
+    impl NoticeWorld for ShadowWorld {
+        fn at_desk(&self, _at: OffsetDateTime) -> Result<bool> {
+            Ok(self.desk)
+        }
+        fn still_wanted(&self, _notice: &Notice) -> Result<bool> {
+            Ok(self.resolved_ms.is_none_or(|at| at > self.current_ms))
+        }
+        fn opened(&self, _notice: &Notice) -> Result<bool> {
+            Ok(self.opened_ms.is_some_and(|at| at <= self.current_ms))
+        }
+        fn unread_count(&self, _notice: &Notice) -> Result<i64> {
+            Ok(0)
+        }
+        fn notice_candidates(&self, _since: OffsetDateTime) -> Result<Vec<NewNotice>> {
+            Ok(vec![])
+        }
+    }
+    let path = std::env::var("SM2535_REPLAY_FILE").expect("set SM2535_REPLAY_FILE");
+    let history: Vec<serde_json::Value> = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let timestamp =
+        |ms: i64| OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).unwrap();
+    let mut off_pushes = 0;
+    let mut held = 0;
+    let mut held_resolved = 0;
+    let mut held_pushed = 0;
+    for item in &history {
+        let kind = item["kind"].as_str().unwrap();
+        let subject = item["subject_id"].as_str().unwrap();
+        let created_ms = item["created_ms"].as_i64().unwrap();
+        let notified_ms = item["notified_ms"].as_i64().unwrap_or(created_ms);
+        let opened_ms = item["opened_ms"].as_i64();
+        let desk = item["desk"].as_bool().unwrap();
+        let historical_outcome = item["outcome"].as_str().unwrap_or("");
+        let notice = if kind == NOTICE_MESSAGE {
+            message_notice(subject, false)
+        } else {
+            review_notice(subject.parse().unwrap())
+        };
+        for enabled in [false, true] {
+            let (store, dir) = temp_store();
+            register(&store, "recorder", None);
+            store
+                .create_notice_with_desk(&notice, timestamp(created_ms), desk, enabled)
+                .unwrap();
+            let is_held = enabled && desk;
+            let due_ms = if is_held {
+                (created_ms + 600_000).max(notified_ms)
+            } else {
+                notified_ms
+            };
+            let world = ShadowWorld {
+                current_ms: due_ms,
+                opened_ms,
+                resolved_ms: (historical_outcome == "resolved").then_some(notified_ms),
+                desk,
+            };
+            let sender = FakeSender::default();
+            let mailer = FakeNoticeMailer::default();
+            if historical_outcome == "overnight" {
+                let id = notice_of(&store, kind, subject).id;
+                store.release_held(&[id], timestamp(due_ms)).unwrap();
+            } else {
+                let channel = (historical_outcome != "email").then_some(&sender as &dyn PushSender);
+                deliver_notices(&store, &world, channel, &mailer, timestamp(due_ms)).unwrap();
+            }
+            let result = notice_of(&store, kind, subject);
+            if enabled {
+                if is_held {
+                    held += 1;
+                    held_resolved +=
+                        usize::from(result.notified_via.as_deref() == Some("resolved"));
+                    held_pushed += usize::from(result.notified_via.as_deref() == Some("push"));
+                }
+            } else {
+                off_pushes += sender.sent().len();
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    println!(
+        "shadow: eligible={} held={} held_resolved={} held_pushed={} off_pushes={}",
+        history.len(),
+        held,
+        held_resolved,
+        held_pushed,
+        off_pushes
+    );
+    assert_eq!(
+        off_pushes,
+        history.iter().filter(|v| v["outcome"] == "push").count()
+    );
+}
+
 #[derive(Default)]
 struct FakeNoticeMailer {
     sent: Mutex<Vec<String>>,
