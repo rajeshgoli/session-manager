@@ -1,4 +1,3 @@
--- Bug reports that mention notifications or pushes, one row per report.
 SELECT CAST((julianday(created_at) - 2440587.5) * 86400000 AS INTEGER) AS at_ms, 1.0 AS value
 FROM bugs.bug_reports
 WHERE (lower(report_text) LIKE '%push%' OR lower(report_text) LIKE '%notif%')

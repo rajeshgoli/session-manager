@@ -110,17 +110,17 @@
 <p class="sans"><small>Author: Auto PM, Claude Opus 5.5 <code>7a50e78e</code> · Experiment <code>x-2026w44-desk-push-hold</code> · Cycle #2533 · Goal #2170 · 2026-10-26</small></p>
 
 <h2>Memo</h2>
-<p><b>When an ask reaches Rajesh while he is working in the web app, sm should hold its phone push for 10 minutes, and drop it if he opens the ask in that time.</b> He opens about two in three such asks within 10 minutes anyway, so those pushes only buzz the phone beside him. The change alters when pushes are sent, which is on the ask-only list, so it is built and replayed in a scratch copy of sm first, then goes to Rajesh as one yes/no.</p>
+<p><b>When an ask reaches Rajesh while he is working in the web app, sm should hold its phone push for 10 minutes, and drop it if he opens the ask in that time.</b> He opens nearly three in four such asks within 10 minutes anyway, so those pushes only buzz the phone beside him. The change alters when pushes are sent, which is on the ask-only list, so it is built and replayed in a scratch copy of sm first, then goes to Rajesh as one yes/no.</p>
 
 <p><b>Terms.</b> An <i>ask</i> is an agent message to Rajesh that does not block the agent (<code>sm send rajesh</code> without <code>--blocking</code>) or a doc review request (<code>sm doc publish --review</code>). <i>At the desk</i> means that in the 5 minutes before the ask arrived he did something in the web app other than a background poll (the list is in appendix A.2), and did nothing in the Android app. A <i>push</i> is the phone notification sm sends for an ask today, about 3 seconds after it arrives.</p>
 
 <h3>Evidence</h3>
-<p>Asks that arrived while Rajesh was at the desk, Oct 16–26, by minutes until he first opened them (any surface). Source: the guard query in appendix B.2, run on snapshots of the live databases.</p>
+<p>Asks that arrived while Rajesh was at the desk, Oct 16–26, by minutes until he first opened them (any surface; a doc's first open comes from the activity log, because sm's doc-view record keeps only the latest view). Source: the guard query in appendix B.2, run on snapshots of the live databases.</p>
 <table>
 <thead><tr><th>Period</th><th>At-desk asks</th><th>Opened within 10 min</th><th>10–60 min</th><th>Later or never</th><th>Median minutes to open</th></tr></thead>
 <tbody>
-<tr><td>Oct 16–22</td><td>64</td><td>40 (63%)</td><td>8</td><td>16</td><td>4.0</td></tr>
-<tr><td>Oct 23–26</td><td>12</td><td>9 (75%)</td><td>3</td><td>0</td><td>0.7</td></tr>
+<tr><td>Oct 16–22</td><td>64</td><td>45 (70%)</td><td>9</td><td>10</td><td>3.7</td></tr>
+<tr><td>Oct 23–26</td><td>12</td><td>10 (83%)</td><td>2</td><td>0</td><td>0.5</td></tr>
 </tbody>
 </table>
 <p>Cross-check from the activity log, all push kinds: of 110 pushes sent while he was at the desk, he acted on the item in the web app within 10 minutes without tapping the push 61 times (55%), and on the phone only 11 times (10%). He tapped 10 of the 110 pushes. Week 2 is thin because he worked mostly from the phone that week.</p>
@@ -151,8 +151,8 @@
 <tbody>
 <tr><td>Path</td><td><b>Shadow, then ask.</b> Change class: pushes (outbound). After a yes it ships behind the switch <code>autopm.desk-push-hold</code>; off means pushes go out exactly as today.</td></tr>
 <tr><td>Shadow evidence</td><td>A scratch copy of live state, runtime off, another port, push and email replaced by recorders. Replays the last 14 days of asks and reports how many it would hold, drop and send late, against the numbers above.</td></tr>
-<tr><td>Metric</td><td>Pushes sent while he is at the desk, per day. Lower is better; the bar is 25% fewer in both weeks. Baseline about 7 a day (76 in 10.5 days); the replay predicts a drop of about two thirds.</td></tr>
-<tr><td>Guards</td><td>(1) Median minutes from an at-desk ask to his first open must not get 25% worse (baseline 3.5 min, Oct 15–26). (2) Bug reports mentioning pushes or notifications. Plus the built-in ones: any 👎, or Rajesh switching it off.</td></tr>
+<tr><td>Metric</td><td>Pushes sent while he is at the desk, per day. Lower is better; the bar is 25% fewer in both weeks. Baseline about 7 a day (76 in 10.5 days); the replay predicts a drop of about 70%.</td></tr>
+<tr><td>Guards</td><td>(1) Median minutes from an at-desk ask to his first open must not get 25% worse (baseline 3.0 min, Oct 15–26). (2) Bug reports mentioning pushes or notifications. Plus the built-in ones: any 👎, or Rajesh switching it off.</td></tr>
 <tr><td>Window</td><td>14 days, measured by sm from the committed queries.</td></tr>
 <tr><td>Timeline</td><td>Shadow build this week; ask in this cycle's message if ready, else next week's. On yes: deploy dark, collect 14 days of the push log as the baseline, switch on, measure 14 days later.</td></tr>
 <tr><td>Lasting side effects</td><td>Held pushes that are dropped are never sent (the reason it needs a yes). New rows in the new <code>push_desk_log</code> table only; no existing row is changed.</td></tr>
@@ -182,12 +182,13 @@
 <p><b>A.5 Off equals today.</b> A test drives a fixture history (at-desk and away notices of every kind, opened and unopened) through creation and delivery with the switch off and asserts every notice's <code>notify_after</code>, outcome, and push and email calls equal those of the code on main. A second test with the switch on asserts A.3 for each case.</p>
 
 <h3>B. Measurement</h3>
+<p>The query files carry no comments: the runner requires the text to begin with <code>SELECT</code> or <code>WITH</code>.</p>
 <p><b>B.1 Metric</b> <code>docs/autopm/metrics/x-2026w44-desk-push-hold.sql</code>: one row per push sent while at the desk. <code>{"query": "docs/autopm/metrics/x-2026w44-desk-push-hold.sql", "stat": "per_day", "direction": "lower", "min_change_pct": 25}</code>. Baseline: from the log's first 14 days while dark; the replay estimate is 7.2 a day.</p>
-<p><b>B.2 Guards.</b> <code>[{"query": "docs/autopm/metrics/x-2026w44-desk-push-hold.guard-act.sql", "stat": "median", "bad_direction": "higher", "max_worse_pct": 25}, {"query": "docs/autopm/metrics/x-2026w44-desk-push-hold.guard-bugs.sql", "stat": "per_day", "bad_direction": "higher", "max_worse_pct": 25}]</code>. The time-to-open guard reads only tables that exist today: 82 observations Oct 15–26 (the activity log starts Oct 15), median 3.5 minutes; 64 in Oct 16–22 alone, so each 7-day half clears the 10-observation floor. Bug reports matching push or notif: 0 in Oct 16–26.</p>
+<p><b>B.2 Guards.</b> <code>[{"query": "docs/autopm/metrics/x-2026w44-desk-push-hold.guard-act.sql", "stat": "median", "bad_direction": "higher", "max_worse_pct": 25}, {"query": "docs/autopm/metrics/x-2026w44-desk-push-hold.guard-bugs.sql", "stat": "per_day", "bad_direction": "higher", "max_worse_pct": 25}]</code>. The time-to-open guard reads only tables that exist today: 82 observations Oct 15–26 (the activity log starts Oct 15), median 3.0 minutes; 64 in Oct 16–22 alone, so each 7-day half clears the 10-observation floor. Bug reports matching push or notif: 0 in Oct 16–26.</p>
 
 <h3>C. Build ticket</h3>
 <p><b>C.1 "Hold at-desk pushes 10 minutes (shadow build)".</b> Tier: Mid. Codex <code>gpt-6-sol</code>, medium. 4 points. Experiment <code>x-2026w44-desk-push-hold</code>, switch <code>autopm.desk-push-hold</code>, off-equals-today test A.5, metric query B.1. Expected files: <code>owner_push/notices.rs</code>, <code>owner_push/tests.rs</code>, the <code>NoticeWorld</code> implementation in <code>http/follows.rs</code>, and the queue database schema module for <code>push_desk_log</code>.</p>
-<p><b>C.2 Shadow run.</b> Follow the scratch-server recipe: copy live state, <code>rust_core.runtime_enabled: false</code>, a port other than 8420, push sender and mailer replaced by recorders. Replay each eligible notice created in the last 14 days in time order, evaluating A.2 and A.3 at its historical <code>created_at</code> and <code>opened</code> at <code>created_at + 600 s</code> from <code>owner_messages.first_viewed_at</code> and <code>owner_doc_views.viewed_at</code>. Report: eligible notices, at the desk, held, held then resolved (no push), held then pushed, and the switch-off run's recorded pushes, which must equal the history's. Record the report and the class's "cannot be shown: Rajesh's reaction" in <code>decision_note</code>, set the experiment to <code>awaiting_owner</code>, put a merge hold on the PR, and stop. The PR merges only after Rajesh's yes.</p>
+<p><b>C.2 Shadow run.</b> Follow the scratch-server recipe: copy live state, <code>rust_core.runtime_enabled: false</code>, a port other than 8420, push sender and mailer replaced by recorders. Replay each eligible notice created in the last 14 days in time order, evaluating A.2 and A.3 at its historical <code>created_at</code> and <code>opened</code> at <code>created_at + 600 s</code> from <code>owner_messages.first_viewed_at</code> and, for docs, the first <code>owner_events</code> row with action <code>doc.open</code> or <code>doc.review</code> on that doc at or after the publish (<code>owner_doc_views.viewed_at</code> is overwritten on every view, so it cannot date a first open). Report: eligible notices, at the desk, held, held then resolved (no push), held then pushed, and the switch-off run's recorded pushes, which must equal the history's. Record the report and the class's "cannot be shown: Rajesh's reaction" in <code>decision_note</code>, set the experiment to <code>awaiting_owner</code>, put a merge hold on the PR, and stop. The PR merges only after Rajesh's yes.</p>
 
 <h3>Z. FAQ</h3>
 <p><b>Why not hold until he leaves the desk?</b> An ask he has not opened after 10 minutes may be one he has not seen; a bounded delay caps the cost of a wrong guess at 10 minutes.</p>

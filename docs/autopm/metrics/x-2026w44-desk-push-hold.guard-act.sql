@@ -1,8 +1,3 @@
--- Minutes from an ask's arrival to Rajesh first opening it, for asks that arrived while he was
--- at the desk: a non-poll web action in the prior 5 min and no Android action.
--- Asks: non-blocking agent messages (opened = first_viewed_at) and doc review requests
--- (opened = first view of the requested revision). Unopened asks count as minutes elapsed
--- up to :until_ms, capped at 1440.
 WITH asks AS (
   SELECT CAST((julianday(created_at) - 2440587.5) * 86400000 AS INTEGER) AS at_ms,
          CAST((julianday(first_viewed_at) - 2440587.5) * 86400000 AS INTEGER) AS open_ms
@@ -10,9 +5,11 @@ WITH asks AS (
   WHERE blocking = 0 AND lower(human) = 'rajesh'
   UNION ALL
   SELECT CAST((julianday(p.published_at) - 2440587.5) * 86400000 AS INTEGER),
-         (SELECT CAST((julianday(v.viewed_at) - 2440587.5) * 86400000 AS INTEGER)
-            FROM q.owner_doc_views v WHERE v.doc_id = p.doc_id AND v.blob_sha = p.blob_sha)
-  FROM q.owner_doc_publishes p
+         (SELECT MIN(e.at_ms) FROM q.owner_events e
+            WHERE e.action IN ('doc.open', 'doc.review')
+              AND (e.target_id = p.doc_id OR e.target_id = d.repo || '/' || d.path)
+              AND e.at_ms >= CAST((julianday(p.published_at) - 2440587.5) * 86400000 AS INTEGER))
+  FROM q.owner_doc_publishes p JOIN q.owner_docs d ON d.id = p.doc_id
   WHERE p.review_requested = 1
 )
 SELECT at_ms, MIN((COALESCE(open_ms, :until_ms) - at_ms) / 60000.0, 1440.0) AS value
