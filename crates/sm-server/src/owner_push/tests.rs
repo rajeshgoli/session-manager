@@ -1106,6 +1106,8 @@ struct FakeNoticeWorld {
     opened: Mutex<std::collections::BTreeSet<String>>,
     unread: i64,
     candidates: Vec<NewNotice>,
+    desk: bool,
+    hold: bool,
 }
 
 impl FakeNoticeWorld {
@@ -1118,6 +1120,12 @@ impl FakeNoticeWorld {
 }
 
 impl NoticeWorld for FakeNoticeWorld {
+    fn at_desk(&self, _at: OffsetDateTime) -> Result<bool> {
+        Ok(self.desk)
+    }
+    fn desk_hold_on(&self) -> bool {
+        self.hold
+    }
     fn still_wanted(&self, notice: &Notice) -> Result<bool> {
         Ok(!self.answered.lock().unwrap().contains(&notice.subject_id))
     }
@@ -1130,6 +1138,197 @@ impl NoticeWorld for FakeNoticeWorld {
     fn notice_candidates(&self, _since: OffsetDateTime) -> Result<Vec<NewNotice>> {
         Ok(self.candidates.clone())
     }
+}
+
+#[test]
+fn desk_hold_switch_preserves_off_delivery_and_holds_only_eligible_asks() {
+    let now = at("2026-10-26T10:00:00Z");
+    for enabled in [false, true] {
+        let (store, dir) = temp_store();
+        let store = store.with_desk_log(dir.join("queue.db"));
+        register(&store, "tok1", None);
+        let world = FakeNoticeWorld {
+            desk: true,
+            hold: enabled,
+            ..Default::default()
+        };
+        world.open("opened");
+        let sender = FakeSender::default();
+        let mailer = FakeNoticeMailer::default();
+        let mut cases = vec![
+            message_notice("ask", false),
+            message_notice("opened", false),
+            review_notice(44),
+            message_notice("blocking", true),
+            NewNotice::approval_needed(OWNER, "eng00001", "agent", now),
+        ];
+        for kind in [
+            crate::board::NOTICE_BOARD_READY,
+            crate::board::NOTICE_BOARD_LANE_DONE,
+            crate::board::NOTICE_BOARD_AUTO_START,
+        ] {
+            let mut board = message_notice(kind, false);
+            board.kind = kind.to_owned();
+            cases.push(board);
+        }
+        for notice in &cases {
+            store
+                .create_notice_with_desk(notice, now, world.desk, world.hold)
+                .unwrap();
+        }
+        assert_eq!(
+            notice_of(&store, NOTICE_MESSAGE, "ask").notify_after,
+            format_ts(now + if enabled { DESK_HOLD } else { Duration::ZERO })
+        );
+        assert_eq!(
+            notice_of(&store, NOTICE_REVIEW_REQUESTED, "44").notify_after,
+            format_ts(now + if enabled { DESK_HOLD } else { Duration::ZERO })
+        );
+        assert_eq!(
+            notice_of(&store, NOTICE_MESSAGE, "blocking").notify_after,
+            format_ts(now)
+        );
+        deliver_notices(&store, &world, Some(&sender), &mailer, now).unwrap();
+        assert_eq!(sender.sent().len(), if enabled { 5 } else { 7 });
+        if enabled {
+            world.open("ask");
+            deliver_notices(&store, &world, Some(&sender), &mailer, now + DESK_HOLD).unwrap();
+            assert_eq!(sender.sent().len(), 6);
+            assert_eq!(
+                notice_of(&store, NOTICE_MESSAGE, "ask")
+                    .notified_via
+                    .as_deref(),
+                Some("resolved")
+            );
+        }
+        let conn = store.open_desk_log().unwrap();
+        let rows: Vec<(String, i64, Option<String>)> = conn
+            .prepare("SELECT kind, held, outcome FROM push_desk_log ORDER BY kind, notice_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().filter(|(_, held, _)| *held == 1).count(),
+            if enabled { 3 } else { 0 }
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|(_, _, outcome)| outcome.as_deref() == Some("resolved"))
+                .count(),
+            if enabled { 2 } else { 1 }
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|(_, _, outcome)| outcome.as_deref() == Some("push"))
+                .count(),
+            if enabled { 1 } else { 2 }
+        );
+        let in_push_db: i64 = store
+            .open()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'push_desk_log'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(in_push_db, 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn desk_hold_away_and_email_match_unheld_delivery() {
+    let now = at("2026-10-26T10:00:00Z");
+    for enabled in [false, true] {
+        let (store, dir) = temp_store();
+        let world = FakeNoticeWorld::default();
+        let mailer = FakeNoticeMailer::default();
+        let notice = message_notice("away", false);
+        store
+            .create_notice_with_desk(&notice, now, false, enabled)
+            .unwrap();
+        assert_eq!(
+            notice_of(&store, NOTICE_MESSAGE, "away").notify_after,
+            format_ts(now)
+        );
+        deliver_notices(&store, &world, None, &mailer, now).unwrap();
+        assert_eq!(mailer.sent.lock().unwrap().len(), 1);
+        assert_eq!(
+            notice_of(&store, NOTICE_MESSAGE, "away")
+                .notified_via
+                .as_deref(),
+            Some("email")
+        );
+        let outcome: (i64, String) = store
+            .open_desk_log()
+            .unwrap()
+            .query_row("SELECT held, outcome FROM push_desk_log", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(outcome, (0, "email".to_owned()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn desk_log_records_actual_push_millisecond() {
+    let (store, dir) = temp_store();
+    register(&store, "tok1", None);
+    let created = at("2026-10-26T10:00:00Z");
+    let sent = created + Duration::milliseconds(123);
+    store
+        .create_notice_with_desk(&message_notice("precise", false), created, true, false)
+        .unwrap();
+    deliver_notices(
+        &store,
+        &FakeNoticeWorld {
+            desk: true,
+            ..Default::default()
+        },
+        Some(&FakeSender::default()),
+        &FakeNoticeMailer::default(),
+        sent,
+    )
+    .unwrap();
+    let (at_ms, at_desk): (i64, i64) = store
+        .open_desk_log()
+        .unwrap()
+        .query_row(
+            "SELECT sent_at_ms, desk_at_send FROM push_desk_log",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(at_ms, (sent.unix_timestamp_nanos() / 1_000_000) as i64);
+    assert_eq!(at_desk, 1);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn desk_background_actions_match_metric_query() {
+    let sql =
+        include_str!("../../../../docs/autopm/metrics/x-2026w44-desk-push-hold.guard-act.sql");
+    let list = sql
+        .split("e.action NOT IN (")
+        .nth(1)
+        .unwrap()
+        .split(')')
+        .next()
+        .unwrap();
+    let listed: std::collections::BTreeSet<&str> = list
+        .split(',')
+        .map(|s| s.trim().trim_matches('\''))
+        .collect();
+    let code: std::collections::BTreeSet<&str> = crate::owner_events::DESK_BACKGROUND_ACTIONS
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(listed, code);
 }
 
 #[derive(Default)]

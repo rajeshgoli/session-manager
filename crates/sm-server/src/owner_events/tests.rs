@@ -89,6 +89,31 @@ fn list_filters_by_window_surface_and_action() {
 }
 
 #[test]
+fn at_desk_requires_recent_web_action_without_android_activity() {
+    let store = OwnerEventStore::new(temp_db("desk"));
+    let t = 1_800_000;
+    assert!(!store.at_desk(t).unwrap());
+    store
+        .record(&event(t - 300_000, "web", "watch.state"))
+        .unwrap();
+    store
+        .record(&event(t - 1, "agent_prompt", "agent.prompt"))
+        .unwrap();
+    assert!(!store.at_desk(t).unwrap());
+    store
+        .record(&event(t - 300_000, "web", "doc.open"))
+        .unwrap();
+    assert!(store.at_desk(t).unwrap());
+    store.record(&event(t, "android", "inbox.open")).unwrap();
+    assert!(store.at_desk(t).unwrap());
+    store
+        .record(&event(t - 1, "android", "inbox.open"))
+        .unwrap();
+    assert!(!store.at_desk(t).unwrap());
+    assert!(!store.at_desk(t + 300_001).unwrap());
+}
+
+#[test]
 fn repeats_within_a_minute_coalesce_by_surface_device_action_and_target() {
     let store = OwnerEventStore::new(temp_db("repeat"));
     let at = |at_ms: i64, device: Option<&str>, target: Option<&str>| OwnerEvent {

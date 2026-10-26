@@ -20,6 +20,7 @@ const MAX_DEVICE_FIELD_CHARS: usize = 200;
 
 pub(super) fn push_store(state: &AppState) -> OwnerPushStore {
     OwnerPushStore::new(owner_push::push_db_path(&state.config))
+        .with_desk_log(expand_home(&state.config.sm_send.db_path))
 }
 
 /// The owner write guard chain (Cloudflare Access, public edge assertion,
@@ -567,7 +568,7 @@ fn review_notice(state: &AppState, doc: &OwnerDoc, publish: &OwnerDocPublish) ->
 /// creates the notice later.
 pub(super) fn notice_new_message(state: &AppState, message: &OwnerMessage) {
     let notice = message_notice(state, message);
-    if let Err(error) = push_store(state).create_notice(&notice, OffsetDateTime::now_utc()) {
+    if let Err(error) = create_ask_notice(state, &notice, OffsetDateTime::now_utc()) {
         eprintln!(
             "Owner message {}: notice insert failed: {error:#}",
             message.id
@@ -581,12 +582,25 @@ pub(super) fn notice_new_message(state: &AppState, message: &OwnerMessage) {
 /// round's first notice stands for it (sm#2466).
 pub(super) fn notice_review_publish(state: &AppState, doc: &OwnerDoc, publish: &OwnerDocPublish) {
     let notice = review_notice(state, doc, publish);
-    if let Err(error) = push_store(state).create_notice(&notice, OffsetDateTime::now_utc()) {
+    if let Err(error) = create_ask_notice(state, &notice, OffsetDateTime::now_utc()) {
         eprintln!(
             "Owner doc {}: review notice insert failed: {error:#}",
             doc.id
         );
     }
+}
+
+fn create_ask_notice(
+    state: &AppState,
+    notice: &NewNotice,
+    now: OffsetDateTime,
+) -> anyhow::Result<bool> {
+    let world = AppNoticeWorld { state };
+    let desk = world.at_desk(now).unwrap_or_else(|error| {
+        eprintln!("notice desk lookup failed: {error:#}");
+        false
+    });
+    push_store(state).create_notice_with_desk(notice, now, desk, world.desk_hold_on())
 }
 
 /// Whether a `--review` publish repeats a request already notified. An
@@ -611,6 +625,15 @@ impl AppNoticeWorld<'_> {
 }
 
 impl NoticeWorld for AppNoticeWorld<'_> {
+    fn at_desk(&self, at: OffsetDateTime) -> anyhow::Result<bool> {
+        let at_ms = (at.unix_timestamp_nanos() / 1_000_000) as i64;
+        super::owner_events::store(self.state).at_desk(at_ms)
+    }
+
+    fn desk_hold_on(&self) -> bool {
+        crate::autopm::switches::is_on("autopm.desk-push-hold")
+    }
+
     fn still_wanted(&self, notice: &Notice) -> anyhow::Result<bool> {
         match notice.kind.as_str() {
             NOTICE_MESSAGE => {

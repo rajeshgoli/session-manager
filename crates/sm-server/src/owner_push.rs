@@ -139,6 +139,7 @@ pub struct JobOutcome {
 
 pub struct OwnerPushStore {
     db_path: PathBuf,
+    desk_log_path: Option<PathBuf>,
 }
 
 const FOLLOW_COLUMNS: &str = "id, user_id, target_kind, session_id, session_name, job_id, \
@@ -199,7 +200,15 @@ CREATE INDEX IF NOT EXISTS owner_follows_pending ON owner_follows(fired_at, noti
 
 impl OwnerPushStore {
     pub fn new(db_path: PathBuf) -> Self {
-        Self { db_path }
+        Self {
+            db_path,
+            desk_log_path: None,
+        }
+    }
+
+    pub fn with_desk_log(mut self, path: PathBuf) -> Self {
+        self.desk_log_path = Some(path);
+        self
     }
 
     /// Context handoff (sm#1651): pending follows of an agent follow its
