@@ -649,6 +649,23 @@ async fn dismiss_review_clears_waiting() {
     assert_eq!(waiting_on(&f, "retired1").await, json!([]));
 }
 
+/// sm#2531: the agent withdraws its own request, e.g. after the owner
+/// approved in chat.
+#[tokio::test]
+async fn withdraw_review_clears_waiting() {
+    let f = fixture();
+    let doc = publish(&f, "author01", "a", true, None).await;
+    let id = doc["id"].as_str().unwrap();
+    assert_eq!(waiting_on(&f, "author01").await[0]["kind"], "owner_review");
+    let (status, body) =
+        request(&f.app, "POST", &format!("/docs/{id}/withdraw-review"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["state"], "new");
+    assert_eq!(waiting_on(&f, "author01").await, json!([]));
+    let (status, _) = request(&f.app, "POST", &format!("/docs/{id}/withdraw-review"), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "nothing left to withdraw");
+}
+
 #[tokio::test]
 async fn assign_undelivered_review_spawns_agent() {
     let f = fixture();

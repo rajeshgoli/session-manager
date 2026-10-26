@@ -544,7 +544,24 @@ fn waiting_by_ticket(input: &ModelInput) -> BTreeMap<Key, &WaitingRecord> {
         .iter()
         .map(|(key, record)| (key.clone(), record))
         .collect();
+    // A merged or closed PR no longer waits on the owner. The doc sync ends
+    // its review request too, but on a slower pass (sm#2531).
+    let ended_prs: BTreeSet<(String, i64)> = input
+        .prs
+        .values()
+        .flatten()
+        .filter(|pr| pr.state != "OPEN")
+        .map(|pr| (pr.repo.to_ascii_lowercase(), pr.number))
+        .collect();
     for record in &input.waiting {
+        if record.kind == WaitingKind::Review
+            && record
+                .pr
+                .as_ref()
+                .is_some_and(|(repo, pr)| ended_prs.contains(&(repo.to_ascii_lowercase(), *pr)))
+        {
+            continue;
+        }
         let mut tickets: BTreeSet<Key> = by_session
             .get(record.session_id.as_str())
             .into_iter()
