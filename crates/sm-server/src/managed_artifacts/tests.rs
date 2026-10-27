@@ -101,6 +101,67 @@ fn owner_delete_preserves_recipes_reports_dependents_and_refuses_in_use() {
 }
 
 #[test]
+fn agent_delete_is_blocked_only_by_rebuildable_dependents() {
+    let f = Fixture::new();
+    for name in ["input", "rebuildable", "hand", "frozen"] {
+        f.create(name);
+    }
+    let conn = f.svc.store.open().unwrap();
+    conn.execute(
+        "UPDATE artifacts SET recipe_complete=1 WHERE name='rebuildable'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE artifacts SET state='frozen',recipe_complete=1,gpu_hours=2 WHERE name='frozen'",
+        [],
+    )
+    .unwrap();
+    let depend = |dependent: &str| {
+        conn.execute("INSERT INTO artifact_inputs(root,name,input,source,job_id) VALUES(?1,?2,'input','declared','job')", params![f.root.path, dependent]).unwrap();
+    };
+    // An input of a rebuildable dependent is still refused.
+    depend("rebuildable");
+    assert!(f
+        .svc
+        .delete(&f.root, "input", "maker", "spent")
+        .unwrap_err()
+        .to_string()
+        .contains("is an input of"));
+    depend("hand");
+    depend("frozen");
+    // Mixed: one rebuildable dependent still refuses and names only it.
+    let error = f
+        .svc
+        .delete(&f.root, "input", "maker", "spent")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(r#"is an input of ["rebuildable"]"#),
+        "{error}"
+    );
+    assert!(f.path("input").exists());
+    // Only non-rebuildable dependents (live and frozen): the delete proceeds.
+    conn.execute("DELETE FROM artifact_inputs WHERE name='rebuildable'", [])
+        .unwrap();
+    let result = f.svc.delete(&f.root, "input", "maker", "spent").unwrap();
+    assert_eq!(result["state"], "deleted");
+    assert!(!f.path("input").exists());
+    let deleted = result["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "deleted")
+        .unwrap();
+    let payload: Value = serde_json::from_str(deleted["detail_json"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["bypassed_dependents"], json!(["frozen", "hand"]));
+    assert_eq!(
+        f.svc.store.detail(&f.root.path, "frozen").unwrap()["state"],
+        "frozen"
+    );
+}
+
+#[test]
 fn names_and_notes() {
     for name in ["a", "123_data", "a.b-c_9"] {
         validate_name(name).unwrap();
@@ -428,6 +489,11 @@ fn delete_refuses_project_inputs_and_jobs() {
     conn.execute("DELETE FROM artifact_jobs", []).unwrap();
     f.create("456_data");
     conn.execute("INSERT INTO artifact_inputs(root,name,input,job_id) VALUES(?1,'456_data','123_data','job')",[&f.root.path]).unwrap();
+    conn.execute(
+        "UPDATE artifacts SET recipe_complete=1 WHERE name='456_data'",
+        [],
+    )
+    .unwrap();
     assert!(f
         .svc
         .delete(&f.root, "123_data", "maker", "cleanup")
