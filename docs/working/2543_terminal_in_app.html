@@ -124,7 +124,7 @@
 </style>
 
 <h1>2543 — One app: the terminal, documents and pages share one frame</h1>
-<p class="sans"><small>Author: Claude (Opus 5.5) <code>0ba7dfd9</code> · Ticket #2543 · 2026-10-27 · Revision 3</small></p>
+<p class="sans"><small>Author: Claude (Opus 5.5) <code>0ba7dfd9</code> · Ticket #2543 · 2026-10-27 · Revision 4</small></p>
 
 <h2>Memo</h2>
 
@@ -233,15 +233,29 @@
 <tr><td>Live agents and shells list</td><td>Terminal page only</td><td>Sidebar middle, every page: open on a terminal, one line elsewhere. Click opens the terminal.</td></tr>
 <tr><td>Usage meters (Claude, Codex, Mac)</td><td>Foot of the left column; not on the terminal</td><td>Sidebar foot, every page: today's full meters, or one line while the agents list is open</td></tr>
 <tr><td>Search ⌘K</td><td>Top bar; off on the terminal</td><td>Sidebar top; works everywhere, terminal included</td></tr>
-<tr><td>New agent</td><td>Top bar button</td><td><b>+</b> beside the Agents heading; same New session sheet</td></tr>
-<tr><td>Queue "1 running · 0 waiting"</td><td>Top bar</td><td>Beside Queue in the sidebar</td></tr>
-<tr><td>Overnight moon</td><td>Top bar</td><td>Sidebar foot</td></tr>
+<tr><td>New agent</td><td>Top bar button, top right</td><td><b>+</b> at the right end of the sidebar's Agents heading, on every page and in both states; same New session sheet. No New agent button in any top bar.</td></tr>
+<tr><td>Queue "1 running · 0 waiting"</td><td>Top bar</td><td>Beside the Queue link in the sidebar ("1 · 0"); a dot on the Queue icon while page links are icons</td></tr>
+<tr><td>Overnight moon (☾, beside the bug button)</td><td>Top bar</td><td>Sidebar foot row; inside More while the agents list is open</td></tr>
 <tr><td>Agents overview (cards, By repo, With stopped)</td><td>The "Agents" page, landing page</td><td>Same page, reached by the Agents heading; still the landing page</td></tr>
-<tr><td>Analytics, History, Guestbook</td><td>Small links in the left column</td><td>"More" menu, and ⌘K</td></tr>
+<tr><td>Analytics, History, Guestbook</td><td>Their own rows in the left column</td><td>A <b>new</b> "More ▾" menu in the sidebar foot (it does not exist today), and ⌘K. It frees three rows for agents.</td></tr>
 <tr><td>Documents</td><td>Side panel; full screen is a separate site</td><td>Main area, sidebar folded; never the side panel</td></tr>
 <tr><td>Agent details and messages, queue job, ticket, Notes</td><td>Side panel</td><td>Side panel, unchanged</td></tr>
 </tbody>
 </table>
+
+<h3>One top bar, about the thing in front of you</h3>
+<p>Today the top bar mixes two jobs: it is about the page (its title), and it carries app-wide things (search, queue status, the overnight moon, New agent). The terminal's bar does only the first job, which is why the two look different. The fix is one rule for every view: <b>the top bar is only about what you are looking at</b>. The app-wide things move to the sidebar, where they sit in the same place on every screen. What is left lines up in the same slots everywhere:</p>
+<table>
+<thead><tr><th style="width:17%">View</th><th style="width:27%">Left: what you are looking at</th><th>Middle and right: actions on it</th><th style="width:13%">Far right</th></tr></thead>
+<tbody>
+<tr><td>Agents overview</td><td>Agents · 1 needs you · 2 moving</td><td>By attention / By repo · Live / With stopped (today's row under the bar moves up into it)</td><td>Bug</td></tr>
+<tr><td>Notes</td><td>Notes</td><td>+ New (moves up the same way)</td><td>Bug</td></tr>
+<tr><td>Board, Queue, Inbox, Artifacts, Settings…</td><td>Page name</td><td>Nothing new; their own controls stay in the page</td><td>Bug</td></tr>
+<tr><td>Terminal</td><td>● sm-2543 (21)</td><td>Notes ⌘J · Details · Hand off… · ⋯ · Redraw</td><td>Bug · Retire</td></tr>
+<tr><td>Document</td><td>← document title</td><td>version · Review · Ask</td><td>Bug</td></tr>
+</tbody>
+</table>
+<p>The queue status ("1 running · 0 waiting") leaves the top bar for the Queue link in the sidebar. While the page links are icons, the Queue icon carries a dot that turns amber when a job has waited 30 minutes.</p>
 
 <h3>How it flows: one evening</h3>
 <p>You are watching far-2390 in its terminal. The sidebar shows Inbox 1. You click Inbox and read far-2419's question. You click far-2419 in the sidebar; its terminal opens, and you answer. Its message mentions the iteration 11 memo; you click the link, and the memo fills the screen with the sidebar folded. ⌘[ takes you back to far-2419's terminal, still connected and up to date. You click Queue to see whether the backtest finished, then "10 live ›" and far-2390. You never leave the tab, and the sidebar never moves.</p>
@@ -275,7 +289,8 @@
 <p>After the first ticket I will ask you to try one thing: from a terminal, click Board, then the same agent in the sidebar, and see its screen come straight back. After the second: click a document link in an agent's Details, read, press ⌘[.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p><b>The sidebar takes turns for its height.</b> Revision 2 stacked page links, agents and meters at full size and claimed they fit. Your screenshots show they do not: today's page links and meters already fill the column with four agents, and you usually run 8–10. Now the agents list opens on a terminal, page links and meters shrink to one line each, and the reverse happens on other pages. The figures are drawn to scale with ten agents.</p>
+<p><b>One rule for the top bar.</b> The top bar is only about what you are looking at; search, queue status, the moon and New agent move to the sidebar. The new table above shows each view's bar in the same slots.</p>
+<p><b>New agent and More, spelled out.</b> New agent is the <b>+</b> on the sidebar's Agents heading, on every page; no top bar has it. "More" is a new menu holding Analytics, History and Guestbook.</p>
 
 <!-- memo-print-scope keys on this divider: everything after it is hidden when printing
      "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
@@ -344,7 +359,9 @@
 <table>
 <thead><tr><th>View</th><th>Left</th><th>Right</th></tr></thead>
 <tbody>
-<tr><td>List pages</td><td>Page name</td><td>Bug button. (Search, queue meter, moon and New agent move to the sidebar.)</td></tr>
+<tr><td>Agents overview</td><td>"Agents" and today's attention summary buttons (<code>agents.js</code> <code>.toolbar .sum</code>)</td><td>Today's two <code>Seg</code> toggles (Order, Show), then Bug. The <code>.toolbar</code> row leaves the page content.</td></tr>
+<tr><td>Notes</td><td>"Notes"</td><td>The page's "+ New" button (<code>notes.js</code>), then Bug; it leaves the page content.</td></tr>
+<tr><td>Other list pages</td><td>Page name</td><td>Bug. Page content unchanged.</td></tr>
 <tr><td>Terminal (wide)</td><td>Today's: dot, name, context ring, connection word when not live</td><td>Today's: Notes ⌘J, Details, Hide (shells), Hand off…, ⋯, hidden shells, Open in Claude, Redraw, Bug, Retire. The "sm" home link leaves the bar (the sidebar has it).</td></tr>
 <tr><td>Terminal (phone)</td><td colspan="2">Today's phone bar, unchanged, including its "sm" link and back arrow.</td></tr>
 <tr><td>Document</td><td>← back, document title</td><td>The reader's existing controls (version, Review, Ask), Bug.</td></tr>
@@ -356,7 +373,7 @@
 <ol>
 <li><b>Heading.</b> "Agents", then "<i>n</i> live" with › (shrunk) or ⌄ (open), then "<i>m</i> needs you" in magenta when m&gt;0, then a <b>+</b> button at the right. The word "Agents" navigates to <code>/</code> (the overview); "<i>n</i> live" toggles open and shrunk (B.4). <b>+</b> opens today's New session sheet (<code>bus.emit('new-agent')</code>), which already offers agent or terminal.</li>
 <li><b>Rows</b> are today's <code>Switcher</code> rows and grouping (<code>switcherGroups</code>), unchanged: two lines, ✓ mark-answered, Idle collapsed with its count, Terminals section, hidden shells excluded except the current one. A click navigates to <code>/terminal/&lt;id&gt;</code>. The current row is highlighted only on that agent's terminal view.</li>
-<li><b>Overview.</b> The Agents page (<code>/</code>) is unchanged in content: attention summary, By attention/By repo, Live/With stopped, cards, details band, shell tiles, keys j/k/Enter/t/c/x. Its page link leaves the page list (the heading replaces it); <code>g a</code> still goes there.</li>
+<li><b>Overview.</b> The Agents page (<code>/</code>) is unchanged in content except that its toolbar moves into the top bar (C): attention summary, By attention/By repo, Live/With stopped, cards, details band, shell tiles, keys j/k/Enter/t/c/x. Its page link leaves the page list (the heading replaces it); <code>g a</code> still goes there.</li>
 </ol>
 
 <h3 id="e">E. Terminal view and kept connection</h3>
@@ -415,7 +432,7 @@
 </ol>
 
 <h3 id="z">Z. FAQ</h3>
-<p><b>How did the design get here?</b> Revision 1 kept the page links as a narrow icon column beside the terminal's agents list; the owner found two left columns overloaded and bolted on, and it left the Agents page and documents unaddressed. Revision 2 merged both lists into one sidebar, made the Agents page the overview behind the heading, and moved documents out of the side panel; it did not fit at real sizes. Revision 3 makes the sidebar's parts take turns. The separate "Terminal" page link and <code>g t</code> shortcut of revision 1 are gone: every agent is in the sidebar.</p>
+<p><b>How did the design get here?</b> Revision 1 kept the page links as a narrow icon column beside the terminal's agents list; the owner found two left columns overloaded and bolted on, and it left the Agents page and documents unaddressed. Revision 2 merged both lists into one sidebar, made the Agents page the overview behind the heading, and moved documents out of the side panel; it did not fit at real sizes. Revision 3 makes the sidebar's parts take turns, sized on real screenshots for 8–10 agents. Revision 4 gives the top bar one rule (only about what you are looking at) and states where New agent, the moon and the new More menu live. The separate "Terminal" page link and <code>g t</code> shortcut of revision 1 are gone: every agent is in the sidebar.</p>
 <p><b>Why keep the Agents overview at all?</b> It is the only place showing stopped agents, the By repo grouping, and per-agent facts side by side. Web request logs for the last two weeks show the terminal screen about four times as busy as the Agents page, so it is a secondary view, but not an empty one. If it stays unused after this ships, landing on the terminal of the agent that most needs you is a one-line change.</p>
 <p><b>Why 15 minutes for the kept terminal?</b> It covers a look at Board, Queue or a document and back, which is what the second tab is used for, without a forgotten terminal streaming over the Cloudflare relay all afternoon. It is a constant.</p>
 <p><b>Why only one kept terminal?</b> Moving between agents through the sidebar reconnects today and is not part of the complaint. Keeping several multiplies streams for little gain.</p>
