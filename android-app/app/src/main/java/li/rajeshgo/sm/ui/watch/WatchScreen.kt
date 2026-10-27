@@ -169,6 +169,8 @@ fun WatchScreen(
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf("all") }
     var toast by remember { mutableStateOf<String?>(null) }
+    // Terminal text waiting in the copy dialog (#2547).
+    var copyText by remember { mutableStateOf<String?>(null) }
     var openPage by remember { mutableStateOf<ReaderPage?>(null) }
     var followDialogSession by remember { mutableStateOf<ClientSession?>(null) }
     var pendingNotificationAction by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -568,12 +570,19 @@ fun WatchScreen(
                 onRendererWritten = viewModel::markTerminalRendererWritten,
                 onDetach = viewModel::detachTerminal,
                 onReconnect = viewModel::reconnectTerminal,
-                onCopy = { selectedText ->
+                onCopy = { selectedText -> copyText = selectedText.ifBlank { terminal.copyBuffer } },
+            )
+        }
+        copyText?.let { text ->
+            TerminalCopyDialog(
+                text = text,
+                onCopyAll = {
                     val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
-                    val copiedText = selectedText.ifBlank { terminal.copyBuffer }
-                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm terminal", copiedText))
+                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm terminal", text))
+                    copyText = null
                     toast = "Terminal output copied"
                 },
+                onDismiss = { copyText = null },
             )
         }
         followDialogSession?.let { session ->
@@ -781,6 +790,34 @@ private fun MobileTerminalOverlay(
             }
         }
     }
+}
+
+/**
+ * The terminal's text, selectable with Android's own handles: long-press, drag the
+ * handles, then Copy in the menu that appears. Copy all takes everything. Opens at
+ * the latest lines (#2547).
+ */
+@Composable
+private fun TerminalCopyDialog(text: String, onCopyAll: () -> Unit, onDismiss: () -> Unit) {
+    val vertical = rememberScrollState()
+    LaunchedEffect(text) { vertical.scrollTo(vertical.maxValue) }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Copy from terminal") },
+        text = {
+            androidx.compose.foundation.text.selection.SelectionContainer {
+                Text(
+                    text = text,
+                    modifier = Modifier.heightIn(max = 480.dp).verticalScroll(vertical).horizontalScroll(rememberScrollState()),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    softWrap = false,
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = onCopyAll) { Text("Copy all") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
 }
 
 @Composable

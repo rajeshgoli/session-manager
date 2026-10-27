@@ -279,3 +279,33 @@ test('provider-owned history takes precedence over incidental xterm history and 
     assert.equal(r.inputs.length, 2);
   } finally { r.term.dispose(); }
 });
+
+test('mouse tracking requests are kept from xterm; scrolling still sends wheel reports while tmux wants the mouse', async () => {
+  const r = renderer();
+  try {
+    r.api.smWriteText(1, '\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006hpane');
+    await drain(r.term);
+    assert.equal(r.term.modes.mouseTrackingMode, 'none', 'a tap is not reported to tmux');
+    assert.equal(r.api.smScrollLines(-2, NaN, NaN), true);
+    assert.ok(r.inputs.length >= 1 && r.inputs.every(data => /^\x1b\[<64;[^;]+;[^;]+M$/.test(data)), JSON.stringify(r.inputs));
+    r.inputs.length = 0;
+    r.api.smWriteText(2, '\x1b[?1002l\x1b[?1000l');
+    await drain(r.term);
+    r.api.smScrollLines(-6, NaN, NaN);
+    assert.deepEqual(r.inputs, ['\x1b[5~'], 'without a mouse request the alternate screen pages instead');
+  } finally { r.term.dispose(); }
+});
+
+test('a mouse request sharing a sequence with the alternate screen draws in the alternate screen', async () => {
+  const r = renderer();
+  try {
+    r.api.smWriteText(1, 'normal\x1b[?1049;1000;1006hALT');
+    await drain(r.term);
+    await drain(r.term);
+    assert.equal(r.term.buffer.active.type, 'alternate');
+    assert.equal(r.term.buffer.active.getLine(0).translateToString(true).trim(), 'ALT');
+    assert.equal(r.term.modes.mouseTrackingMode, 'none');
+    r.api.smScrollLines(-1, NaN, NaN);
+    assert.match(r.inputs.at(-1), /^\x1b\[<64;/);
+  } finally { r.term.dispose(); }
+});
