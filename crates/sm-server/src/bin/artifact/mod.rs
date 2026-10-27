@@ -37,6 +37,11 @@ enum ArtifactCommand {
     Done {
         name: String,
     },
+    /// Become the owner of a discovered folder you recorded, when discovery
+    /// had sent its record request to another session.
+    Adopt {
+        name: String,
+    },
     Consumer {
         name: String,
         #[arg(value_parser=["add","remove"])]
@@ -181,6 +186,7 @@ pub(crate) fn run(client: &ApiClient, args: ArtifactArgs) -> Result<()> {
         ArtifactCommand::Rebuild { name } => (name, "rebuild", json!({})),
         ArtifactCommand::Measure { name } => (name, "measure", json!({})),
         ArtifactCommand::Done { name } => (name, "done", json!({})),
+        ArtifactCommand::Adopt { name } => (name, "adopt", json!({})),
         ArtifactCommand::Consumer {
             name,
             operation,
