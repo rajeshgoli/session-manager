@@ -194,6 +194,36 @@
     });
     term.loadAddon(fitAddon);
 
+    // tmux with `mouse on` asks the terminal to report clicks, so a tap would reach
+    // tmux. The page keeps taps for itself and only remembers the request: while the
+    // application wants the mouse, scrolling still goes to it as wheel reports (#2547).
+    const MOUSE_TRACKING_MODES = new Set([9, 1000, 1001, 1002, 1003]);
+    let mouseWanted = false;
+    let mouseReleasePending = false;
+    function mouseTrackingHandler(set) {
+      return params => {
+        const flat = params.map(p => Array.isArray(p) ? p[0] : p);
+        const rest = flat.filter(p => !MOUSE_TRACKING_MODES.has(p));
+        if (rest.length === flat.length) return false;
+        mouseWanted = set;
+        if (!rest.length || !set) return !rest.length;
+        // Another mode shares the sequence (an alternate screen, say): xterm applies
+        // it all in place, and tracking goes off once this chunk is parsed. Nothing
+        // is written into the stream, which may be partway through an escape sequence.
+        mouseReleasePending = true;
+        return false;
+      };
+    }
+    term.onWriteParsed(() => {
+      if (!mouseReleasePending) return;
+      mouseReleasePending = false;
+      // xterm has no public switch for this; the vendored version is pinned.
+      const mouse = term._core && term._core.coreMouseService;
+      if (mouse) mouse.activeProtocol = "NONE";
+    });
+    term.parser.registerCsiHandler({ prefix: "?", final: "h" }, mouseTrackingHandler(true));
+    term.parser.registerCsiHandler({ prefix: "?", final: "l" }, mouseTrackingHandler(false));
+
     let ready = false;
     let opened = false;
     let lastResize = "";
@@ -342,7 +372,7 @@
     }
 
     function terminalMouseTrackingEnabled() {
-      return Boolean(term && term.modes && term.modes.mouseTrackingMode !== "none");
+      return mouseWanted;
     }
 
     function terminalCellFromClient(clientX, clientY) {

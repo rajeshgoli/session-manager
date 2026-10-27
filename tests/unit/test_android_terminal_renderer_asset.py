@@ -63,7 +63,7 @@ def test_terminal_asset_forwards_alternate_screen_scroll_as_wheel_input():
     assert "function terminalUsesAlternateBuffer()" in source
     assert "activeBuffer.type === \"alternate\"" in source
     assert "function terminalMouseTrackingEnabled()" in source
-    assert "term.modes.mouseTrackingMode !== \"none\"" in source
+    assert "return mouseWanted;" in source
     assert "function terminalCellFromClient(clientX, clientY)" in source
     assert "function sendTerminalWheel(lines, clientX, clientY)" in source
     assert "function sendTerminalPageScroll(lines)" in source
