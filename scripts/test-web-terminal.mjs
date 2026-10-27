@@ -65,6 +65,7 @@ function fakeSocket() {
       if (frame.type === 'auth') {
         reply({ type: 'status', state: 'attached' }, 5);
         reply({ type: 'output', sequence: 1, data: btoa(window.termOutput || 'rajesh@studio ~ % ') }, 10);
+        if (window.termOutput2) reply({ type: 'output', sequence: 2, data: btoa(window.termOutput2) }, 30);
       }
       if (frame.type === 'ping') reply({ type: 'pong', id: frame.id }, this.url.startsWith('ws://localhost') ? 2 : 40);
     }
@@ -591,11 +592,14 @@ test('a mouse request sharing a sequence with the alternate screen draws in the 
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
     const { page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
-    await page.addInitScript(() => { window.termOutput = 'normal screen text\x1b[?1049;1000;1006hALTERNATE SCREEN'; });
+    // The first frame ends partway through a colour sequence; the bridge sends the rest next.
+    await page.addInitScript(() => { window.termOutput = 'normal screen text\x1b[?1049;1000;1006hALTERNATE SCREEN \x1b['; window.termOutput2 = '31mRED'; });
     await page.goto(`${ORIGIN}/terminal/iter8-run`);
     await page.locator('.term-page[data-connection="Live"]').waitFor();
     await page.locator('.xterm-rows', { hasText: 'ALTERNATE SCREEN' }).waitFor();
     assert.ok(!(await page.locator('.xterm-rows').innerText()).includes('normal screen text'));
+    await page.locator('.xterm-rows', { hasText: 'RED' }).waitFor();
+    assert.ok(!(await page.locator('.xterm-rows').innerText()).includes('31m'), 'the split colour sequence stays intact');
     const box = await page.evaluate(() => { const r = document.querySelector('.xterm-screen').getBoundingClientRect(); return { x: r.left, y: r.top }; });
     await page.mouse.click(box.x + 40, box.y + 30);
     await page.waitForTimeout(100);

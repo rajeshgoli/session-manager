@@ -309,3 +309,17 @@ test('a mouse request sharing a sequence with the alternate screen draws in the 
     assert.match(r.inputs.at(-1), /^\x1b\[<64;/);
   } finally { r.term.dispose(); }
 });
+
+test('a combined mouse request leaves an escape sequence split across frames intact', async () => {
+  const r = renderer();
+  try {
+    r.api.smWriteText(1, '\x1b[?1049;1000h\x1b[');
+    await drain(r.term);
+    r.api.smWriteText(2, '31mRED');
+    await drain(r.term);
+    const line = r.term.buffer.active.getLine(0);
+    assert.equal(line.translateToString(true).trim(), 'RED');
+    assert.equal(line.getCell(line.translateToString(false).indexOf('R')).getFgColor(), 1, 'RED is drawn red');
+    assert.equal(r.term.modes.mouseTrackingMode, 'none');
+  } finally { r.term.dispose(); }
+});

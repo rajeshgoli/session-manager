@@ -198,28 +198,29 @@
     // tmux. The page keeps taps for itself and only remembers the request: while the
     // application wants the mouse, scrolling still goes to it as wheel reports (#2547).
     const MOUSE_TRACKING_MODES = new Set([9, 1000, 1001, 1002, 1003]);
-    // The page's own tracking-off sequence, in an order applications do not send.
-    const MOUSE_RELEASE = "1003;1002;1001;1000;9";
     let mouseWanted = false;
-    let mouseReleases = 0;
+    let mouseReleasePending = false;
     function mouseTrackingHandler(set) {
       return params => {
         const flat = params.map(p => Array.isArray(p) ? p[0] : p);
         const rest = flat.filter(p => !MOUSE_TRACKING_MODES.has(p));
         if (rest.length === flat.length) return false;
-        if (!set && mouseReleases && params.join(";") === MOUSE_RELEASE) {
-          mouseReleases -= 1;
-          return false;
-        }
         mouseWanted = set;
         if (!rest.length || !set) return !rest.length;
         // Another mode shares the sequence (an alternate screen, say): xterm applies
-        // it all in place, and tracking goes off again straight after this chunk.
-        mouseReleases += 1;
-        term.write(`\x1b[?${MOUSE_RELEASE}l`);
+        // it all in place, and tracking goes off once this chunk is parsed. Nothing
+        // is written into the stream, which may be partway through an escape sequence.
+        mouseReleasePending = true;
         return false;
       };
     }
+    term.onWriteParsed(() => {
+      if (!mouseReleasePending) return;
+      mouseReleasePending = false;
+      // xterm has no public switch for this; the vendored version is pinned.
+      const mouse = term._core && term._core.coreMouseService;
+      if (mouse) mouse.activeProtocol = "NONE";
+    });
     term.parser.registerCsiHandler({ prefix: "?", final: "h" }, mouseTrackingHandler(true));
     term.parser.registerCsiHandler({ prefix: "?", final: "l" }, mouseTrackingHandler(false));
 

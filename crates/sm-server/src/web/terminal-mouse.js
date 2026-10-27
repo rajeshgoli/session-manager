@@ -7,8 +7,6 @@
 
 // DECSET modes that make the terminal report clicks, drags or motion.
 const TRACKING = new Set([9, 1000, 1001, 1002, 1003]);
-// The page's own tracking-off sequence, in an order applications do not send.
-const RELEASE = '1003;1002;1001;1000;9';
 
 /** The private-mode params left once mouse tracking is taken out, and whether any was there. */
 export function withoutTracking(params) {
@@ -41,24 +39,29 @@ export function wheelTicks(event, cellHeight, carry) {
  * the mouse; while the app wants the mouse, the wheel goes to it as SGR reports.
  */
 export function installPageMouse(terminal, host, send, copyText) {
-  let wanted = false, releases = 0;
+  let wanted = false, release = false;
   const carry = { value: 0 };
   const handler = (set) => (params) => {
     const { tracking, rest } = withoutTracking(params);
     if (!tracking) return false;
-    // Our own release (below) passes through and leaves `wanted` alone.
-    if (!set && releases && params.join(';') === RELEASE) { releases--; return false; }
     wanted = set;
     if (!rest.length || !set) return !rest.length;
     // Another mode shares the sequence (an alternate screen, say). xterm applies it
-    // all here, so output after it lands in the right buffer, and tracking is
-    // switched off again straight after this chunk.
-    releases++;
-    terminal.write(`\x1b[?${RELEASE}l`);
+    // all here, so output after it lands in the right buffer, and tracking goes off
+    // once this chunk is parsed. Nothing is written into the application's stream,
+    // which may be partway through its next escape sequence.
+    release = true;
     return false;
   };
   const on = terminal.parser.registerCsiHandler({ prefix: '?', final: 'h' }, handler(true));
   const off = terminal.parser.registerCsiHandler({ prefix: '?', final: 'l' }, handler(false));
+  const parsed = terminal.onWriteParsed(() => {
+    if (!release) return;
+    release = false;
+    // xterm has no public switch for this; the vendored version is pinned.
+    const mouse = terminal._core?.coreMouseService;
+    if (mouse) mouse.activeProtocol = 'NONE';
+  });
   terminal.attachCustomWheelEventHandler((event) => {
     if (!wanted || event.deltaY === 0) return true;
     const screen = terminal.element?.querySelector('.xterm-screen');
@@ -103,6 +106,6 @@ export function installPageMouse(terminal, host, send, copyText) {
       copy();
       return true;
     },
-    dispose() { on.dispose(); off.dispose(); selection.dispose(); button.remove(); },
+    dispose() { on.dispose(); off.dispose(); parsed.dispose(); selection.dispose(); button.remove(); },
   };
 }
