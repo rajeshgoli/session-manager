@@ -124,16 +124,16 @@
 </style>
 
 <h1>2543 — One app: the terminal, documents and pages share one frame</h1>
-<p class="sans"><small>Author: Claude (Opus 5.5) <code>0ba7dfd9</code> · Ticket #2543 · 2026-10-27 · Revision 2</small></p>
+<p class="sans"><small>Author: Claude (Opus 5.5) <code>0ba7dfd9</code> · Ticket #2543 · 2026-10-27 · Revision 3</small></p>
 
 <h2>Memo</h2>
 
-<p><b>I recommend that the terminal page's layout become the layout of the whole web app.</b> Every page gets one left sidebar. Its top half holds the page links (Inbox, Board, Queue…). Its lower half holds the live agents and shells, the list that today exists only on the terminal page. The Agents page becomes the overview you reach by clicking the "Agents" heading. A terminal and a document become two <i>focus views</i>: they fill the space right of the sidebar. A document folds the sidebar away so you can read. The side panel on the right goes back to small things about what you are looking at: details, messages, a queue job, notes. Documents no longer open there.</p>
+<p><b>I recommend that the terminal page's layout become the layout of the whole web app.</b> Every page gets one left sidebar with three parts: page links (Inbox, Board, Queue…), the live agents and shells (the list that today exists only on the terminal page), and usage meters. They take turns for the height. On a terminal, the agents list is open and the page links and meters shrink to one line each. On every other page, page links and meters are open as today and the agents list shrinks to one line. A click on a shrunk part opens it. The Agents page becomes the overview you reach by clicking the "Agents" heading. A terminal and a document become two <i>focus views</i>: they fill the space right of the sidebar. A document folds the sidebar away so you can read. The side panel on the right goes back to small things about what you are looking at: details, messages, a queue job, notes. Documents no longer open there.</p>
 
-<p>The result is one sidebar and one top bar on every screen, both always in the same place. Getting from a terminal to Board and back is one click each way, as it is between any other two pages.</p>
+<p>The result is one sidebar and one top bar on every screen, both always in the same place. From a terminal, any page is one click away. From any page, an agent that needs you is one click away and any other agent two; ⌘[ returns to the terminal you just left, still connected.</p>
 
 <dl class="vocab">
-  <dt>Sidebar</dt><dd>The single left column on every page. Top: "sm", the search box (⌘K), page links with their badges. Middle: <b>Agents</b> heading, then the live agents and shells grouped Needs you / Moving / Idle / Terminals. Bottom: usage meters, overnight moon, Settings. It folds to a thin strip with ⌘\ or a click on that strip.</dd>
+  <dt>Sidebar</dt><dd>The single left column on every page: "sm" and the search box (⌘K); page links with their badges; the <b>Agents</b> heading and the live agents and shells, grouped Needs you / Finished / Moving / Waiting / Idle / Terminals; usage meters and Settings. The agents list is either <i>open</i> (page links shrink to a row of icons, meters to one line) or <i>shrunk</i> (one line, plus agents that need you). The whole sidebar also folds to a thin strip with ⌘\ or a click on that strip.</dd>
   <dt>Focus view</dt><dd>A page whose subject is one thing that wants the whole width: an agent's or shell's terminal, or a document.</dd>
   <dt>Top bar</dt><dd>The 40-pixel bar above the main area. Left: what you are looking at (a page name, an agent's name and context ring, a document's title). Right: actions on it. Today's terminal page bar is the model.</dd>
   <dt>Side panel</dt><dd>The resizable column on the right: an agent's details and message thread, a queue job, a ticket, Notes.</dd>
@@ -142,67 +142,74 @@
 <h3>What you see</h3>
 
 <figure>
-<svg class="mock" viewBox="0 0 720 372" role="img" aria-label="Terminal view: sidebar with pages, agents, meters; agent bar; terminal">
+<svg class="mock" viewBox="0 0 720 372" role="img" aria-label="Terminal view: sidebar with page icon row, ten agents, one-line meters; agent bar; terminal">
   <rect class="frame" x="0.5" y="0.5" width="719" height="371" rx="4"/>
   <rect class="side" x="0.5" y="0.5" width="160" height="371"/>
-  <text class="b" x="10" y="18" style="fill:var(--blue)">sm</text><text class="xs" x="148" y="18">‹</text>
-  <rect class="box" x="8" y="26" width="144" height="16" rx="3"/><text class="xs" x="14" y="37">Search or jump…</text><text class="xs" x="130" y="37">⌘K</text>
-  <text x="14" y="60">Inbox</text><text x="146" y="60" class="b" style="fill:#a21caf">1</text>
-  <text x="14" y="76">Board</text>
-  <text x="14" y="92">Queue</text><text class="xs" x="114" y="92">1 run · 0</text>
-  <text x="14" y="108">Artifacts</text>
-  <text x="14" y="124">Notes</text>
-  <line x1="8" x2="152" y1="134" y2="134" stroke="var(--rule)"/>
-  <text class="b" x="10" y="148">Agents</text><text class="xs" x="48" y="148">1 needs you</text><text class="b" x="144" y="148">+</text>
-  <text class="h" x="10" y="164" style="fill:#a21caf">NEEDS YOU</text>
-  <circle class="att" cx="14" cy="174" r="3"/><text class="b" x="22" y="177">far-2419-o-h3</text><text x="144" y="177" style="fill:#a21caf">✓</text>
-  <text class="xs" x="22" y="188" style="fill:#a21caf">◆ 41h: Review iteration 11 memo</text>
-  <text class="h" x="10" y="204" style="fill:var(--green)">MOVING</text>
-  <rect class="sel" x="1" y="208" width="159" height="26"/><rect x="1" y="208" width="2.5" height="26" style="fill:var(--blue)"/>
-  <circle class="mov" cx="14" cy="216" r="3"/><text class="b" x="22" y="219">sm-2540</text><text class="xs" x="22" y="230" style="fill:var(--green)">Working 0m</text>
-  <circle class="mov" cx="14" cy="242" r="3"/><text class="b" x="22" y="245">far-2390</text><text class="xs" x="22" y="256" style="fill:var(--green)">▶ Background 14m of 4h</text>
-  <text class="xs" x="10" y="274">IDLE · 4 ›</text>
-  <text class="h" x="10" y="290" style="fill:var(--ink-3)">TERMINALS</text>
-  <text class="xs" x="12" y="302">▹</text><text x="22" y="302">studio-zsh</text>
-  <line x1="8" x2="152" y1="318" y2="318" stroke="var(--rule)"/>
-  <text class="xs" x="10" y="331">Claude 0% · week 24%   Codex 6%</text>
-  <text class="xs" x="10" y="344">Mac 98/256G · CPU 100% · GPU 0%</text>
-  <text class="xs" x="10" y="362">⚙ Settings   ☽ Overnight   More ▾</text>
+  <text class="b" x="8" y="15" style="fill:var(--blue)">sm</text>
+  <rect class="box" x="26" y="5" width="126" height="14" rx="3"/><text class="xs" x="31" y="15">Search or jump…</text><text class="xs" x="132" y="15">⌘K</text>
+  <text x="10" y="35">✉</text><circle class="att" cx="20" cy="27" r="2"/><text x="31" y="35">▦</text><text x="52" y="35">≡</text><text x="73" y="35">◫</text><text x="94" y="35">✎</text><text x="117" y="35">⋯</text><text x="138" y="35">⚙</text>
+  <line x1="6" x2="154" y1="41" y2="41" stroke="var(--rule)"/>
+  <text class="b" x="8" y="53">Agents</text><text class="xs" x="44" y="53">10 live ⌄ · 1 needs you</text><text class="b" x="146" y="53">+</text>
+  <text class="h" x="8" y="66" style="fill:#a21caf">NEEDS YOU</text>
+  <circle class="att" cx="12" cy="73" r="2.5"/><text class="b" x="19" y="76">far-2419-o-h3</text><text x="146" y="76" style="fill:#a21caf">✓</text>
+  <text class="xs" x="19" y="86" style="fill:#a21caf">◆ 41h: Review iteration 11 memo</text>
+  <text class="h" x="8" y="100" style="fill:var(--blue)">FINISHED</text>
+  <circle cx="12" cy="107" r="2.5" style="fill:var(--blue)"/><text class="b" x="19" y="110">sm-2544</text>
+  <text class="xs" x="19" y="120" style="fill:var(--blue)">✔ Fixed and live: an agent that…</text>
+  <text class="h" x="8" y="134" style="fill:var(--green)">MOVING</text>
+  <rect class="sel" x="1" y="137" width="159" height="22"/><rect x="1" y="137" width="2.5" height="22" style="fill:var(--blue)"/>
+  <circle class="mov" cx="12" cy="143" r="2.5"/><text class="b" x="19" y="146">sm-2543</text><text class="xs" x="19" y="156" style="fill:var(--green)">Working 0m</text>
+  <circle class="mov" cx="12" cy="165" r="2.5"/><text class="b" x="19" y="168">far-2390-h2</text><text class="xs" x="19" y="178" style="fill:var(--green)">▶ Background running 39m of 4h</text>
+  <circle class="mov" cx="12" cy="187" r="2.5"/><text class="b" x="19" y="190">far-2454</text><text class="xs" x="19" y="200" style="fill:var(--green)">▶ Tests running 3m of 15m</text>
+  <circle class="mov" cx="12" cy="209" r="2.5"/><text class="b" x="19" y="212">sm-2537</text><text class="xs" x="19" y="222" style="fill:var(--green)">Working 2m</text>
+  <text class="h" x="8" y="236" style="fill:var(--orange)">WAITING</text>
+  <circle cx="12" cy="243" r="2.5" style="fill:var(--orange)"/><text class="b" x="19" y="246">sm-2540</text><text class="xs" x="19" y="256" style="fill:var(--orange)">❚❚ Waiting on review by GitHub Codex</text>
+  <circle cx="12" cy="265" r="2.5" style="fill:var(--orange)"/><text class="b" x="19" y="268">far-2431</text><text class="xs" x="19" y="278" style="fill:var(--orange)">❚❚ Waiting on queue: perf slot</text>
+  <text class="xs" x="8" y="294">IDLE · 2 ›</text>
+  <text class="h" x="8" y="308" style="fill:var(--ink-3)">TERMINALS</text>
+  <text class="xs" x="10" y="320">▹</text><text x="19" y="320">studio-zsh</text>
+  <line x1="6" x2="154" y1="354" y2="354" stroke="var(--rule)"/>
+  <text class="xs" x="8" y="366">Claude 2%·25%  Codex 6%  CPU <tspan style="fill:var(--red)">100%</tspan></text>
   <rect class="bar" x="160.5" y="0.5" width="559" height="26"/>
-  <circle class="mov" cx="172" cy="14" r="3.5"/><text class="b" x="180" y="17">sm-2540</text><circle cx="236" cy="14" r="7" fill="none" stroke="var(--green)"/><text class="xs" x="231" y="17">17</text>
+  <circle class="mov" cx="172" cy="14" r="3.5"/><text class="b" x="180" y="17">sm-2543</text><circle cx="236" cy="14" r="7" fill="none" stroke="var(--green)"/><text class="xs" x="231" y="17">21</text>
   <text class="xs" x="420" y="17">Notes ⌘J   Details   Hand off…   ⋯    ↻   🐞</text><text class="xs" x="680" y="17" style="fill:var(--red)">Retire</text>
   <rect class="term" x="160.5" y="26.5" width="559" height="345"/>
   <text class="mono" x="172" y="48">Claude Code v2.1.285 · Opus 5.5 (1M context)</text>
-  <text class="mono" x="172" y="70">❯ You own #2540 in rajeshgoli/session-manager. Begin</text>
-  <text class="mono" x="172" y="88">● Claimed #2540; reading terminal-mouse.js now.</text>
-  <text class="mono" x="172" y="106">● Running 1 shell command…</text>
+  <text class="mono" x="172" y="70">❯ You own #2543 in rajeshgoli/session-manager. Begin</text>
+  <text class="mono" x="172" y="88">● Claimed #2543; mapping the web app shell.</text>
   <text class="mono" x="172" y="340">❯ ▌</text>
-  <g><circle class="tagc" cx="160" cy="92" r="7"/><text x="157" y="95" style="fill:#fff;font-weight:700">1</text></g>
-  <g><circle class="tagc" cx="160" cy="221" r="7"/><text x="157" y="224" style="fill:#fff;font-weight:700">2</text></g>
-  <g><circle class="tagc" cx="160" cy="338" r="7"/><text x="157" y="341" style="fill:#fff;font-weight:700">3</text></g>
+  <g><circle class="tagc" cx="160" cy="31" r="7"/><text x="157" y="34" style="fill:#fff;font-weight:700">1</text></g>
+  <g><circle class="tagc" cx="160" cy="200" r="7"/><text x="157" y="203" style="fill:#fff;font-weight:700">2</text></g>
+  <g><circle class="tagc" cx="160" cy="362" r="7"/><text x="157" y="365" style="fill:#fff;font-weight:700">3</text></g>
   <g><circle class="tagc" cx="400" cy="14" r="7"/><text x="397" y="17" style="fill:#fff;font-weight:700">4</text></g>
 </svg>
-<figcaption><b>An agent's terminal.</b> This is today's terminal page with three additions to its left column. (1) Page links with their badges, and search, above the agents. (2) The agents list you already use; a click opens that agent's terminal. (3) Usage meters at the foot, today found only on the other pages. (4) The top bar is unchanged: name, context ring, Notes, Details, Hand off, Retire. The terminal is as wide as today.</figcaption>
+<figcaption><b>An agent's terminal, ten agents live, drawn to scale for an 820-point-tall window.</b> The Agents list is open, so everything else in the sidebar shrinks. (1) Page links become one row of icons with badge dots: Inbox, Board, Queue, Artifacts, Notes, More, Settings. (2) The agents list you use today, with about 590 of the 820 points. (3) Usage shrinks to one line; red or amber shows only when a meter is high. (4) The top bar is unchanged. The terminal is as wide as today.</figcaption>
 </figure>
 
 <div class="twoup">
 <figure>
-<svg class="mock" viewBox="0 0 360 220" role="img" aria-label="Board page with the same sidebar">
+<svg class="mock" viewBox="0 0 360 220" role="img" aria-label="Board page: page links and meters open, agents list folded to one line">
   <rect class="frame" x="0.5" y="0.5" width="359" height="219" rx="4"/>
   <rect class="side" x="0.5" y="0.5" width="84" height="219"/>
-  <text class="b" x="6" y="13" style="fill:var(--blue)">sm</text>
-  <rect class="box" x="5" y="18" width="74" height="11" rx="2"/><text class="xs" x="9" y="26">Search ⌘K</text>
-  <text class="xs" x="8" y="42">Inbox  1</text><rect class="sel" x="1" y="46" width="83" height="11"/><text class="xs" x="8" y="54" style="fill:var(--ink)">Board</text><text class="xs" x="8" y="66">Queue</text><text class="xs" x="8" y="78">Artifacts</text><text class="xs" x="8" y="90">Notes</text>
-  <text class="b" x="6" y="106" style="font-size:8px">Agents</text>
-  <circle class="att" cx="9" cy="117" r="2.5"/><text class="xs" x="15" y="120">far-2419-o-h3</text>
-  <circle class="mov" cx="9" cy="131" r="2.5"/><text class="xs" x="15" y="134">sm-2540</text>
-  <circle class="mov" cx="9" cy="145" r="2.5"/><text class="xs" x="15" y="148">far-2390</text>
-  <text class="xs" x="6" y="200">Claude 24% · CPU 100%</text>
+  <text class="b" x="5" y="12" style="fill:var(--blue)">sm</text><rect class="box" x="20" y="4" width="60" height="11" rx="2"/><text class="xs" x="24" y="12">Search ⌘K</text>
+  <text class="xs" x="8" y="30">Inbox</text><text class="xs" x="74" y="30" style="fill:#a21caf">1</text>
+  <rect class="sel" x="1" y="34" width="83" height="11"/><text class="xs" x="8" y="42" style="fill:var(--ink)">Board</text>
+  <text class="xs" x="8" y="54">Queue</text><text class="xs" x="60" y="54">1 · 0</text><text class="xs" x="8" y="66">Artifacts</text><text class="xs" x="8" y="78">Notes</text>
+  <line x1="4" x2="80" y1="84" y2="84" stroke="var(--rule)"/>
+  <text class="b" x="5" y="95" style="font-size:8px">Agents</text><text class="xs" x="36" y="95">10 live ›</text>
+  <circle class="att" cx="9" cy="104" r="2.5"/><text class="xs" x="15" y="107" style="fill:var(--ink)">far-2419-o-h3</text>
+  <line x1="4" x2="80" y1="114" y2="114" stroke="var(--rule)"/>
+  <text class="xs" x="5" y="125">CLAUDE  5-hour 2%</text><rect x="5" y="128" width="74" height="2" fill="var(--rule)"/>
+  <text class="xs" x="5" y="139">This week 25%</text><rect x="5" y="142" width="74" height="2" fill="var(--rule)"/><rect x="5" y="142" width="18" height="2" fill="var(--green)"/>
+  <text class="xs" x="5" y="153">CODEX  week 6%</text><rect x="5" y="156" width="74" height="2" fill="var(--rule)"/>
+  <text class="xs" x="5" y="167">MAC  Mem 114/256G</text><rect x="5" y="170" width="74" height="2" fill="var(--rule)"/><rect x="5" y="170" width="33" height="2" fill="var(--green)"/>
+  <text class="xs" x="5" y="181">CPU 100%</text><rect x="5" y="184" width="74" height="2" fill="var(--red)"/>
+  <text class="xs" x="5" y="208">⚙ Settings  ☾  More</text>
   <rect class="bar" x="84.5" y="0.5" width="275" height="20"/><text class="b" x="92" y="14">Board</text><text class="xs" x="340" y="14">🐞</text>
   <rect class="box" x="92" y="30" width="80" height="180" rx="3"/><rect class="box" x="180" y="30" width="80" height="180" rx="3"/><rect class="box" x="268" y="30" width="84" height="180" rx="3"/>
   <rect class="box" x="98" y="40" width="68" height="22" rx="2"/><rect class="box" x="98" y="68" width="68" height="22" rx="2"/><rect class="box" x="186" y="40" width="68" height="22" rx="2"/>
 </svg>
-<figcaption><b>Board, Queue, any page:</b> the same sidebar, so every agent is one click away. The Board itself is unchanged.</figcaption>
+<figcaption><b>Board, Queue, any page.</b> Page links and meters are open, as in today's left column. The agents list is closed to one line ("10 live ›") plus any agent that needs you. Clicking that line opens the list, and the page links and meters shrink as in the terminal view.</figcaption>
 </figure>
 <figure>
 <svg class="mock" viewBox="0 0 360 220" role="img" aria-label="Document view with the sidebar folded to a strip">
@@ -222,26 +229,26 @@
 <table>
 <thead><tr><th style="width:30%">Thing</th><th style="width:33%">Today</th><th>Proposed</th></tr></thead>
 <tbody>
-<tr><td>Page links and badges</td><td>Left column on every page except the terminal</td><td>Sidebar top, every page</td></tr>
-<tr><td>Live agents and shells list</td><td>Terminal page only</td><td>Sidebar middle, every page. Click opens the terminal.</td></tr>
-<tr><td>Usage meters (Claude, Codex, Mac)</td><td>Foot of the left column; not on the terminal</td><td>Sidebar foot, three compact lines, every page</td></tr>
+<tr><td>Page links and badges</td><td>Left column on every page except the terminal</td><td>Sidebar top, every page; a row of icons while the agents list is open</td></tr>
+<tr><td>Live agents and shells list</td><td>Terminal page only</td><td>Sidebar middle, every page: open on a terminal, one line elsewhere. Click opens the terminal.</td></tr>
+<tr><td>Usage meters (Claude, Codex, Mac)</td><td>Foot of the left column; not on the terminal</td><td>Sidebar foot, every page: today's full meters, or one line while the agents list is open</td></tr>
 <tr><td>Search ⌘K</td><td>Top bar; off on the terminal</td><td>Sidebar top; works everywhere, terminal included</td></tr>
 <tr><td>New agent</td><td>Top bar button</td><td><b>+</b> beside the Agents heading; same New session sheet</td></tr>
 <tr><td>Queue "1 running · 0 waiting"</td><td>Top bar</td><td>Beside Queue in the sidebar</td></tr>
 <tr><td>Overnight moon</td><td>Top bar</td><td>Sidebar foot</td></tr>
 <tr><td>Agents overview (cards, By repo, With stopped)</td><td>The "Agents" page, landing page</td><td>Same page, reached by the Agents heading; still the landing page</td></tr>
-<tr><td>Analytics, History, Guestbook</td><td>Small links in the left column</td><td>"More" menu in the sidebar foot, and ⌘K</td></tr>
+<tr><td>Analytics, History, Guestbook</td><td>Small links in the left column</td><td>"More" menu, and ⌘K</td></tr>
 <tr><td>Documents</td><td>Side panel; full screen is a separate site</td><td>Main area, sidebar folded; never the side panel</td></tr>
 <tr><td>Agent details and messages, queue job, ticket, Notes</td><td>Side panel</td><td>Side panel, unchanged</td></tr>
 </tbody>
 </table>
 
 <h3>How it flows: one evening</h3>
-<p>You are watching far-2390 in its terminal. The sidebar shows Inbox 1. You click Inbox and read far-2419's question. You click far-2419 in the sidebar; its terminal opens, and you answer. Its message mentions the iteration 11 memo; you click the link, and the memo fills the screen with the sidebar folded. ⌘[ takes you back to far-2419's terminal, still connected and up to date. You click Queue to see whether the backtest finished, then far-2390 in the sidebar. You never leave the tab, and the sidebar never moves.</p>
+<p>You are watching far-2390 in its terminal. The sidebar shows Inbox 1. You click Inbox and read far-2419's question. You click far-2419 in the sidebar; its terminal opens, and you answer. Its message mentions the iteration 11 memo; you click the link, and the memo fills the screen with the sidebar folded. ⌘[ takes you back to far-2419's terminal, still connected and up to date. You click Queue to see whether the backtest finished, then "10 live ›" and far-2390. You never leave the tab, and the sidebar never moves.</p>
 
 <h3>Why this design</h3>
 <p><b>The terminal page already had the right layout.</b> Its left column is the list of agents; that list is the thing you navigate by. The old left navigation lists <i>pages</i>, and the old Agents page is a large version of the same agents list. Putting both lists in one column, pages above agents, gives a single place to go anywhere. Slack and Linear use this layout for the same reason: destinations and live items in one sidebar.</p>
-<p><b>It fits.</b> In the browser window from your bug screenshot (about 820 points tall), the page links, heading and meters take about 340 points, leaving room for eleven two-line agent rows before the list scrolls. Three rarely used pages move to a "More" menu to make that room.</p>
+<p><b>It fits, measured on your screenshots.</b> Your window is about 820 points tall; a page link is 32 points, an agent row 48, a section heading about 26, today's meters about 300. With the agents list open, search, the icon row, the Agents heading and the one-line meters take about 135 points, leaving about 685. Ten agents in four sections need about 590, so your usual 8–10 fit without scrolling, and the list starts to scroll at about 12 (Idle stays collapsed, as today). On other pages, five page links, today's full meters, Settings and up to three agents that need you take about 710. Analytics, History and Guestbook move to a "More" menu to make that room.</p>
 <p><b>Focus views stay immersive.</b> The terminal keeps today's width and bar. A document gets the whole width, because reading is what you open it for, and the side panel is a poor place to read. Both keep one way back to everything: the sidebar, one click or ⌘\ away.</p>
 <p><b>Cost.</b> On Board and Queue the sidebar is wider than today's left column (15.5 rem against 9 rem, about 100 points), because it now holds agents. ⌘\ folds it on any page.</p>
 
@@ -251,7 +258,7 @@
 <tr><th style="width:24%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
 </thead>
 <tbody>
-<tr><td>1. How do pages and agents share the screen?</td><td><b>One sidebar on every page</b>: pages on top, live agents and shells below, meters at the foot. Rejected: two left columns; page links in a top bar.</td><td>One place to go anywhere, always in the same spot.</td></tr>
+<tr><td>1. How do pages and agents share the screen?</td><td><b>One sidebar on every page</b>: pages, live agents and shells, meters. The agents list is open on a terminal and shrunk elsewhere; a click swaps. Rejected: two left columns; page links in a top bar; all parts open at once (does not fit 8–10 agents).</td><td>One place to go anywhere, always in the same spot, and it fits.</td></tr>
 <tr><td>2. What happens to the Agents page?</td><td><b>It stays as the overview</b>, opened by the Agents heading, and remains the landing page at <code>sm.rajeshgo.li/</code>. Alternative: land on the terminal of the agent that most needs you.</td><td>After hours away, the overview with stopped agents and By repo is the right first screen; the terminal is one click away.</td></tr>
 <tr><td>3. Where do documents open?</td><td><b>In the main area, sidebar folded</b>, from every link in the app (Inbox, Details, History, terminal output). The side panel stops showing documents.</td><td>Reading wants the width; the side panel is for small things.</td></tr>
 <tr><td>4. Keep the terminal connected while you are elsewhere?</td><td><b>Yes, the last terminal, for 15 minutes.</b> Coming back is instant and shows output that arrived meanwhile.</td><td>That is what your second browser tab gives you today.</td></tr>
@@ -268,10 +275,7 @@
 <p>After the first ticket I will ask you to try one thing: from a terminal, click Board, then the same agent in the sidebar, and see its screen come straight back. After the second: click a document link in an agent's Details, read, press ⌘[.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p><b>Why not two left columns any more?</b> Revision 1 kept the page links as a narrow icon column beside the terminal's agents list. You found it overloaded and bolted on. Now there is one sidebar with pages above agents, and every page uses it.</p>
-<p><b>What changed about the Agents page?</b> Revision 1 did not say. It is now the overview behind the Agents heading (decision 2).</p>
-<p><b>Why do documents move?</b> You said the side panel is the wrong place to read. Documents now open as a focus view (decision 3).</p>
-<p><b>What was dropped?</b> The separate "Terminal" page link and its <code>g t</code> shortcut: every agent is in the sidebar, so a link to "the last terminal" is not needed.</p>
+<p><b>The sidebar takes turns for its height.</b> Revision 2 stacked page links, agents and meters at full size and claimed they fit. Your screenshots show they do not: today's page links and meters already fill the column with four agents, and you usually run 8–10. Now the agents list opens on a terminal, page links and meters shrink to one line each, and the reverse happens on other pages. The figures are drawn to scale with ten agents.</p>
 
 <!-- memo-print-scope keys on this divider: everything after it is hidden when printing
      "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
@@ -312,17 +316,28 @@
 <li><b>Width.</b> Open: <code>15.5rem</code> (today's switcher width). Folded: a <code>14px</code> strip with today's <code>.term-edge</code> look; clicking it opens the sidebar. The fold control when open is the same strip on the sidebar's right edge.</li>
 <li><b>Contents, top to bottom.</b>
   <ol type="a">
-  <li>"sm" (navigates to <code>/</code>).</li>
-  <li>Search box, label "Search or jump…", <kbd>⌘K</kbd> hint; click opens the palette.</li>
-  <li>Page links: Inbox, Board, Queue, Artifacts, Notes, with today's badges from <code>badges()</code>. Queue's row also shows <code>&lt;running&gt; run · &lt;waiting&gt;</code> (amber when a job has waited 30 minutes), replacing the top bar meter. The current page is highlighted.</li>
-  <li>Agents heading (D.1) and the session list (D.2). This part alone scrolls; everything above and below stays put.</li>
-  <li>Foot: the usage <code>Dash</code> in a compact three-line form (Claude windows; Codex; Mac memory, CPU, GPU), each value tinted as today; then a row with Settings, the overnight moon (today's top bar control) and "More ▾" (Analytics, History, Guestbook).</li>
+  <li>One 40 px row: "sm" (navigates to <code>/</code>) and the search box, label "Search or jump…", <kbd>⌘K</kbd> hint; click opens the palette.</li>
+  <li>Page links: Inbox, Board, Queue, Artifacts, Notes, with today's badges from <code>badges()</code>. Queue also shows <code>&lt;running&gt; · &lt;waiting&gt;</code> (amber when a job has waited 30 minutes), replacing the top bar meter. The current page is highlighted.</li>
+  <li>Agents heading (D.1) and the session list (D.2).</li>
+  <li>Usage: today's <code>Dash</code>.</li>
+  <li>Foot row: Settings, the overnight moon (today's top bar control), "More ▾" (Analytics, History, Guestbook).</li>
   </ol></li>
+<li><b>Agents open or shrunk.</b> The sidebar is in one of two states.
+  <table>
+  <thead><tr><th>Part</th><th>Agents open</th><th>Agents shrunk</th></tr></thead>
+  <tbody>
+  <tr><td>Page links (b)</td><td>One 36 px row of icons, each with today's badge as a dot (folded-rail style): Inbox, Board, Queue, Artifacts, Notes, More, Settings. Tooltip is the label. The moon moves into More.</td><td>Full rows as listed in B.3 b.</td></tr>
+  <tr><td>Agents (c)</td><td>Heading plus the full list; this part alone scrolls.</td><td>Heading only, reading "Agents &nbsp;<i>n</i> live ›", then the rows of Needs-you agents, at most 3, then "+<i>k</i> more" if there are more. Clicking "<i>n</i> live ›" or "+<i>k</i> more" opens the list.</td></tr>
+  <tr><td>Usage (d)</td><td>One 28 px line: Claude 5-hour·week, Codex week, then the Mac reading with the strongest tint (CPU, memory or GPU; CPU if none is tinted), each tinted as today. Click opens the agents-shrunk state.</td><td>Today's full <code>Dash</code>.</td></tr>
+  <tr><td>Foot row (e)</td><td>Hidden (its items are in the icon row).</td><td>Shown.</td></tr>
+  </tbody></table>
+  "<i>n</i> live ›" switches to agents open; in the open state the heading shows "<i>n</i> live ⌄", and clicking it, or the one-line meters, switches back. The state is remembered per view kind in local storage <code>sm-sidebar-agents</code> = <code>{ pages, terminal }</code>, each <code>open|shrunk</code>; defaults <code>pages: shrunk</code>, <code>terminal: open</code>. The document view uses <code>pages</code> when unfolded.</li>
+<li><b>Sizes</b> (CSS px at today's root font): page row 32, icon row 36, agent row 48, section heading 26, one-line meters 28, full <code>Dash</code> about 300, foot row 36. Example at 820 px tall, agents open, ten agents in Needs you 1 / Finished 1 / Moving 4 / Waiting 2 / Idle 2 (collapsed): fixed parts 40+36+30+28 = 134; list = 5 headings × 26 + 8 rows × 48 = 514; no scroll. Agents shrunk, Board: 40 + 5×32 + 32 + 1×48 + 300 + 36 = 616.</li>
 <li><b>Folded strip signal.</b> When folded, the strip shows one dot at its top: red if an agent is blocked, magenta if anything needs you (Inbox needs-you count &gt; 0 or a Needs-you agent), otherwise none.</li>
 <li><b>Fold state</b> is remembered per view kind in local storage <code>sm-sidebar</code> = <code>{ pages, terminal, doc }</code>, each <code>open|folded</code>. Defaults: <code>pages</code> open at ≥1100 px else folded; <code>terminal</code> open at ≥900 px else folded; <code>doc</code> folded. First run migrates <code>sm-layout.rail</code> (<code>full</code>→open) into <code>pages</code> and <code>sm-term-switcher</code> into <code>terminal</code>.</li>
 <li><b>720–900 px.</b> The sidebar, when opened, overlays <code>main</code> (today's switcher overlay rule) and closes after a pick.</li>
 <li><b>≤720 px (phone).</b> Unchanged. List pages keep today's bottom tab bar (the same page items as today, Agents first); the terminal is full screen with today's phone bar and key row; the document view is full screen with a back arrow. No sidebar.</li>
-<li>Example: 1512×820 window, Board page, <code>sm-sidebar.pages=open</code>. Sidebar 15.5 rem; Board gets the rest. Clicking far-2390 navigates to <code>/terminal/&lt;far-2390 id&gt;</code>; the sidebar stays open because <code>terminal=open</code>; the row is highlighted.</li>
+<li>Example: 1512×820 window, Board page, <code>sm-sidebar.pages=open</code>. Sidebar 15.5 rem; Board gets the rest. The agents list is shrunk (<code>sm-sidebar-agents.pages=shrunk</code>); clicking "10 live ›" opens it, and clicking far-2390 navigates to <code>/terminal/&lt;far-2390 id&gt;</code>, where the list is open (<code>terminal=open</code>) with far-2390 highlighted and the page links as icons.</li>
 </ol>
 
 <h3 id="c">C. Top bar</h3>
@@ -339,7 +354,7 @@
 
 <h3 id="d">D. Agents heading, rows, overview</h3>
 <ol>
-<li><b>Heading.</b> "Agents", then "<i>n</i> needs you" in magenta when n&gt;0, then a <b>+</b> button at the right. Clicking the heading text navigates to <code>/</code> (the overview). <b>+</b> opens today's New session sheet (<code>bus.emit('new-agent')</code>), which already offers agent or terminal.</li>
+<li><b>Heading.</b> "Agents", then "<i>n</i> live" with › (shrunk) or ⌄ (open), then "<i>m</i> needs you" in magenta when m&gt;0, then a <b>+</b> button at the right. The word "Agents" navigates to <code>/</code> (the overview); "<i>n</i> live" toggles open and shrunk (B.4). <b>+</b> opens today's New session sheet (<code>bus.emit('new-agent')</code>), which already offers agent or terminal.</li>
 <li><b>Rows</b> are today's <code>Switcher</code> rows and grouping (<code>switcherGroups</code>), unchanged: two lines, ✓ mark-answered, Idle collapsed with its count, Terminals section, hidden shells excluded except the current one. A click navigates to <code>/terminal/&lt;id&gt;</code>. The current row is highlighted only on that agent's terminal view.</li>
 <li><b>Overview.</b> The Agents page (<code>/</code>) is unchanged in content: attention summary, By attention/By repo, Live/With stopped, cards, details band, shell tiles, keys j/k/Enter/t/c/x. Its page link leaves the page list (the heading replaces it); <code>g a</code> still goes there.</li>
 </ol>
@@ -400,6 +415,7 @@
 </ol>
 
 <h3 id="z">Z. FAQ</h3>
+<p><b>How did the design get here?</b> Revision 1 kept the page links as a narrow icon column beside the terminal's agents list; the owner found two left columns overloaded and bolted on, and it left the Agents page and documents unaddressed. Revision 2 merged both lists into one sidebar, made the Agents page the overview behind the heading, and moved documents out of the side panel; it did not fit at real sizes. Revision 3 makes the sidebar's parts take turns. The separate "Terminal" page link and <code>g t</code> shortcut of revision 1 are gone: every agent is in the sidebar.</p>
 <p><b>Why keep the Agents overview at all?</b> It is the only place showing stopped agents, the By repo grouping, and per-agent facts side by side. Web request logs for the last two weeks show the terminal screen about four times as busy as the Agents page, so it is a secondary view, but not an empty one. If it stays unused after this ships, landing on the terminal of the agent that most needs you is a one-line change.</p>
 <p><b>Why 15 minutes for the kept terminal?</b> It covers a look at Board, Queue or a document and back, which is what the second tab is used for, without a forgotten terminal streaming over the Cloudflare relay all afternoon. It is a constant.</p>
 <p><b>Why only one kept terminal?</b> Moving between agents through the sidebar reconnects today and is not part of the complaint. Keeping several multiplies streams for little gain.</p>
