@@ -58,6 +58,7 @@ const ASSETS: &[Asset] = &[
     asset!("devices.css", "text/css; charset=utf-8"),
     asset!("terminal.js", JS),
     asset!("terminal-images.js", JS),
+    asset!("terminal-mouse.js", JS),
     asset!("terminal-files.js", JS),
     asset!("terminal-route.js", JS),
     asset!("terminal-theme.js", JS),
