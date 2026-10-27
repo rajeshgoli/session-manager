@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>2543 — The terminal page joins the rest of sm</title>
+<title>2543 — One app: terminal, documents and pages</title>
 <!--
   House format for owner-facing design documents.
 
@@ -107,153 +107,171 @@
 </style>
 
 <style>
-  .mock text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--ink); }
-  .mock .sm { font-size: 9px; } .mock .xs { font-size: 7.5px; fill: var(--ink-2); } .mock .b { font-weight: 700; }
-  .mock .mono { font-family: ui-monospace, Menlo, monospace; font-size: 7.5px; fill: #d9d7cf; }
+  .mock text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--ink); font-size: 9px; }
+  .mock .xs { font-size: 7.5px; fill: var(--ink-2); } .mock .b { font-weight: 700; } .mock .h { font-size: 7.5px; font-weight: 700; letter-spacing: .06em; }
+  .mock .mono { font-family: ui-monospace, Menlo, monospace; font-size: 8px; fill: #d9d7cf; }
   .mock .frame { fill: var(--surface); stroke: var(--ink-3); }
-  .mock .chrome { fill: var(--surface-2); stroke: var(--rule); }
+  .mock .side { fill: var(--surface-2); stroke: var(--rule); }
+  .mock .bar { fill: var(--surface); stroke: var(--rule); }
   .mock .term { fill: #2b2b29; }
-  .mock .hl { fill: none; stroke: var(--orange); stroke-width: 2; stroke-dasharray: 4 3; }
-  .mock .sel { fill: rgba(42,120,214,.28); }
-  .mock .ok { fill: var(--green); } .mock .att { fill: #a21caf; }
+  .mock .box { fill: none; stroke: var(--rule); }
+  .mock .sel { fill: rgba(42,120,214,.25); }
+  .mock .att { fill: #a21caf; } .mock .mov { fill: var(--green); } .mock .idl { fill: var(--ink-3); }
+  .mock .tag { fill: var(--orange); font-size: 8px; font-weight: 700; }
+  .mock .tagc { fill: var(--orange); }
   .twoup { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
   @media (max-width: 640px) { .twoup { grid-template-columns: 1fr; } }
 </style>
 
-<h1>2543 — The terminal page joins the rest of sm</h1>
-<p class="sans"><small>Author: Claude (Opus 5.5) <code>0ba7dfd9</code> · Ticket #2543 · 2026-10-27</small></p>
+<h1>2543 — One app: the terminal, documents and pages share one frame</h1>
+<p class="sans"><small>Author: Claude (Opus 5.5) <code>0ba7dfd9</code> · Ticket #2543 · 2026-10-27 · Revision 2</small></p>
 
 <h2>Memo</h2>
 
-<p><b>I recommend keeping the terminal page exactly as immersive as it is, and giving it back the one thing it lacks: the app's left navigation.</b> Today, opening a terminal hides the navigation column (Agents, Board, Inbox, Queue…), the top bar and ⌘K search, so the terminal behaves like a separate site that you enter and leave. That is why you keep it in its own browser tab. With the change below, the terminal is one more page in that column, Board and Queue are one click away from it, and a click on "Terminal" brings you back to the agent you were watching, still connected.</p>
+<p><b>I recommend that the terminal page's layout become the layout of the whole web app.</b> Every page gets one left sidebar. Its top half holds the page links (Inbox, Board, Queue…). Its lower half holds the live agents and shells, the list that today exists only on the terminal page. The Agents page becomes the overview you reach by clicking the "Agents" heading. A terminal and a document become two <i>focus views</i>: they fill the space right of the sidebar. A document folds the sidebar away so you can read. The side panel on the right goes back to small things about what you are looking at: details, messages, a queue job, notes. Documents no longer open there.</p>
 
-<p>Four terms, used throughout:</p>
+<p>The result is one sidebar and one top bar on every screen, both always in the same place. Getting from a terminal to Board and back is one click each way, as it is between any other two pages.</p>
+
 <dl class="vocab">
-  <dt>Left navigation</dt><dd>The column on every sm web page except the terminal: Agents, Board, Inbox, Queue, Artifacts, Notes… with their red and amber count badges, and the usage meters (Claude 5-hour and weekly, Codex, Mac memory/CPU/GPU) at the bottom. Its narrow form shows only icons, dot badges and short meter readings, about 50 px wide.</dd>
-  <dt>Terminal page</dt><dd>The page at <code>sm.rajeshgo.li/terminal/&lt;id&gt;</code>: a live agent or shell terminal, its top bar (Notes, Details, Hand off…, Retire) and the session list.</dd>
-  <dt>Session list</dt><dd>The terminal page's own left column: live agents grouped Needs you / Moving / Idle, plus shells. ⌘\ folds it; ⌘⌥↑/↓ steps through it.</dd>
-  <dt>⌘K search</dt><dd>The "Search or jump…" box: pages, agents, tickets and docs by name.</dd>
+  <dt>Sidebar</dt><dd>The single left column on every page. Top: "sm", the search box (⌘K), page links with their badges. Middle: <b>Agents</b> heading, then the live agents and shells grouped Needs you / Moving / Idle / Terminals. Bottom: usage meters, overnight moon, Settings. It folds to a thin strip with ⌘\ or a click on that strip.</dd>
+  <dt>Focus view</dt><dd>A page whose subject is one thing that wants the whole width: an agent's or shell's terminal, or a document.</dd>
+  <dt>Top bar</dt><dd>The 40-pixel bar above the main area. Left: what you are looking at (a page name, an agent's name and context ring, a document's title). Right: actions on it. Today's terminal page bar is the model.</dd>
+  <dt>Side panel</dt><dd>The resizable column on the right: an agent's details and message thread, a queue job, a ticket, Notes.</dd>
 </dl>
 
-<h3>What is wrong today</h3>
+<h3>What you see</h3>
+
+<figure>
+<svg class="mock" viewBox="0 0 720 372" role="img" aria-label="Terminal view: sidebar with pages, agents, meters; agent bar; terminal">
+  <rect class="frame" x="0.5" y="0.5" width="719" height="371" rx="4"/>
+  <rect class="side" x="0.5" y="0.5" width="160" height="371"/>
+  <text class="b" x="10" y="18" style="fill:var(--blue)">sm</text><text class="xs" x="148" y="18">‹</text>
+  <rect class="box" x="8" y="26" width="144" height="16" rx="3"/><text class="xs" x="14" y="37">Search or jump…</text><text class="xs" x="130" y="37">⌘K</text>
+  <text x="14" y="60">Inbox</text><text x="146" y="60" class="b" style="fill:#a21caf">1</text>
+  <text x="14" y="76">Board</text>
+  <text x="14" y="92">Queue</text><text class="xs" x="114" y="92">1 run · 0</text>
+  <text x="14" y="108">Artifacts</text>
+  <text x="14" y="124">Notes</text>
+  <line x1="8" x2="152" y1="134" y2="134" stroke="var(--rule)"/>
+  <text class="b" x="10" y="148">Agents</text><text class="xs" x="48" y="148">1 needs you</text><text class="b" x="144" y="148">+</text>
+  <text class="h" x="10" y="164" style="fill:#a21caf">NEEDS YOU</text>
+  <circle class="att" cx="14" cy="174" r="3"/><text class="b" x="22" y="177">far-2419-o-h3</text><text x="144" y="177" style="fill:#a21caf">✓</text>
+  <text class="xs" x="22" y="188" style="fill:#a21caf">◆ 41h: Review iteration 11 memo</text>
+  <text class="h" x="10" y="204" style="fill:var(--green)">MOVING</text>
+  <rect class="sel" x="1" y="208" width="159" height="26"/><rect x="1" y="208" width="2.5" height="26" style="fill:var(--blue)"/>
+  <circle class="mov" cx="14" cy="216" r="3"/><text class="b" x="22" y="219">sm-2540</text><text class="xs" x="22" y="230" style="fill:var(--green)">Working 0m</text>
+  <circle class="mov" cx="14" cy="242" r="3"/><text class="b" x="22" y="245">far-2390</text><text class="xs" x="22" y="256" style="fill:var(--green)">▶ Background 14m of 4h</text>
+  <text class="xs" x="10" y="274">IDLE · 4 ›</text>
+  <text class="h" x="10" y="290" style="fill:var(--ink-3)">TERMINALS</text>
+  <text class="xs" x="12" y="302">▹</text><text x="22" y="302">studio-zsh</text>
+  <line x1="8" x2="152" y1="318" y2="318" stroke="var(--rule)"/>
+  <text class="xs" x="10" y="331">Claude 0% · week 24%   Codex 6%</text>
+  <text class="xs" x="10" y="344">Mac 98/256G · CPU 100% · GPU 0%</text>
+  <text class="xs" x="10" y="362">⚙ Settings   ☽ Overnight   More ▾</text>
+  <rect class="bar" x="160.5" y="0.5" width="559" height="26"/>
+  <circle class="mov" cx="172" cy="14" r="3.5"/><text class="b" x="180" y="17">sm-2540</text><circle cx="236" cy="14" r="7" fill="none" stroke="var(--green)"/><text class="xs" x="231" y="17">17</text>
+  <text class="xs" x="420" y="17">Notes ⌘J   Details   Hand off…   ⋯    ↻   🐞</text><text class="xs" x="680" y="17" style="fill:var(--red)">Retire</text>
+  <rect class="term" x="160.5" y="26.5" width="559" height="345"/>
+  <text class="mono" x="172" y="48">Claude Code v2.1.285 · Opus 5.5 (1M context)</text>
+  <text class="mono" x="172" y="70">❯ You own #2540 in rajeshgoli/session-manager. Begin</text>
+  <text class="mono" x="172" y="88">● Claimed #2540; reading terminal-mouse.js now.</text>
+  <text class="mono" x="172" y="106">● Running 1 shell command…</text>
+  <text class="mono" x="172" y="340">❯ ▌</text>
+  <g><circle class="tagc" cx="160" cy="92" r="7"/><text x="157" y="95" style="fill:#fff;font-weight:700">1</text></g>
+  <g><circle class="tagc" cx="160" cy="221" r="7"/><text x="157" y="224" style="fill:#fff;font-weight:700">2</text></g>
+  <g><circle class="tagc" cx="160" cy="338" r="7"/><text x="157" y="341" style="fill:#fff;font-weight:700">3</text></g>
+  <g><circle class="tagc" cx="400" cy="14" r="7"/><text x="397" y="17" style="fill:#fff;font-weight:700">4</text></g>
+</svg>
+<figcaption><b>An agent's terminal.</b> This is today's terminal page with three additions to its left column. (1) Page links with their badges, and search, above the agents. (2) The agents list you already use; a click opens that agent's terminal. (3) Usage meters at the foot, today found only on the other pages. (4) The top bar is unchanged: name, context ring, Notes, Details, Hand off, Retire. The terminal is as wide as today.</figcaption>
+</figure>
 
 <div class="twoup">
 <figure>
-<svg class="mock" viewBox="0 0 360 230" role="img" aria-label="Today: Board page and terminal page side by side, two separate worlds">
-  <rect class="frame" x="1" y="1" width="168" height="200" rx="4"/>
-  <rect class="chrome" x="1" y="1" width="40" height="200"/>
-  <text class="sm b" x="8" y="16">sm</text>
-  <text class="xs" x="6" y="34">Agents</text><text class="xs" x="6" y="48">Board</text><text class="xs" x="6" y="62">Inbox ●</text><text class="xs" x="6" y="76">Queue</text><text class="xs" x="6" y="90">Artifacts</text><text class="xs" x="6" y="104">Notes</text>
-  <text class="xs" x="6" y="160">5-hr 0%</text><text class="xs" x="6" y="172">CPU 100</text>
-  <rect class="chrome" x="41" y="1" width="128" height="18"/>
-  <text class="xs" x="46" y="13">Board   ⌘K   New agent</text>
-  <rect x="48" y="28" width="52" height="60" rx="3" fill="none" stroke="var(--rule)"/><rect x="108" y="28" width="52" height="60" rx="3" fill="none" stroke="var(--rule)"/>
-  <rect class="hl" x="2" y="2" width="38" height="198"/>
-  <text class="sm" x="40" y="218">Tab 1: Board, Queue, Inbox…</text>
-
-  <rect class="frame" x="190" y="1" width="168" height="200" rx="4"/>
-  <rect class="chrome" x="190" y="1" width="168" height="16"/>
-  <text class="xs" x="195" y="12">sm ● sm-2538   Notes  Details  Retire</text>
-  <rect class="chrome" x="190" y="17" width="48" height="184"/>
-  <text class="xs" x="194" y="30" style="fill:#a21caf">NEEDS YOU</text><text class="xs" x="194" y="41">far-2419</text>
-  <text class="xs" x="194" y="56" style="fill:var(--green)">MOVING</text><text class="xs" x="194" y="67">sm-2538</text><text class="xs" x="194" y="78">far-2390</text>
-  <rect class="term" x="238" y="17" width="120" height="184"/>
-  <text class="mono" x="244" y="34">❯ You own #2538…</text><text class="mono" x="244" y="46">● Claimed #2538</text>
-  <text class="sm" x="230" y="218">Tab 2: terminal</text>
-  <text class="xs" x="196" y="196" style="fill:var(--orange)">no Board, Queue, ⌘K</text>
+<svg class="mock" viewBox="0 0 360 220" role="img" aria-label="Board page with the same sidebar">
+  <rect class="frame" x="0.5" y="0.5" width="359" height="219" rx="4"/>
+  <rect class="side" x="0.5" y="0.5" width="84" height="219"/>
+  <text class="b" x="6" y="13" style="fill:var(--blue)">sm</text>
+  <rect class="box" x="5" y="18" width="74" height="11" rx="2"/><text class="xs" x="9" y="26">Search ⌘K</text>
+  <text class="xs" x="8" y="42">Inbox  1</text><rect class="sel" x="1" y="46" width="83" height="11"/><text class="xs" x="8" y="54" style="fill:var(--ink)">Board</text><text class="xs" x="8" y="66">Queue</text><text class="xs" x="8" y="78">Artifacts</text><text class="xs" x="8" y="90">Notes</text>
+  <text class="b" x="6" y="106" style="font-size:8px">Agents</text>
+  <circle class="att" cx="9" cy="117" r="2.5"/><text class="xs" x="15" y="120">far-2419-o-h3</text>
+  <circle class="mov" cx="9" cy="131" r="2.5"/><text class="xs" x="15" y="134">sm-2540</text>
+  <circle class="mov" cx="9" cy="145" r="2.5"/><text class="xs" x="15" y="148">far-2390</text>
+  <text class="xs" x="6" y="200">Claude 24% · CPU 100%</text>
+  <rect class="bar" x="84.5" y="0.5" width="275" height="20"/><text class="b" x="92" y="14">Board</text><text class="xs" x="340" y="14">🐞</text>
+  <rect class="box" x="92" y="30" width="80" height="180" rx="3"/><rect class="box" x="180" y="30" width="80" height="180" rx="3"/><rect class="box" x="268" y="30" width="84" height="180" rx="3"/>
+  <rect class="box" x="98" y="40" width="68" height="22" rx="2"/><rect class="box" x="98" y="68" width="68" height="22" rx="2"/><rect class="box" x="186" y="40" width="68" height="22" rx="2"/>
 </svg>
-<figcaption><b>Today.</b> The left navigation (dashed) exists on every page but the terminal. Inside the terminal there is no way to Board or Queue except "sm" back to Agents, and no way back to the terminal except finding the agent's card again. Two tabs is the workaround.</figcaption>
+<figcaption><b>Board, Queue, any page:</b> the same sidebar, so every agent is one click away. The Board itself is unchanged.</figcaption>
 </figure>
-
 <figure>
-<svg class="mock" viewBox="0 0 360 230" role="img" aria-label="Proposed: terminal page with narrow left navigation, session list, terminal">
-  <rect class="frame" x="1" y="1" width="356" height="200" rx="4"/>
-  <rect class="chrome" x="1" y="1" width="22" height="200"/>
-  <text class="xs" x="5" y="14">sm</text>
-  <circle cx="12" cy="30" r="3.5" fill="none" stroke="var(--ink-2)"/>
-  <rect x="5" y="39" width="14" height="13" rx="2" class="sel"/><rect x="8" y="42" width="8" height="7" rx="1" fill="none" stroke="var(--ink)"/>
-  <rect x="8" y="58" width="8" height="7" fill="none" stroke="var(--ink-2)"/>
-  <rect x="8" y="74" width="8" height="7" fill="none" stroke="var(--ink-2)"/><circle cx="18" cy="73" r="2" class="att"/>
-  <path d="M8 92h8M8 95h8M8 98h8" stroke="var(--ink-2)"/>
-  <circle cx="12" cy="112" r="3.5" fill="none" stroke="var(--ink-2)"/>
-  <text class="xs" x="4" y="160">0%</text><text class="xs" x="4" y="172">24%</text><text class="xs" x="2" y="184">100</text>
-  <rect class="hl" x="2" y="2" width="20" height="198"/>
-  <rect class="chrome" x="23" y="1" width="334" height="16"/>
-  <text class="xs" x="28" y="12">sm ● sm-2538 ⑨                         Notes ⌘J  Details  Hand off…  ⋯   Retire</text>
-  <rect class="chrome" x="23" y="17" width="78" height="184"/>
-  <text class="xs" x="27" y="30" style="fill:#a21caf">NEEDS YOU</text><text class="xs" x="27" y="41">far-2419-o-h3</text>
-  <text class="xs" x="27" y="56" style="fill:var(--green)">MOVING</text>
-  <rect class="sel" x="23" y="60" width="78" height="10"/><text class="xs" x="27" y="67">sm-2538</text><text class="xs" x="27" y="80">far-2390</text>
-  <rect class="term" x="101" y="17" width="256" height="184"/>
-  <text class="mono" x="108" y="34">Claude Code v2.1.285</text><text class="mono" x="108" y="50">❯ You own #2538 in rajeshgoli/session-manager.</text><text class="mono" x="108" y="62">● Claimed #2538; reading the delete code now.</text>
-  <text class="mono" x="108" y="190">❯ ▌</text>
-  <text class="sm" x="70" y="218">One tab. Terminal is the highlighted icon.</text>
+<svg class="mock" viewBox="0 0 360 220" role="img" aria-label="Document view with the sidebar folded to a strip">
+  <rect class="frame" x="0.5" y="0.5" width="359" height="219" rx="4"/>
+  <rect class="side" x="0.5" y="0.5" width="8" height="219"/><circle class="att" cx="4.5" cy="12" r="2.5"/>
+  <rect class="bar" x="8.5" y="0.5" width="351" height="20"/><text class="xs" x="14" y="14">←</text><text class="b" x="26" y="14">2543 — One app: the terminal…</text><text class="xs" x="250" y="14">rev 2   Review   Ask</text>
+  <text class="b" x="80" y="42">Memo</text>
+  <rect x="80" y="50" width="200" height="4" fill="var(--rule)"/><rect x="80" y="58" width="190" height="4" fill="var(--rule)"/><rect x="80" y="66" width="200" height="4" fill="var(--rule)"/><rect x="80" y="74" width="120" height="4" fill="var(--rule)"/>
+  <rect x="80" y="88" width="200" height="60" rx="3" class="box"/>
+  <rect x="80" y="158" width="200" height="4" fill="var(--rule)"/><rect x="80" y="166" width="195" height="4" fill="var(--rule)"/><rect x="80" y="174" width="160" height="4" fill="var(--rule)"/>
 </svg>
-<figcaption><b>Proposed.</b> The narrow left navigation (dashed) stays on screen, with a new <b>Terminal</b> item (highlighted) and the same badges and meter readings as everywhere else. The session list, top bar and terminal are unchanged. Cost: about six terminal columns of width.</figcaption>
+<figcaption><b>A document</b> opens in the main area with the sidebar folded to a strip (a dot on the strip if something needs you). Back, ⌘[, returns to where you came from, the terminal still connected.</figcaption>
 </figure>
 </div>
 
-<p>The two pages are already one web app sharing one stylesheet and one login. The split is a single deliberate choice in the code: when the address is a terminal, the app draws only the terminal page, and switches off ⌘K and the <code>g</code>-letter page jumps.<sup>1</sup> Nothing about that choice is load-bearing. The terminal page's good qualities (full-height terminal, focused top bar, foldable session list) do not depend on hiding the navigation.</p>
-
-<h3>The change, in five parts</h3>
-
+<h3>Where everything goes</h3>
 <table>
-<thead><tr><th style="width:4%">#</th><th style="width:30%">What you get</th><th>How it behaves</th></tr></thead>
+<thead><tr><th style="width:30%">Thing</th><th style="width:33%">Today</th><th>Proposed</th></tr></thead>
 <tbody>
-<tr><td>1</td><td><b>Left navigation on the terminal page</b>, always in its narrow icon form.</td><td>Same items, badges and meter readings as on Board or Queue. A click goes to that page in the same tab. It stays narrow there regardless of how you set it elsewhere, because the session list already takes the wide slot. Your ⌘\ habit is unchanged: on the terminal page it still folds the session list.</td></tr>
-<tr><td>2</td><td><b>"Terminal" is a page in the navigation</b>, second after Agents, shortcut <code>g t</code>.</td><td>It opens the last agent or shell you had open in the terminal page. If that one has stopped, it opens the top row of the session list (the first agent that needs you). With no live sessions it stays on Agents and says so. So Board → Terminal → Queue → Terminal is one click each way, like every other page.</td></tr>
-<tr><td>3</td><td><b>The terminal stays connected while you look at another page.</b></td><td>Today every return to the terminal is a fresh connection and a full screen repaint, because leaving destroys it.<sup>2</sup> Instead, the last terminal keeps running out of sight; coming back is instant and shows output that arrived meanwhile. After 15 minutes away it disconnects, and the next return connects fresh as today. Only one terminal is kept this way; opening a different one replaces it.</td></tr>
-<tr><td>4</td><td><b>⌘K works on the terminal page.</b></td><td>It opens the same search box. Picking an agent or shell there opens <i>its terminal</i>, not its details card, because you are in the terminal. Escape closes the box and puts the keyboard back in the terminal. <code>g</code>-letter jumps stay off on the terminal page, since those keys belong to the agent's prompt.</td></tr>
-<tr><td>5</td><td><b>The browser tab names the agent.</b></td><td>The tab title becomes <code>sm-2538 · sm</code> instead of <code>sm · Terminal</code>, so if you still keep a second tab, you can tell which agent it holds.</td></tr>
+<tr><td>Page links and badges</td><td>Left column on every page except the terminal</td><td>Sidebar top, every page</td></tr>
+<tr><td>Live agents and shells list</td><td>Terminal page only</td><td>Sidebar middle, every page. Click opens the terminal.</td></tr>
+<tr><td>Usage meters (Claude, Codex, Mac)</td><td>Foot of the left column; not on the terminal</td><td>Sidebar foot, three compact lines, every page</td></tr>
+<tr><td>Search ⌘K</td><td>Top bar; off on the terminal</td><td>Sidebar top; works everywhere, terminal included</td></tr>
+<tr><td>New agent</td><td>Top bar button</td><td><b>+</b> beside the Agents heading; same New session sheet</td></tr>
+<tr><td>Queue "1 running · 0 waiting"</td><td>Top bar</td><td>Beside Queue in the sidebar</td></tr>
+<tr><td>Overnight moon</td><td>Top bar</td><td>Sidebar foot</td></tr>
+<tr><td>Agents overview (cards, By repo, With stopped)</td><td>The "Agents" page, landing page</td><td>Same page, reached by the Agents heading; still the landing page</td></tr>
+<tr><td>Analytics, History, Guestbook</td><td>Small links in the left column</td><td>"More" menu in the sidebar foot, and ⌘K</td></tr>
+<tr><td>Documents</td><td>Side panel; full screen is a separate site</td><td>Main area, sidebar folded; never the side panel</td></tr>
+<tr><td>Agent details and messages, queue job, ticket, Notes</td><td>Side panel</td><td>Side panel, unchanged</td></tr>
 </tbody>
 </table>
 
-<h3>Your questions, answered</h3>
+<h3>How it flows: one evening</h3>
+<p>You are watching far-2390 in its terminal. The sidebar shows Inbox 1. You click Inbox and read far-2419's question. You click far-2419 in the sidebar; its terminal opens, and you answer. Its message mentions the iteration 11 memo; you click the link, and the memo fills the screen with the sidebar folded. ⌘[ takes you back to far-2419's terminal, still connected and up to date. You click Queue to see whether the backtest finished, then far-2390 in the sidebar. You never leave the tab, and the sidebar never moves.</p>
 
-<p><b>What of the Agents page is truly missing from the terminal page?</b> Less than it looks. Everything about one agent (facts, jobs, reviews, PR links, its message thread and Send box) is already one click away under <b>Details</b>, which opens beside the terminal. What is genuinely missing is the cross-agent and cross-page context:</p>
-
-<table>
-<thead><tr><th>Missing on the terminal page today</th><th>After this change</th></tr></thead>
-<tbody>
-<tr><td>Page navigation and its badges (Inbox needs-you count, Queue waiting, Board, Artifacts)</td><td>Present: narrow left navigation (part 1).</td></tr>
-<tr><td>Usage meters (Claude, Codex, Mac CPU/memory/GPU)</td><td>Present: short readings at the foot of the narrow navigation, as on any page with it folded.</td></tr>
-<tr><td>⌘K search</td><td>Present (part 4).</td></tr>
-<tr><td>"New agent" button</td><td>Reached by one click to Agents. I do not add it to the terminal top bar, which is full; say so if you start agents from the terminal often.</td></tr>
-<tr><td>The Agents page's overview: "1 needs you · 2 moving", By repo, With stopped</td><td>Stays on Agents. The session list already shows the same attention grouping.</td></tr>
-<tr><td>Overnight moon and night banner</td><td>Stays off the terminal page; not something you set mid-session.</td></tr>
-</tbody>
-</table>
-
-<p><b>Can the terminal's side rail become top or bottom bars?</b> I recommend against it. Putting page links in the terminal's top bar costs no width, but then the navigation lives on the left on every page and at the top on one, which is the "different place" feeling we are removing. The narrow left column costs about six of roughly 200 terminal columns on your screen. A bottom bar would cost terminal rows, which matter more than columns for an agent's output.</p>
-
-<p><b>Can the main page adopt the collapsible sidebar?</b> It already folds: the small ‹ beside "sm" and ⌘\ narrow it to the icon form shown above. It is easy to miss next to the terminal page's full-height fold strip. I recommend the main pages use the same full-height strip on the navigation's right edge, so both columns fold the same way and the control is obvious. On the terminal page the navigation has no strip, since it is always narrow there.</p>
-
-<p><b>What about the phone?</b> No change. At phone width the navigation is a bottom tab bar, and the terminal page deliberately has none: the keyboard and the Esc/Tab/Ctrl-C key row already take the space. The Android app has its own navigation and is untouched.</p>
+<h3>Why this design</h3>
+<p><b>The terminal page already had the right layout.</b> Its left column is the list of agents; that list is the thing you navigate by. The old left navigation lists <i>pages</i>, and the old Agents page is a large version of the same agents list. Putting both lists in one column, pages above agents, gives a single place to go anywhere. Slack and Linear use this layout for the same reason: destinations and live items in one sidebar.</p>
+<p><b>It fits.</b> In the browser window from your bug screenshot (about 820 points tall), the page links, heading and meters take about 340 points, leaving room for eleven two-line agent rows before the list scrolls. Three rarely used pages move to a "More" menu to make that room.</p>
+<p><b>Focus views stay immersive.</b> The terminal keeps today's width and bar. A document gets the whole width, because reading is what you open it for, and the side panel is a poor place to read. Both keep one way back to everything: the sidebar, one click or ⌘\ away.</p>
+<p><b>Cost.</b> On Board and Queue the sidebar is wider than today's left column (15.5 rem against 9 rem, about 100 points), because it now holds agents. ⌘\ folds it on any page.</p>
 
 <h3>Decision surface</h3>
-
 <table>
 <thead>
 <tr><th style="width:24%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
 </thead>
 <tbody>
-<tr><td>1. How does the terminal page reach the rest of sm?</td><td><b>Narrow left navigation on the terminal page</b> (part 1). Rejected: page links in the terminal's top bar; a bottom bar.</td><td>Navigation in the same place on every page is what makes it feel like one app.</td></tr>
-<tr><td>2. Is "Terminal" a page of its own?</td><td><b>Yes</b>, second item, <code>g t</code>, opens the last terminal you had open (part 2).</td><td>Without a way back, the terminal stays a place you dig for through Agents.</td></tr>
-<tr><td>3. Keep the terminal connected while you are on another page?</td><td><b>Yes, for 15 minutes</b>, one terminal at a time (part 3).</td><td>Instant return is what a second browser tab gives you today; this gives it in one tab.</td></tr>
-<tr><td>4. ⌘K on the terminal page?</td><td><b>Yes</b>; picking an agent opens its terminal (part 4).</td><td>Jumping to a named agent is the fastest switch you have.</td></tr>
-<tr><td>5. Same full-height fold strip on the main pages' navigation?</td><td><b>Yes.</b></td><td>One fold control, one look, easy to find.</td></tr>
+<tr><td>1. How do pages and agents share the screen?</td><td><b>One sidebar on every page</b>: pages on top, live agents and shells below, meters at the foot. Rejected: two left columns; page links in a top bar.</td><td>One place to go anywhere, always in the same spot.</td></tr>
+<tr><td>2. What happens to the Agents page?</td><td><b>It stays as the overview</b>, opened by the Agents heading, and remains the landing page at <code>sm.rajeshgo.li/</code>. Alternative: land on the terminal of the agent that most needs you.</td><td>After hours away, the overview with stopped agents and By repo is the right first screen; the terminal is one click away.</td></tr>
+<tr><td>3. Where do documents open?</td><td><b>In the main area, sidebar folded</b>, from every link in the app (Inbox, Details, History, terminal output). The side panel stops showing documents.</td><td>Reading wants the width; the side panel is for small things.</td></tr>
+<tr><td>4. Keep the terminal connected while you are elsewhere?</td><td><b>Yes, the last terminal, for 15 minutes.</b> Coming back is instant and shows output that arrived meanwhile.</td><td>That is what your second browser tab gives you today.</td></tr>
+<tr><td>5. Phone width?</td><td><b>Unchanged</b>: bottom tab bar on pages; full-screen terminal and document.</td><td>The phone already works; the Android app is untouched.</td></tr>
 </tbody>
 </table>
 
-<p>Not proposed: merging the Agents page into the terminal page (Agents becomes "session list + terminal", the card grid an overview toggle). You said you rarely use Agents, which argues for it, but it is a larger change to the app's front door. I recommend living with this change for a week first; the merge is easy to do on top of it if Agents still goes unused.</p>
-
 <h3>Delivery</h3>
-<p>One implementation ticket, done by one agent in one pull request, touching the web app's shell, the terminal page and the stylesheet, plus one server route so <code>/terminal</code> without an id opens the app. It starts after the open terminal mouse and copy fix (#2540, pull request #2542) merges, because both edit the same two files. I test it with the existing browser test harness and on the live server, then ask you to try one thing: open Board, click Terminal, click Queue, click Terminal again, and see the agent's screen come straight back.</p>
-
-<p class="sans"><small><sup>1</sup> <code>crates/sm-server/src/web/app.js:186-189</code> (draws only the terminal page) and <code>app.js:657</code> (keyboard returns early). <sup>2</sup> <code>terminal.js</code> page effect clean-up: closes the connection and disposes the terminal.</small></p>
+<p>Two tickets, one after the other, both after the terminal mouse and copy fix (#2540, pull request #2542) merges, because all three edit the same files.</p>
+<ol>
+<li><b>One sidebar.</b> The sidebar on every page, the terminal inside it, the top bar changes, search everywhere, and the kept terminal connection.</li>
+<li><b>Documents as a focus view.</b> Every document link opens the document in the main area; the side panel stops hosting documents.</li>
+</ol>
+<p>After the first ticket I will ask you to try one thing: from a terminal, click Board, then the same agent in the sidebar, and see its screen come straight back. After the second: click a document link in an agent's Details, read, press ⌘[.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>First revision.</p>
+<p><b>Why not two left columns any more?</b> Revision 1 kept the page links as a narrow icon column beside the terminal's agents list. You found it overloaded and bolted on. Now there is one sidebar with pages above agents, and every page uses it.</p>
+<p><b>What changed about the Agents page?</b> Revision 1 did not say. It is now the overview behind the Agents heading (decision 2).</p>
+<p><b>Why do documents move?</b> You said the side panel is the wrong place to read. Documents now open as a focus view (decision 3).</p>
+<p><b>What was dropped?</b> The separate "Terminal" page link and its <code>g t</code> shortcut: every agent is in the sidebar, so a link to "the last terminal" is not needed.</p>
 
 <!-- memo-print-scope keys on this divider: everything after it is hidden when printing
      "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
@@ -262,107 +280,131 @@
 
 <div class="toc">
   <div><a href="#a">A. Requirement map</a></div>
-  <div><a href="#b">B. Layout</a></div>
-  <div><a href="#c">C. The Terminal page item and <code>/terminal</code></a></div>
-  <div><a href="#d">D. Keyboard and ⌘K</a></div>
-  <div><a href="#e">E. Keeping the terminal connected</a></div>
-  <div><a href="#f">F. Navigation fold strip</a></div>
-  <div><a href="#g">G. Title, and what does not change</a></div>
-  <div><a href="#h">H. Tests and live check</a></div>
+  <div><a href="#b">B. Frame and sidebar</a></div>
+  <div><a href="#c">C. Top bar</a></div>
+  <div><a href="#d">D. Agents heading, rows, overview</a></div>
+  <div><a href="#e">E. Terminal view and kept connection</a></div>
+  <div><a href="#f">F. Document view</a></div>
+  <div><a href="#g">G. Keyboard</a></div>
+  <div><a href="#h">H. Tickets</a></div>
+  <div><a href="#i">I. Tests and live checks</a></div>
   <div><a href="#z">Z. FAQ</a></div>
 </div>
 
 <h3 id="a">A. Requirement map</h3>
-<p>Every memo requirement, where it is specified and where it is proven. Paths are under <code>crates/sm-server/src/</code> unless they start with <code>tests/</code> or <code>scripts/</code>.</p>
+<p>Paths are under <code>crates/sm-server/src/</code> unless they start with <code>tests/</code> or <code>scripts/</code>. Ticket numbers refer to H.</p>
 <table>
-<thead><tr><th>Memo part</th><th>Spec</th><th>Code</th><th>Proof</th></tr></thead>
+<thead><tr><th>Requirement</th><th>Spec</th><th>Code</th><th>Proof</th><th>Ticket</th></tr></thead>
 <tbody>
-<tr><td>1 Navigation on terminal page</td><td>B</td><td><code>web/app.js</code> <code>App()</code>, <code>web/app.css</code> terminal block</td><td>H.1, H.2, H.6</td></tr>
-<tr><td>2 Terminal page item, <code>g t</code></td><td>C</td><td><code>web/app.js</code> <code>PAGES</code>, <code>pageFor</code>, new <code>terminalTarget</code>; <code>http.rs</code> route</td><td>H.3, H.4</td></tr>
-<tr><td>3 Kept connection</td><td>E</td><td><code>web/app.js</code> <code>App()</code>, <code>web/terminal.js</code> <code>TerminalPage</code></td><td>H.5, H.6</td></tr>
-<tr><td>4 ⌘K on terminal page</td><td>D</td><td><code>web/app.js</code> <code>useKeyboard</code>, <code>Palette</code>; <code>web/terminal.js</code> key handler</td><td>H.2</td></tr>
-<tr><td>5 Tab title</td><td>G.1</td><td><code>web/app.js</code> title effect</td><td>H.1</td></tr>
-<tr><td>Decision 5 fold strip</td><td>F</td><td><code>web/app.js</code> <code>Rail</code>, <code>web/app.css</code></td><td>H.1</td></tr>
+<tr><td>One sidebar, every page (decision 1)</td><td>B</td><td><code>web/app.js</code> <code>App</code>, new <code>Sidebar</code> replacing <code>Rail</code>; <code>web/terminal.js</code> <code>Switcher</code> reused; <code>web/app.css</code></td><td>I.1, I.2</td><td>1</td></tr>
+<tr><td>Top bar rules</td><td>C</td><td><code>web/app.js</code> <code>TopBar</code>; <code>web/terminal.js</code> bars</td><td>I.1</td><td>1</td></tr>
+<tr><td>Agents overview behind the heading (decision 2)</td><td>D</td><td><code>web/app.js</code> <code>PAGES</code>, <code>pageFor</code>; <code>web/agents.js</code></td><td>I.3</td><td>1</td></tr>
+<tr><td>Kept terminal (decision 4)</td><td>E</td><td><code>web/app.js</code> <code>App</code>; <code>web/terminal.js</code> <code>TerminalPage</code></td><td>I.4, I.7</td><td>1</td></tr>
+<tr><td>⌘K, ⌘\ everywhere</td><td>G</td><td><code>web/app.js</code> <code>useKeyboard</code>, <code>Palette</code>; <code>web/terminal.js</code> key handler</td><td>I.2</td><td>1</td></tr>
+<tr><td>Documents as focus view (decision 3)</td><td>F</td><td><code>web/reader.js</code>, <code>web/app.js</code>, link sites in F.4; <code>http.rs</code> route</td><td>I.5, I.6, I.8</td><td>2</td></tr>
+<tr><td>Phone unchanged (decision 5)</td><td>B.7</td><td><code>web/app.css</code> ≤720 px block</td><td>I.1</td><td>1</td></tr>
 </tbody>
 </table>
 
-<h3 id="b">B. Layout</h3>
+<h3 id="b">B. Frame and sidebar</h3>
 <ol>
-<li><code>App()</code> no longer returns early for the terminal page. It renders the normal <code>.app</code> grid with <code>Rail</code> in the first column and the terminal page in the second, with class <code>term-mode</code> on <code>.app</code>. On the terminal page it does <b>not</b> render <code>TopBar</code>, <code>NightBanner</code> or the right-hand <code>Panel</code>; the terminal page keeps its own top bar and its own Details/Notes column beside the terminal, as today.</li>
-<li>In <code>term-mode</code> the navigation is drawn folded (<code>--rail-w: 3.2rem</code>, the existing <code>.folded</code> rules) whatever <code>sm-layout.rail</code> says, and the saved <code>sm-layout.rail</code> value is not changed. Leaving the terminal page restores the saved form. The fold strip (F) is not drawn in <code>term-mode</code>.</li>
-<li><code>.term-page</code> stops being <code>position: fixed; inset: 0; z-index: 30</code>. It fills its grid cell (<code>height: 100%</code>, flex column as now). Everything inside it (bar, session list, edge strip, body, side panels, notices, popovers anchored with <code>position: fixed</code> at <code>top: 44px; right: 12px</code>) keeps its current rules; the popovers' right anchor is unaffected because they hang from the right edge.</li>
-<li>Width 720 px and below: <code>term-mode</code> hides <code>.rail</code> (<code>display: none</code>) and the terminal page takes the full width, exactly as today. No bottom tab bar on the terminal page.</li>
-<li>Between 720 and 900 px: the narrow navigation shows; the session list keeps its existing overlay behaviour, which is positioned inside <code>.term-main</code> and so sits right of the navigation.</li>
-<li>Toasts, the bug dialog and the retire confirmation keep their current stacking; the navigation must sit below them (it has no z-index today, which suffices once <code>.term-page</code> is no longer a fixed overlay).</li>
-</ol>
-
-<h3 id="c">C. The Terminal page item and <code>/terminal</code></h3>
-<ol>
-<li><code>PAGES</code> gains <code>{ key: 'terminal', label: 'Terminal', icon: 'terminal', path: '/terminal', key_hint: 't' }</code> immediately after Agents. The <code>terminal</code> icon already exists in <code>web/ui.js</code>. No badge.</li>
-<li><code>pageFor</code> returns <code>'terminal'</code> for <code>/terminal</code> and <code>/terminal/…</code>. The item is highlighted (<code>on</code>, <code>aria-current="page"</code>) on every terminal page.</li>
-<li><b>Remembering.</b> Whenever the terminal page shows session <i>X</i>, the client stores <i>X</i> under local storage key <code>sm-term-last</code> (via <code>store</code>, so a blocked storage is harmless).</li>
-<li><b>Target.</b> A click on the item, <code>g t</code>, the ⌘K "Terminal" page row, or arriving at bare <code>/terminal</code> resolves the target from the shared watch state (<code>/watch/state</code> sessions; fetch once if the shared copy is empty):
+<li><b>Frame.</b> <code>App()</code> renders one grid on every page: <code>sidebar | main | [side panel]</code>. <code>main</code> is the top bar plus the page or focus view. There is no early return for the terminal page; <code>.term-page</code> stops being a <code>position: fixed</code> overlay and fills <code>main</code>. The terminal page's own Details/Notes column becomes the app's side panel (one side panel component for all pages, resizable and widenable as today's <code>Panel</code>). On the terminal view, <code>agent:&lt;id&gt;</code> for the current agent still renders details only (<code>beside='terminal'</code>), and the Notes pane keeps "Type into terminal".</li>
+<li><b>Width.</b> Open: <code>15.5rem</code> (today's switcher width). Folded: a <code>14px</code> strip with today's <code>.term-edge</code> look; clicking it opens the sidebar. The fold control when open is the same strip on the sidebar's right edge.</li>
+<li><b>Contents, top to bottom.</b>
   <ol type="a">
-  <li><code>sm-term-last</code> if that session exists and is not stopped (hidden shells count: you opened it last);</li>
-  <li>else the first row of <code>switcherGroups(sessions, null, false).order</code>, which is the first Needs-you agent, then Moving, and so on, never a hidden shell;</li>
-  <li>else stay on, or go to, <code>/</code> and toast "No live agents or shells".</li>
-  </ol>
-  It then navigates to <code>/terminal/&lt;id&gt;</code>. From bare <code>/terminal</code> it uses <code>history.replaceState</code>, so Back does not land on the bare address again. Clicking the item while already on a terminal page does nothing.</li>
-<li>Example: you open far-2390's terminal, go to Board, far-2390 is retired by its parent, you click Terminal. <code>sm-term-last</code> is far-2390, which is stopped, so the target is the top session-list row, far-2419-o-h3 (Needs you).</li>
-<li>Server: add <code>.route("/terminal", get(web::get_shell_only_page))</code> beside the existing <code>/terminal/{session_id}</code> route in <code>http.rs</code>, so a reload or a typed <code>sm.rajeshgo.li/terminal</code> serves the app. Same owner check, same 404 on non-browser hosts.</li>
-<li>The ⌘K list shows "Terminal" as a Page row with detail <code>g t</code>, from <code>pageItem</code> unchanged.</li>
+  <li>"sm" (navigates to <code>/</code>).</li>
+  <li>Search box, label "Search or jump…", <kbd>⌘K</kbd> hint; click opens the palette.</li>
+  <li>Page links: Inbox, Board, Queue, Artifacts, Notes, with today's badges from <code>badges()</code>. Queue's row also shows <code>&lt;running&gt; run · &lt;waiting&gt;</code> (amber when a job has waited 30 minutes), replacing the top bar meter. The current page is highlighted.</li>
+  <li>Agents heading (D.1) and the session list (D.2). This part alone scrolls; everything above and below stays put.</li>
+  <li>Foot: the usage <code>Dash</code> in a compact three-line form (Claude windows; Codex; Mac memory, CPU, GPU), each value tinted as today; then a row with Settings, the overnight moon (today's top bar control) and "More ▾" (Analytics, History, Guestbook).</li>
+  </ol></li>
+<li><b>Folded strip signal.</b> When folded, the strip shows one dot at its top: red if an agent is blocked, magenta if anything needs you (Inbox needs-you count &gt; 0 or a Needs-you agent), otherwise none.</li>
+<li><b>Fold state</b> is remembered per view kind in local storage <code>sm-sidebar</code> = <code>{ pages, terminal, doc }</code>, each <code>open|folded</code>. Defaults: <code>pages</code> open at ≥1100 px else folded; <code>terminal</code> open at ≥900 px else folded; <code>doc</code> folded. First run migrates <code>sm-layout.rail</code> (<code>full</code>→open) into <code>pages</code> and <code>sm-term-switcher</code> into <code>terminal</code>.</li>
+<li><b>720–900 px.</b> The sidebar, when opened, overlays <code>main</code> (today's switcher overlay rule) and closes after a pick.</li>
+<li><b>≤720 px (phone).</b> Unchanged. List pages keep today's bottom tab bar (the same page items as today, Agents first); the terminal is full screen with today's phone bar and key row; the document view is full screen with a back arrow. No sidebar.</li>
+<li>Example: 1512×820 window, Board page, <code>sm-sidebar.pages=open</code>. Sidebar 15.5 rem; Board gets the rest. Clicking far-2390 navigates to <code>/terminal/&lt;far-2390 id&gt;</code>; the sidebar stays open because <code>terminal=open</code>; the row is highlighted.</li>
 </ol>
 
-<h3 id="d">D. Keyboard and ⌘K</h3>
+<h3 id="c">C. Top bar</h3>
 <table>
-<thead><tr><th>Key</th><th>Terminal page today</th><th>After</th></tr></thead>
+<thead><tr><th>View</th><th>Left</th><th>Right</th></tr></thead>
 <tbody>
-<tr><td>⌘K</td><td>Typed nowhere; app ignores it</td><td>Opens ⌘K search. The terminal's custom key handler returns <code>false</code> for ⌘K (and Ctrl+K is <i>not</i> intercepted: it is readline's kill-line).</td></tr>
-<tr><td>⌘\</td><td>Folds the session list</td><td>Unchanged. The app's own ⌘\ (fold navigation) stays off on the terminal page.</td></tr>
-<tr><td>⌘J, ⌘[, ⌘⌥↑/↓</td><td>Notes, back, step list</td><td>Unchanged.</td></tr>
-<tr><td><code>g</code> + letter, Escape</td><td>Go to the terminal</td><td>Unchanged: they belong to the terminal. <code>g t</code> works on every other page.</td></tr>
-<tr><td>⌘.</td><td>Ignored</td><td>Unchanged (no right-hand panel on the terminal page).</td></tr>
+<tr><td>List pages</td><td>Page name</td><td>Bug button. (Search, queue meter, moon and New agent move to the sidebar.)</td></tr>
+<tr><td>Terminal (wide)</td><td>Today's: dot, name, context ring, connection word when not live</td><td>Today's: Notes ⌘J, Details, Hide (shells), Hand off…, ⋯, hidden shells, Open in Claude, Redraw, Bug, Retire. The "sm" home link leaves the bar (the sidebar has it).</td></tr>
+<tr><td>Terminal (phone)</td><td colspan="2">Today's phone bar, unchanged, including its "sm" link and back arrow.</td></tr>
+<tr><td>Document</td><td>← back, document title</td><td>The reader's existing controls (version, Review, Ask), Bug.</td></tr>
 </tbody>
 </table>
-<p>In <code>useKeyboard</code>, the early return for the terminal page moves below the ⌘K branch. In <code>Palette</code>, when the current page is the terminal page, an Agent or Terminal row navigates to <code>/terminal/&lt;id&gt;</code>; on every other page Agent rows keep opening the details card. Closing the search box on the terminal page returns focus to the terminal (the page's existing <code>refocus</code>).</p>
+<p>Bar height is 40 px everywhere. The <code>NightBanner</code> stays under the bar on list pages only.</p>
 
-<h3 id="e">E. Keeping the terminal connected</h3>
+<h3 id="d">D. Agents heading, rows, overview</h3>
 <ol>
-<li><b>One kept terminal.</b> <code>App()</code> holds <code>kept = { id, leftAt }</code>. On leaving a terminal page for a non-terminal page, <code>kept</code> becomes that page's id and the time. The <code>TerminalPage</code> element for <code>kept.id</code> stays mounted (same Preact key, so its effect does not re-run), inside a wrapper with the <code>hidden</code> attribute, alongside the normal page. Returning to <code>/terminal/kept.id</code> un-hides it. Navigating to any other terminal id unmounts the kept one first (today's teardown: detach, close socket, dispose).</li>
-<li><b>No resize while hidden.</b> This is the one hazard: a hidden element measures 0×0, and a resize sent from it would shrink the agent's real tmux window. While hidden, the page sends no <code>resize</code> frame and runs no fit. On un-hide it fits once and sends one <code>resize</code> if the size differs from the last one sent. The test in H.5 proves no resize frame leaves while hidden.</li>
-<li><b>Focus.</b> On hide, the terminal is blurred, so keys typed on Board never reach the agent. On un-hide it is focused, as on a fresh open.</li>
-<li><b>While hidden</b> output keeps arriving and is written to the off-screen terminal; pings continue; the connection label logic is unchanged. A reconnect triggered while hidden proceeds as normal.</li>
-<li><b>15-minute limit.</b> When the kept terminal has been hidden 15 minutes, the app unmounts it and clears <code>kept</code>. The next visit opens fresh. A timer, not a poll; cleared on return.</li>
-<li><b>Session ends while hidden.</b> If the watch state shows it stopped, or the connection reaches Ended, unmount and clear <code>kept</code>. Retiring from the terminal page itself keeps today's behaviour (move to next row).</li>
-<li><b>Browser tab events.</b> <code>pagehide</code>/<code>pageshow</code> handling is unchanged and applies to the kept terminal too.</li>
-<li>The Details or Notes column beside a kept terminal is part of the URL (<code>?open=</code>); returning via the Terminal item opens the bare <code>/terminal/&lt;id&gt;</code> (no column), and the terminal refits to the wider space on un-hide.</li>
+<li><b>Heading.</b> "Agents", then "<i>n</i> needs you" in magenta when n&gt;0, then a <b>+</b> button at the right. Clicking the heading text navigates to <code>/</code> (the overview). <b>+</b> opens today's New session sheet (<code>bus.emit('new-agent')</code>), which already offers agent or terminal.</li>
+<li><b>Rows</b> are today's <code>Switcher</code> rows and grouping (<code>switcherGroups</code>), unchanged: two lines, ✓ mark-answered, Idle collapsed with its count, Terminals section, hidden shells excluded except the current one. A click navigates to <code>/terminal/&lt;id&gt;</code>. The current row is highlighted only on that agent's terminal view.</li>
+<li><b>Overview.</b> The Agents page (<code>/</code>) is unchanged in content: attention summary, By attention/By repo, Live/With stopped, cards, details band, shell tiles, keys j/k/Enter/t/c/x. Its page link leaves the page list (the heading replaces it); <code>g a</code> still goes there.</li>
 </ol>
 
-<h3 id="f">F. Navigation fold strip</h3>
-<p>The navigation's ‹/› fold button beside "sm" is replaced by a full-height 14 px strip on the navigation's right edge, drawn with the same rules as the terminal's <code>.term-edge</code> (border, hover colour, fold/unfold icon, title "Fold menu (⌘\)" / "Expand menu (⌘\)"). ⌘\ is unchanged. Not drawn at 720 px and below (bottom tab bar) or in <code>term-mode</code>. The strip adds 14 px to the navigation width in both forms, so <code>--rail-w</code> grows by that amount; the <code>.app.wide .panel</code> left offset follows <code>--rail-w</code> already.</p>
-
-<h3 id="g">G. Title, and what does not change</h3>
+<h3 id="e">E. Terminal view and kept connection</h3>
 <ol>
-<li>Tab title on the terminal page: <code>&lt;session name&gt; · sm</code> once the name is known, <code>sm · Terminal</code> before that. Other pages unchanged.</li>
-<li>Unchanged: the terminal page's top bar contents and order, the session list, phone key row, routes and round-trip display, image paste, file links, Details and Notes beside the terminal, the Agents page card terminal icon and <code>t</code> key, Board/Queue "⌨" chips, the Android app.</li>
-<li>Bug reports filed from the terminal page keep <code>page="Terminal"</code>.</li>
+<li>Inside the terminal page, the old <code>.term-side</code> column (switcher and edge strip) is removed; the sidebar replaces it. Retire still moves to the next row by today's <code>rowAfterRetire</code>, computed on the sidebar's order.</li>
+<li><b>One kept terminal.</b> <code>App()</code> holds <code>kept = { id, leftAt }</code>. Leaving a terminal view for any non-terminal view sets it. The <code>TerminalPage</code> for <code>kept.id</code> stays mounted with the same key inside a wrapper with the <code>hidden</code> attribute. Returning to <code>/terminal/kept.id</code> un-hides it. Opening a different terminal unmounts the kept one first with today's teardown.</li>
+<li><b>No resize while hidden.</b> A hidden element measures 0×0; a resize from it would shrink the agent's real tmux window. While hidden the page runs no fit and sends no <code>resize</code> frame. On un-hide it fits once and sends one <code>resize</code> only if the size differs from the last one sent.</li>
+<li><b>Focus.</b> On hide, the terminal is blurred, so keys typed elsewhere never reach the agent. On un-hide it takes focus.</li>
+<li>While hidden, output is written to the off-screen terminal, pings continue, reconnects proceed as today.</li>
+<li>After 15 minutes hidden the app unmounts it and clears <code>kept</code>; a timer, cleared on return. If the session stops or the connection reaches Ended while hidden, the same happens immediately.</li>
+<li><code>pagehide</code>/<code>pageshow</code> handling is unchanged and covers the kept terminal.</li>
+<li>Tab title on a terminal view: <code>&lt;session name&gt; · sm</code>.</li>
 </ol>
 
-<h3 id="h">H. Tests and live check</h3>
+<h3 id="f">F. Document view</h3>
 <ol>
-<li><b>Layout</b> (browser harness, <code>scripts/test-web-terminal.mjs</code> or a sibling): at 1440 px the terminal page shows <code>nav.rail</code> folded with a Terminal item marked current, no <code>.bar</code> top bar; at 390 px no <code>nav.rail</code> is visible; tab title is the session name.</li>
-<li><b>Keys:</b> ⌘K on the terminal page opens the search box and sends nothing to the terminal; Ctrl+K reaches the terminal; picking an agent row navigates to its <code>/terminal/</code> address.</li>
-<li><b>Target resolution</b> (unit, <code>tests/web/*.test.mjs</code>): the four cases of C.4 including the example in C.5, and that hidden shells are skipped in step b but honoured in step a.</li>
-<li><b>Route:</b> <code>GET /terminal</code> returns the app on the browser host and 404 on any other host (new Rust test in <code>http/browser_terminal_tests.rs</code>).</li>
-<li><b>Kept connection:</b> open a terminal, go to Board: the socket stays open, zero <code>resize</code> frames are sent while hidden, a keypress on Board sends no <code>input</code> frame; return: no new attach ticket is minted. After the 15-minute timer (fake clock) the socket closes. Opening a second terminal closes the first socket.</li>
-<li><b>Live:</b> on the restarted server, Board → Terminal → Queue → Terminal with an agent printing output; screen returns without the "Connecting" notice and shows the new output; the agent's tmux size is unchanged.</li>
+<li><b>Route.</b> In-app document addresses are <code>/read/&lt;reader path&gt;</code>, where the reader path is what <code>readerPath()</code> accepts today (<code>/docs/…</code>, <code>/messages/…</code>, <code>/t/…</code>), query and fragment kept. Example: <code>/read/docs/session-manager/docs/working/2543_terminal_in_app.html?version=291f65d4bbea#sm-review</code>. Server: <code>.route("/read/{*rest}", get(web::get_shell_only_page))</code>, same owner check and host rule as the other shell routes.</li>
+<li><b>Render.</b> <code>pageFor</code> returns <code>doc</code>; <code>main</code> shows the C top bar and today's <code>Reader</code> component filling the main area (its iframe of the server document page, ask thread and review sheet unchanged). Sidebar uses the <code>doc</code> fold state.</li>
+<li><b>Back.</b> The ← button and ⌘[ do <code>history.back()</code> when the previous entry is in this app, else navigate to <code>/</code>. Because opening a document is a <code>pushState</code>, Back from a document reached from a terminal lands on that terminal, which is still connected (E.2).</li>
+<li><b>Every opener switches</b> from <code>openPanel('doc:…')</code> to <code>navigate('/read' + path)</code>: <code>web/inbox.js:121, 229, 267, 268, 277</code>; <code>web/history.js:110</code>; <code>web/reader.js:100, 149</code> (links inside a document stay in the document view); <code>web/ui.js:485</code>; terminal file and web links whose target is a same-origin reader path (<code>web/terminal.js</code> <code>openLink</code>). The <code>doc</code> panel registration (<code>web/reader.js:181</code>) is removed. Old links of the form <code>?open=doc:&lt;path&gt;</code> are rewritten on arrival with <code>history.replaceState</code> to <code>/read&lt;path&gt;</code>.</li>
+<li>Inbox keeps its own inline thread and work views; only documents leave the Inbox's right side.</li>
+<li><b>Unchanged:</b> a direct load of <code>sm.rajeshgo.li/docs/…</code> (published links, the phone app) still serves the standalone document page. Its existing "full screen" path (<code>fullScreen</code>) is removed from the app, because the document view is already full width.</li>
+<li>Tab title: <code>&lt;document title&gt; · sm</code>.</li>
+</ol>
+
+<h3 id="g">G. Keyboard</h3>
+<table>
+<thead><tr><th>Key</th><th>Lists</th><th>Terminal view</th><th>Document view</th></tr></thead>
+<tbody>
+<tr><td>⌘K</td><td>Search</td><td>Search (terminal key handler lets ⌘K through; Ctrl+K still reaches the terminal)</td><td>Search</td></tr>
+<tr><td>⌘\</td><td colspan="3">Fold or open the sidebar (one meaning everywhere; saved per view kind, B.5)</td></tr>
+<tr><td>⌘⌥↑ / ⌘⌥↓</td><td colspan="3">Open the previous / next row's terminal (today's <code>stepRow</code>, sidebar order)</td></tr>
+<tr><td>⌘[</td><td>Browser back</td><td>Back (today)</td><td>Back (F.3)</td></tr>
+<tr><td>⌘J</td><td colspan="3">Notes pane (today)</td></tr>
+<tr><td><code>g</code>+letter</td><td>Page jumps (today)</td><td>Off: keys belong to the terminal</td><td>Page jumps</td></tr>
+</tbody>
+</table>
+<p>In the palette, an Agent or Terminal row opens that session's terminal on every page; a Doc row opens the document view. Closing the palette on a terminal view refocuses the terminal.</p>
+
+<h3 id="h">H. Tickets</h3>
+<ol>
+<li><b>One sidebar</b>: B, C, D, E, G. Files: <code>web/app.js</code>, <code>web/terminal.js</code>, <code>web/agents.js</code>, <code>web/app.css</code>, tests. Starts after #2540 / PR #2542.</li>
+<li><b>Documents as a focus view</b>: F, plus the document rows of C and G. Files: <code>web/reader.js</code>, <code>web/inbox.js</code>, <code>web/history.js</code>, <code>web/ui.js</code>, <code>web/terminal.js</code> (link handler only), <code>web/app.js</code>, <code>http.rs</code>, tests. Starts after ticket 1.</li>
+</ol>
+
+<h3 id="i">I. Tests and live checks</h3>
+<ol>
+<li><b>Layout</b> (browser harness beside <code>scripts/test-web-terminal.mjs</code>): at 1440 px every page shows one <code>nav</code> sidebar with search, page links, Agents heading, rows and meters, and no second left column; the terminal view's bar has no "sm" link; at 390 px list pages show the bottom tab bar and no sidebar.</li>
+<li><b>Keys:</b> ⌘K on a terminal view opens search and sends no input frame; Ctrl+K reaches the terminal; ⌘\ folds and the fold state persists per view kind; ⌘⌥↓ opens the next row's terminal.</li>
+<li><b>Overview:</b> heading click lands on <code>/</code>; <b>+</b> opens the New session sheet; <code>g a</code> works.</li>
+<li><b>Kept connection:</b> open a terminal, go to Board: socket stays open, zero <code>resize</code> frames while hidden, a keypress on Board sends no <code>input</code> frame; return mints no new attach ticket. Fake clock past 15 minutes closes the socket. Opening a second terminal closes the first socket.</li>
+<li><b>Document openers:</b> each site in F.4 navigates to <code>/read…</code>; <code>?open=doc:</code> is rewritten; no <code>doc</code> panel renders anywhere.</li>
+<li><b>Route:</b> Rust test in <code>http/browser_terminal_tests.rs</code> style: <code>GET /read/docs/x</code> serves the app on the browser host and 404s on another host; <code>GET /docs/x</code> is unchanged.</li>
+<li><b>Live, ticket 1:</b> terminal → Board → same agent in sidebar: no "Connecting" notice, new output present, the agent's tmux size unchanged.</li>
+<li><b>Live, ticket 2:</b> from an agent's Details, open a document link, read, ⌘[: back on the terminal, still connected.</li>
 </ol>
 
 <h3 id="z">Z. FAQ</h3>
-<p><b>Why not render the navigation inside <code>TerminalPage</code>?</b> The navigation's badges and meters come from <code>useRailData</code> in <code>App()</code>; rendering the one <code>Rail</code> from <code>App()</code> keeps a single source and a single component.</p>
-<p><b>Why 15 minutes?</b> Long enough to cover a look at Board, Queue or a doc and back, the pattern the two-tab habit serves; short enough that a forgotten terminal does not stream output over the Cloudflare relay all afternoon. It is a constant; changing it later is one line.</p>
-<p><b>Why only one kept terminal?</b> Switching between agents goes through the session list, which reconnects today and is not part of the complaint. Keeping several would multiply streams for little gain.</p>
-<p><b>Does this touch the Android app?</b> No. Its terminal is a separate WebView page with native navigation around it.</p>
+<p><b>Why keep the Agents overview at all?</b> It is the only place showing stopped agents, the By repo grouping, and per-agent facts side by side. Web request logs for the last two weeks show the terminal screen about four times as busy as the Agents page, so it is a secondary view, but not an empty one. If it stays unused after this ships, landing on the terminal of the agent that most needs you is a one-line change.</p>
+<p><b>Why 15 minutes for the kept terminal?</b> It covers a look at Board, Queue or a document and back, which is what the second tab is used for, without a forgotten terminal streaming over the Cloudflare relay all afternoon. It is a constant.</p>
+<p><b>Why only one kept terminal?</b> Moving between agents through the sidebar reconnects today and is not part of the complaint. Keeping several multiplies streams for little gain.</p>
+<p><b>Why not put page links in a top bar?</b> It frees width, but the terminal and document views need their bar for their own title and actions, so pages would need a second bar, costing two terminal rows on every screen.</p>
+<p><b>Does the Android app change?</b> No. It has native navigation and its own terminal and document screens.</p>
 
 <!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
      The block is self-contained and appended to every memo that uses the house tokens;
