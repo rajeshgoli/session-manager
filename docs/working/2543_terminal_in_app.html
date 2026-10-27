@@ -124,146 +124,328 @@
 </style>
 
 <h1>2543 — One app: the terminal, documents and pages share one frame</h1>
-<p class="sans"><small>Author: Claude (Opus 5.5) <code>0ba7dfd9</code> · Ticket #2543 · 2026-10-27 · Revision 4</small></p>
+<p class="sans"><small>Author: Claude (Opus 5.5) <code>0ba7dfd9</code> · Ticket #2543 · 2026-10-27 · Revision 5</small></p>
 
 <h2>Memo</h2>
 
-<p><b>I recommend that the terminal page's layout become the layout of the whole web app.</b> Every page gets one left sidebar with three parts: page links (Inbox, Board, Queue…), the live agents and shells (the list that today exists only on the terminal page), and usage meters. They take turns for the height. On a terminal, the agents list is open and the page links and meters shrink to one line each. On every other page, page links and meters are open as today and the agents list shrinks to one line. A click on a shrunk part opens it. The Agents page becomes the overview you reach by clicking the "Agents" heading. A terminal and a document become two <i>focus views</i>: they fill the space right of the sidebar. A document folds the sidebar away so you can read. The side panel on the right goes back to small things about what you are looking at: details, messages, a queue job, notes. Documents no longer open there.</p>
+<p><b>I recommend that the terminal page's layout become the layout of the whole web app.</b> Every page gets one left sidebar. It holds the page links as today, the live agents and shells (the list that today exists only on the terminal page), compact usage meters, and Settings. On a terminal the sidebar puts agents first; on every other page it puts pages first. The Agents page becomes the overview behind the "Agents" heading. Documents open full width instead of in the side panel. The top bar shows only what you are looking at, with the moon and the bug button at its right end on every screen.</p>
 
-<p>The result is one sidebar and one top bar on every screen, both always in the same place. From a terminal, any page is one click away. From any page, an agent that needs you is one click away and any other agent two; ⌘[ returns to the terminal you just left, still connected.</p>
+<p>From a terminal, any page is one click away. From any page, any agent is one click away. ⌘[ returns to the terminal you just left, still connected.</p>
 
 <dl class="vocab">
-  <dt>Sidebar</dt><dd>The single left column on every page: "sm" and the search box (⌘K); page links with their badges; the <b>Agents</b> heading and the live agents and shells, grouped Needs you / Finished / Moving / Waiting / Idle / Terminals; usage meters and Settings. The agents list is either <i>open</i> (page links shrink to a row of icons, meters to one line) or <i>shrunk</i> (one line, plus agents that need you). The whole sidebar also folds to a thin strip with ⌘\ or a click on that strip.</dd>
-  <dt>Focus view</dt><dd>A page whose subject is one thing that wants the whole width: an agent's or shell's terminal, or a document.</dd>
-  <dt>Top bar</dt><dd>The 40-pixel bar above the main area. Left: what you are looking at (a page name, an agent's name and context ring, a document's title). Right: actions on it. Today's terminal page bar is the model.</dd>
+  <dt>Sidebar</dt><dd>The single left column on every page. From the top: "sm" and the search box (⌘K); the page links; the <b>Agents</b> heading and the live agents and shells; the usage meters; Settings. It folds to a thin strip with ⌘\ or a click on that strip.</dd>
+  <dt>Pages first, agents first</dt><dd>The sidebar's two arrangements. <i>Pages first</i>: every page link as today, and each agent on a one-line row. <i>Agents first</i>: page links as one row of icons, and each agent on today's two-line row. Pages first is the default on pages; agents first is the default on a terminal. The chevron after "10 live" swaps them.</dd>
+  <dt>Focus view</dt><dd>A page about one thing that wants the whole width: an agent's or shell's terminal, or a document.</dd>
+  <dt>Top bar</dt><dd>The bar above the main area. Left: what you are looking at. Right: actions on it, then the moon and the bug button.</dd>
   <dt>Side panel</dt><dd>The resizable column on the right: an agent's details and message thread, a queue job, a ticket, Notes.</dd>
 </dl>
 
-<h3>What you see</h3>
+<h3>The screens</h3>
+<p>All six screens are drawn at the size of the window in your screenshots, 1512 × 820, with ten live agents. They use the app's own colours, fonts and icons.</p>
 
-<figure>
-<svg class="mock" viewBox="0 0 720 372" role="img" aria-label="Terminal view: sidebar with page icon row, ten agents, one-line meters; agent bar; terminal">
-  <rect class="frame" x="0.5" y="0.5" width="719" height="371" rx="4"/>
-  <rect class="side" x="0.5" y="0.5" width="160" height="371"/>
-  <text class="b" x="8" y="15" style="fill:var(--blue)">sm</text>
-  <rect class="box" x="26" y="5" width="126" height="14" rx="3"/><text class="xs" x="31" y="15">Search or jump…</text><text class="xs" x="132" y="15">⌘K</text>
-  <text x="10" y="35">✉</text><circle class="att" cx="20" cy="27" r="2"/><text x="31" y="35">▦</text><text x="52" y="35">≡</text><text x="73" y="35">◫</text><text x="94" y="35">✎</text><text x="117" y="35">⋯</text><text x="138" y="35">⚙</text>
-  <line x1="6" x2="154" y1="41" y2="41" stroke="var(--rule)"/>
-  <text class="b" x="8" y="53">Agents</text><text class="xs" x="44" y="53">10 live ⌄ · 1 needs you</text><text class="b" x="146" y="53">+</text>
-  <text class="h" x="8" y="66" style="fill:#a21caf">NEEDS YOU</text>
-  <circle class="att" cx="12" cy="73" r="2.5"/><text class="b" x="19" y="76">far-2419-o-h3</text><text x="146" y="76" style="fill:#a21caf">✓</text>
-  <text class="xs" x="19" y="86" style="fill:#a21caf">◆ 41h: Review iteration 11 memo</text>
-  <text class="h" x="8" y="100" style="fill:var(--blue)">FINISHED</text>
-  <circle cx="12" cy="107" r="2.5" style="fill:var(--blue)"/><text class="b" x="19" y="110">sm-2544</text>
-  <text class="xs" x="19" y="120" style="fill:var(--blue)">✔ Fixed and live: an agent that…</text>
-  <text class="h" x="8" y="134" style="fill:var(--green)">MOVING</text>
-  <rect class="sel" x="1" y="137" width="159" height="22"/><rect x="1" y="137" width="2.5" height="22" style="fill:var(--blue)"/>
-  <circle class="mov" cx="12" cy="143" r="2.5"/><text class="b" x="19" y="146">sm-2543</text><text class="xs" x="19" y="156" style="fill:var(--green)">Working 0m</text>
-  <circle class="mov" cx="12" cy="165" r="2.5"/><text class="b" x="19" y="168">far-2390-h2</text><text class="xs" x="19" y="178" style="fill:var(--green)">▶ Background running 39m of 4h</text>
-  <circle class="mov" cx="12" cy="187" r="2.5"/><text class="b" x="19" y="190">far-2454</text><text class="xs" x="19" y="200" style="fill:var(--green)">▶ Tests running 3m of 15m</text>
-  <circle class="mov" cx="12" cy="209" r="2.5"/><text class="b" x="19" y="212">sm-2537</text><text class="xs" x="19" y="222" style="fill:var(--green)">Working 2m</text>
-  <text class="h" x="8" y="236" style="fill:var(--orange)">WAITING</text>
-  <circle cx="12" cy="243" r="2.5" style="fill:var(--orange)"/><text class="b" x="19" y="246">sm-2540</text><text class="xs" x="19" y="256" style="fill:var(--orange)">❚❚ Waiting on review by GitHub Codex</text>
-  <circle cx="12" cy="265" r="2.5" style="fill:var(--orange)"/><text class="b" x="19" y="268">far-2431</text><text class="xs" x="19" y="278" style="fill:var(--orange)">❚❚ Waiting on queue: perf slot</text>
-  <text class="xs" x="8" y="294">IDLE · 2 ›</text>
-  <text class="h" x="8" y="308" style="fill:var(--ink-3)">TERMINALS</text>
-  <text class="xs" x="10" y="320">▹</text><text x="19" y="320">studio-zsh</text>
-  <line x1="6" x2="154" y1="354" y2="354" stroke="var(--rule)"/>
-  <text class="xs" x="8" y="366">Claude 2%·25%  Codex 6%  CPU <tspan style="fill:var(--red)">100%</tspan></text>
-  <rect class="bar" x="160.5" y="0.5" width="559" height="26"/>
-  <circle class="mov" cx="172" cy="14" r="3.5"/><text class="b" x="180" y="17">sm-2543</text><circle cx="236" cy="14" r="7" fill="none" stroke="var(--green)"/><text class="xs" x="231" y="17">21</text>
-  <text class="xs" x="420" y="17">Notes ⌘J   Details   Hand off…   ⋯    ↻   🐞</text><text class="xs" x="680" y="17" style="fill:var(--red)">Retire</text>
-  <rect class="term" x="160.5" y="26.5" width="559" height="345"/>
-  <text class="mono" x="172" y="48">Claude Code v2.1.285 · Opus 5.5 (1M context)</text>
-  <text class="mono" x="172" y="70">❯ You own #2543 in rajeshgoli/session-manager. Begin</text>
-  <text class="mono" x="172" y="88">● Claimed #2543; mapping the web app shell.</text>
-  <text class="mono" x="172" y="340">❯ ▌</text>
-  <g><circle class="tagc" cx="160" cy="31" r="7"/><text x="157" y="34" style="fill:#fff;font-weight:700">1</text></g>
-  <g><circle class="tagc" cx="160" cy="200" r="7"/><text x="157" y="203" style="fill:#fff;font-weight:700">2</text></g>
-  <g><circle class="tagc" cx="160" cy="362" r="7"/><text x="157" y="365" style="fill:#fff;font-weight:700">3</text></g>
-  <g><circle class="tagc" cx="400" cy="14" r="7"/><text x="397" y="17" style="fill:#fff;font-weight:700">4</text></g>
-</svg>
-<figcaption><b>An agent's terminal, ten agents live, drawn to scale for an 820-point-tall window.</b> The Agents list is open, so everything else in the sidebar shrinks. (1) Page links become one row of icons with badge dots: Inbox, Board, Queue, Artifacts, Notes, More, Settings. (2) The agents list you use today, with about 590 of the 820 points. (3) Usage shrinks to one line; red or amber shows only when a meter is high. (4) The top bar is unchanged. The terminal is as wide as today.</figcaption>
-</figure>
-
-<div class="twoup">
-<figure>
-<svg class="mock" viewBox="0 0 360 220" role="img" aria-label="Board page: page links and meters open, agents list folded to one line">
-  <rect class="frame" x="0.5" y="0.5" width="359" height="219" rx="4"/>
-  <rect class="side" x="0.5" y="0.5" width="84" height="219"/>
-  <text class="b" x="5" y="12" style="fill:var(--blue)">sm</text><rect class="box" x="20" y="4" width="60" height="11" rx="2"/><text class="xs" x="24" y="12">Search ⌘K</text>
-  <text class="xs" x="8" y="30">Inbox</text><text class="xs" x="74" y="30" style="fill:#a21caf">1</text>
-  <rect class="sel" x="1" y="34" width="83" height="11"/><text class="xs" x="8" y="42" style="fill:var(--ink)">Board</text>
-  <text class="xs" x="8" y="54">Queue</text><text class="xs" x="60" y="54">1 · 0</text><text class="xs" x="8" y="66">Artifacts</text><text class="xs" x="8" y="78">Notes</text>
-  <line x1="4" x2="80" y1="84" y2="84" stroke="var(--rule)"/>
-  <text class="b" x="5" y="95" style="font-size:8px">Agents</text><text class="xs" x="36" y="95">10 live ›</text>
-  <circle class="att" cx="9" cy="104" r="2.5"/><text class="xs" x="15" y="107" style="fill:var(--ink)">far-2419-o-h3</text>
-  <line x1="4" x2="80" y1="114" y2="114" stroke="var(--rule)"/>
-  <text class="xs" x="5" y="125">CLAUDE  5-hour 2%</text><rect x="5" y="128" width="74" height="2" fill="var(--rule)"/>
-  <text class="xs" x="5" y="139">This week 25%</text><rect x="5" y="142" width="74" height="2" fill="var(--rule)"/><rect x="5" y="142" width="18" height="2" fill="var(--green)"/>
-  <text class="xs" x="5" y="153">CODEX  week 6%</text><rect x="5" y="156" width="74" height="2" fill="var(--rule)"/>
-  <text class="xs" x="5" y="167">MAC  Mem 114/256G</text><rect x="5" y="170" width="74" height="2" fill="var(--rule)"/><rect x="5" y="170" width="33" height="2" fill="var(--green)"/>
-  <text class="xs" x="5" y="181">CPU 100%</text><rect x="5" y="184" width="74" height="2" fill="var(--red)"/>
-  <text class="xs" x="5" y="208">⚙ Settings  ☾  More</text>
-  <rect class="bar" x="84.5" y="0.5" width="275" height="20"/><text class="b" x="92" y="14">Board</text><text class="xs" x="340" y="14">🐞</text>
-  <rect class="box" x="92" y="30" width="80" height="180" rx="3"/><rect class="box" x="180" y="30" width="80" height="180" rx="3"/><rect class="box" x="268" y="30" width="84" height="180" rx="3"/>
-  <rect class="box" x="98" y="40" width="68" height="22" rx="2"/><rect class="box" x="98" y="68" width="68" height="22" rx="2"/><rect class="box" x="186" y="40" width="68" height="22" rx="2"/>
-</svg>
-<figcaption><b>Board, Queue, any page.</b> Page links and meters are open, as in today's left column. The agents list is closed to one line ("10 live ›") plus any agent that needs you. Clicking that line opens the list, and the page links and meters shrink as in the terminal view.</figcaption>
-</figure>
-<figure>
-<svg class="mock" viewBox="0 0 360 220" role="img" aria-label="Document view with the sidebar folded to a strip">
-  <rect class="frame" x="0.5" y="0.5" width="359" height="219" rx="4"/>
-  <rect class="side" x="0.5" y="0.5" width="8" height="219"/><circle class="att" cx="4.5" cy="12" r="2.5"/>
-  <rect class="bar" x="8.5" y="0.5" width="351" height="20"/><text class="xs" x="14" y="14">←</text><text class="b" x="26" y="14">2543 — One app: the terminal…</text><text class="xs" x="250" y="14">rev 2   Review   Ask</text>
-  <text class="b" x="80" y="42">Memo</text>
-  <rect x="80" y="50" width="200" height="4" fill="var(--rule)"/><rect x="80" y="58" width="190" height="4" fill="var(--rule)"/><rect x="80" y="66" width="200" height="4" fill="var(--rule)"/><rect x="80" y="74" width="120" height="4" fill="var(--rule)"/>
-  <rect x="80" y="88" width="200" height="60" rx="3" class="box"/>
-  <rect x="80" y="158" width="200" height="4" fill="var(--rule)"/><rect x="80" y="166" width="195" height="4" fill="var(--rule)"/><rect x="80" y="174" width="160" height="4" fill="var(--rule)"/>
-</svg>
-<figcaption><b>A document</b> opens in the main area with the sidebar folded to a strip (a dot on the strip if something needs you). Back, ⌘[, returns to where you came from, the terminal still connected.</figcaption>
-</figure>
+<style>.shot { margin: 1.4rem 0; }
+.shot .zoom { zoom: .5; border: 2px solid #c9c8c2; border-radius: 8px; overflow: hidden; width: max-content; }
+.shot .zoom.side { zoom: .62; border: 0; }
+@media screen and (max-width: 800px) { .shot .zoom { zoom: .22; } .shot .zoom.side { zoom: .4; } }
+.shot .scr, .shot .scr * { box-sizing: border-box; }
+.shot .scr {
+  --bg: #F5F5F2; --panel: #FFFFFF; --panel-2: #EEEEE9; --line: #E0E0D9; --ink: #16171B; --ink-2: #555864; --ink-3: #8B8D96;
+  --accent: #0B7A90; --sel: #E2F1F4; --green: #15803D; --amber: #B45309; --magenta: #A21CAF; --red: #BE123C; --cyan: #0E7490; --claude: #C2410C;
+  --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; --mono: "SF Mono", ui-monospace, Menlo, monospace;
+  width: 1512px; height: 820px; display: grid; grid-template-columns: 248px 1fr; background: var(--bg); color: var(--ink);
+  font: 16px/1.4 var(--ui); text-align: left; overflow: hidden;
+}
+.shot .scr.folded { grid-template-columns: 14px 1fr; }
+.shot .scr.side-only { width: 262px; grid-template-columns: 262px; }
+.shot .pair { display: flex; gap: 40px; }
+.shot .scr svg { display: inline-block; vertical-align: middle; max-width: none; }
+.shot .magenta { color: var(--magenta); } .shot .green { color: var(--green); } .shot .amber { color: var(--amber); } .shot .cyan { color: var(--cyan); } .shot .red { color: var(--red); }
+.shot .muted { color: var(--ink-3); }
+/* sidebar */
+.shot .sb { position: relative; background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; padding: 8px 8px 6px; gap: 2px; min-height: 0; padding-right: 22px; width: 262px; }
+.shot .scr:not(.side-only) .sb { width: 248px; padding-right: 22px; }
+.shot .sb .top { display: flex; align-items: center; gap: 8px; height: 40px; flex: none; }
+.shot .brand { font: 700 18px var(--mono); color: var(--accent); padding: 0 4px; }
+.shot .search { flex: 1; display: flex; justify-content: space-between; color: var(--ink-3); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; background: var(--bg); font-size: 14px; }
+.shot .search kbd { font: 13px var(--ui); }
+.shot .item { display: flex; align-items: center; gap: 8px; padding: 5px 7px; border-radius: 6px; color: var(--ink-2); height: 32px; flex: none; }
+.shot .item.on { background: var(--sel); color: var(--ink); font-weight: 600; }
+.shot .item .lb { flex: 1; }
+.shot .item b { font-weight: 600; font-size: 14px; color: var(--ink-3); } .shot .item b.magenta { color: var(--magenta); }
+.shot .item.set { margin-top: 4px; }
+.shot .icons { display: flex; justify-content: space-between; height: 36px; align-items: center; padding: 0 4px; color: var(--ink-2); flex: none; border-bottom: 1px solid var(--line); }
+.shot .icons .ic { position: relative; padding: 5px; border-radius: 6px; }
+.shot .icons em { position: absolute; top: 2px; right: 1px; width: 7px; height: 7px; border-radius: 50%; background: var(--magenta); }
+.shot .ah { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 7px; margin-top: 4px; border-top: 1px solid var(--line); flex: none; color: var(--ink-2); }
+.shot .ah.on { background: var(--sel); border-radius: 6px; color: var(--ink); }
+.shot .ah .an { display: flex; align-items: center; gap: 8px; font-weight: 650; color: var(--ink); }
+.shot .ah .live { font-size: 13px; color: var(--ink-3); flex: 1; }
+.shot .ah .nm { font-weight: 600; font-size: 14px; color: var(--magenta); }
+.shot .ah .plus { font-weight: 700; font-size: 18px; color: var(--accent); padding: 0 4px; }
+.shot .list { flex: 1; min-height: 0; overflow: hidden; margin: 0 0 0 -8px; }
+.shot .gap { height: 6px; }
+.shot .dot.idl { color: var(--ink-3); }
+.shot .sec { font: 600 13px var(--ui); letter-spacing: .06em; text-transform: uppercase; padding: 8px 12px 2px; color: var(--ink-3); }
+.shot .sec.magenta { color: var(--magenta); } .shot .sec.cyan { color: var(--cyan); } .shot .sec.green { color: var(--green); } .shot .sec.amber { color: var(--amber); }
+.shot .row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; column-gap: 8px; align-items: center; padding: 4px 8px 5px 12px; }
+.shot .row1 { display: grid; grid-template-columns: 8px auto minmax(0, 1fr); column-gap: 8px; align-items: center; padding: 3px 10px 3px 12px; height: 26px; }
+.shot .row.cur, .shot .row1.cur { background: var(--sel); box-shadow: inset 3px 0 0 var(--accent); }
+.shot .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; display: block; }
+.shot .nmx { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.shot .row1 .nmx { font-weight: 500; }
+.shot .fact { grid-column: 2 / 4; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink-2); }
+.shot .fact.green, .shot .fs.green { color: var(--green); } .shot .fact.amber, .shot .fs.amber { color: var(--amber); } .shot .fact.magenta, .shot .fs.magenta { color: var(--magenta); } .shot .fact.cyan, .shot .fs.cyan { color: var(--cyan); }
+.shot .fs { font-size: 13px; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--ink-3); }
+.shot .tick { font-weight: 700; padding: 0 4px; }
+.shot .shell { color: var(--ink-3); font-size: 12px; }
+.shot .edge { position: absolute; top: 0; bottom: 0; right: 0; width: 14px; border-left: 1px solid var(--line); background: var(--panel); color: var(--ink-3); display: flex; align-items: center; justify-content: center; }
+.shot .strip { background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; color: var(--ink-3); }
+.shot .strip em { position: absolute; top: 10px; width: 7px; height: 7px; border-radius: 50%; background: var(--magenta); }
+/* meters */
+.shot .dash { border-top: 1px solid var(--line); padding: 8px 4px 6px; display: flex; flex-direction: column; gap: 3px; font-size: 13px; flex: none; font-variant-numeric: tabular-nums; }
+.shot .dr { display: flex; align-items: center; gap: 8px; height: 20px; }
+.shot .dk { width: 48px; color: var(--ink-3); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; flex: none; }
+.shot .m { display: flex; align-items: center; gap: 4px; }
+.shot .m i { font-style: normal; color: var(--ink-3); font-size: 12px; }
+.shot .m u { display: block; width: 26px; height: 4px; background: var(--panel-2); border-radius: 2px; overflow: hidden; }
+.shot .m s { display: block; height: 100%; background: var(--green); }
+.shot .m s.amber { background: var(--amber); } .shot .m s.red { background: var(--red); }
+.shot .m b { font-weight: 600; } .shot .m b.red { color: var(--red); } .shot .m b.amber { color: var(--amber); }
+.shot .quiet { color: var(--ink-3); }
+.shot .dn { font-size: 12px; padding-left: 56px; margin-top: -2px; }
+.shot .dn.amber { color: var(--amber); } .shot .dn.cyan { color: var(--cyan); }
+.shot .dashes { display: grid; grid-template-columns: repeat(2, max-content); gap: 14px 28px; }
+@media screen and (max-width: 800px) { .shot .dashes { grid-template-columns: 1fr 1fr; } }
+.shot .dcase p { font: .8rem var(--ui, sans-serif); margin: .3rem 0 0; color: var(--ink-2); }
+.shot .scr.dash-only { width: 262px; height: auto; display: block; border: 1px solid #c9c8c2; border-radius: 6px; background: #fff; zoom: .9; }
+.shot .scr.dash-only .dash { border-top: 0; }
+/* main */
+.shot main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.shot .tb { height: 44px; flex: none; display: flex; align-items: center; gap: 10px; padding: 0 14px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.shot .tb h1 { font-size: 16px; font-weight: 650; margin: 0; border: 0; padding: 0; }
+.shot .tb .sp { flex: 1; }
+.shot .who { display: flex; align-items: center; gap: 8px; }
+.shot .who .dot { color: var(--green); }
+.shot .ring { display: inline-flex; width: 28px; height: 28px; border-radius: 50%; border: 3px solid #e7e7e1; border-top-color: var(--green); align-items: center; justify-content: center; font-size: 12px; }
+.shot .ring.big { width: 40px; height: 40px; font-size: 14px; flex: none; }
+.shot .btn { border: 1px solid var(--line); border-radius: 6px; padding: 1px 8px; font-size: 14px; background: var(--panel); white-space: nowrap; }
+.shot .btn.danger { color: var(--red); }
+.shot .ib { color: var(--ink-2); padding: 3px; display: inline-flex; }
+.shot .bug { font-size: 14px; background: var(--panel-2); border-radius: 5px; padding: 1px 4px; }
+.shot .sum { color: var(--ink-2); font-size: 15px; } .shot .sum b { font-weight: 650; }
+.shot .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; font-size: 14px; }
+.shot .seg span { padding: 2px 10px; color: var(--ink-2); } .shot .seg span + span { border-left: 1px solid var(--line); }
+.shot .seg span.on { background: var(--sel); color: var(--ink); }
+.shot .content { flex: 1; overflow: hidden; padding: 12px 18px; }
+.shot .sh { font: 600 14px var(--ui); letter-spacing: .06em; text-transform: uppercase; margin: 10px 0 8px; }
+.shot .cards { display: grid; grid-template-columns: repeat(2, 560px); gap: 12px; }
+.shot .card { display: flex; gap: 14px; background: var(--panel); border: 1px solid var(--line); border-left: 4px solid currentColor; border-radius: 8px; padding: 12px 14px; color: var(--ink); }
+.shot .card.magenta { border-left-color: var(--magenta); } .shot .card.cyan { border-left-color: var(--cyan); } .shot .card.green { border-left-color: var(--green); }
+.shot .card .ring.big { align-self: center; }
+.shot .cb { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.shot .cn { font-weight: 650; font-size: 17px; display: flex; justify-content: space-between; } .shot .ci { color: var(--ink-2); display: flex; gap: 10px; }
+.shot .cd { color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 15px; }
+.shot .cm { font: 14px var(--mono); color: var(--ink-2); } .shot .claude { color: var(--claude); font-weight: 700; letter-spacing: .08em; }
+.shot .cs { font-size: 14px; color: var(--ink-2); } .shot .cf { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.shot .term { flex: 1; background: #FCFCFA; padding: 14px 22px; display: flex; flex-direction: column; min-height: 0; }
+.shot .term pre { font: 15px/1.5 var(--mono); color: #16171B; margin: 0; background: none; border: 0; padding: 0; white-space: pre; overflow: hidden; }
+.shot .term .pr { background: #efefea; display: block; } .shot .term .g { color: var(--green); }
+.shot .tfoot { margin-top: auto; } .shot .tmux { background: #3f9a2e; color: #10220c; font: 15px var(--mono); padding: 1px 4px; display: flex; justify-content: space-between; }
+.shot .lanes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+.shot .lane { background: var(--panel-2); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 8px; min-height: 600px; }
+.shot .lh { font-weight: 650; font-size: 15px; } .shot .tk { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font-size: 15px; }
+.shot .tm { color: var(--ink-3); font-size: 13px; margin-top: 2px; }
+.shot .docbg { background: #fcfcfb; overflow: hidden; }
+.shot .docpage { max-width: 760px; margin: 18px auto; font: 17px/1.55 Georgia, serif; color: #0b0b0b; }
+.shot .docpage h2 { font: 700 26px var(--ui); border: 0; margin: 0 0 6px; padding: 0; }
+.shot .docpage h3 { font: 700 19px var(--ui); border-bottom: 2px solid #0b0b0b; padding-bottom: 4px; margin: 26px 0 8px; }
+.shot .docpage .by { font: 14px var(--ui); color: #52514e; }
+.shot .docfig { height: 220px; border: 1px solid #e2e1dc; border-radius: 6px; background: #f4f3f0; margin: 14px 0; }
+</style>
+<figure class="shot"><div class="zoom"><div class="scr"><nav class="sb">
+<div class="top"><span class="brand">sm</span><span class="search">Search or jump…<kbd>⌘K</kbd></span></div>
+<div class="icons"><span class="ic" title="Inbox"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9.5l1.8-6h8.4L14 9.5v3.5H2z"/><path d="M2 9.5h3.5l1 1.6h3l1-1.6H14"/></svg><em class=magenta></em></span><span class="ic" title="Board"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M2 6.5h12M6 6.5v7"/></svg></span><span class="ic" title="Queue"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M2.5 8h11M2.5 12h7"/></svg></span><span class="ic" title="Artifacts"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg></span><span class="ic" title="Notes"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg></span><span class="ic" title="Analytics"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13.5V8M8 13.5V3M13 13.5V6"/></svg></span><span class="ic" title="History"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg></span><span class="ic" title="Guestbook"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg></span></div>
+<div class="ah"><span class="an"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 14c.6-2.8 2.7-4.3 5.2-4.3s4.6 1.5 5.2 4.3"/></svg>Agents</span><span class="live">10 live ⌄</span><span class="nm">1</span><span class="plus">+</span></div>
+<div class="list">
+<div class="sec magenta">Needs you</div>
+<div class="row"><i class="dot magenta"></i><span class="nmx">far-2419-o-h3</span><span class=tick magenta>✓</span><span class="fact magenta">◆ 41h 50m: Review: Iteration 11 learning memo</span></div>
+<div class="sec cyan">Finished</div>
+<div class="row"><i class="dot cyan"></i><span class="nmx">sm-2544</span><span class=tick cyan>✓</span><span class="fact cyan">✔ Fixed and live: an agent that is idle while…</span></div>
+<div class="sec green">Moving</div>
+<div class="row cur"><i class="dot green"></i><span class="nmx">sm-2543</span><span></span><span class="fact green">Working 0m</span></div>
+<div class="row"><i class="dot green"></i><span class="nmx">far-2390-h2</span><span></span><span class="fact green">▶ Background running 39m of 4h 0m</span></div>
+<div class="row"><i class="dot green"></i><span class="nmx">far-2454</span><span></span><span class="fact green">▶ Tests running 3m of 15m</span></div>
+<div class="row"><i class="dot green"></i><span class="nmx">sm-2537</span><span></span><span class="fact green">Working 2m</span></div>
+<div class="sec amber">Waiting</div>
+<div class="row"><i class="dot amber"></i><span class="nmx">sm-2540</span><span></span><span class="fact amber">❚❚ Waiting on review by GitHub Codex · 1m</span></div>
+<div class="row"><i class="dot amber"></i><span class="nmx">far-2431</span><span></span><span class="fact amber">❚❚ Waiting on queue · perf slot</span></div>
+<div class="sec idle">Idle · 2 ›</div><div class="sec ink3">Terminals</div>
+<div class="row"><span class="shell">▹</span><span class="nmx">studio-zsh</span><span></span><span class=fact>Shell · 2h</span></div>
 </div>
+<div class="dash"><div class="dr"><span class="dk">Claude</span><span class="m"><i>5h</i><u><s class="green" style="width:2%"></s></u><b class="">2%</b></span><span class="m"><i>wk</i><u><s class="green" style="width:25%"></s></u><b class="">25%</b></span></div><div class="dr"><span class="dk">Codex</span><span class="m"><i>wk</i><u><s class="green" style="width:6%"></s></u><b class="">6%</b></span></div><div class="dr"><span class="dk">Mac</span><span class="m"><i>CPU</i><u><s class="red" style="width:100%"></s></u><b class="red">100%</b></span></div></div>
+<div class="item set"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6 5 5M11 11l1.4 1.4M3.6 12.4 5 11M11 5l1.4-1.4"/></svg><span class="lb">Settings</span></div>
+<div class="edge"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 4 5.5 8l4 4"/></svg></div></nav><main><header class="tb"><span class="who"><i class="dot green"></i><b>sm-2543</b><span class="ring">21</span></span><span class="sp"></span><span class="btn">Notes ⌘J</span><span class="btn">Details</span><span class="btn">Hand off…</span><span class="btn">⋯</span><span class="ib"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5h4.5V7M13.5 2.5 7.5 8.5M12 9.5v4H2.5V4h4"/></svg></span><span class="ib"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 2.5v3h-3"/></svg></span><span class="ib"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13.2 10.1A5.6 5.6 0 0 1 5.9 2.8a5.6 5.6 0 1 0 7.3 7.3z"/></svg></span><span class="bug">🐞</span><span class="btn danger">Retire</span></header><div class="term"><pre>
+<b>Claude Code</b> v2.1.285
+Opus 5.5 (1M context) with medium effort · Claude Max
+~/projects/session-manager · /rc
 
-<h3>Where everything goes</h3>
-<table>
-<thead><tr><th style="width:30%">Thing</th><th style="width:33%">Today</th><th>Proposed</th></tr></thead>
-<tbody>
-<tr><td>Page links and badges</td><td>Left column on every page except the terminal</td><td>Sidebar top, every page; a row of icons while the agents list is open</td></tr>
-<tr><td>Live agents and shells list</td><td>Terminal page only</td><td>Sidebar middle, every page: open on a terminal, one line elsewhere. Click opens the terminal.</td></tr>
-<tr><td>Usage meters (Claude, Codex, Mac)</td><td>Foot of the left column; not on the terminal</td><td>Sidebar foot, every page: today's full meters, or one line while the agents list is open</td></tr>
-<tr><td>Search ⌘K</td><td>Top bar; off on the terminal</td><td>Sidebar top; works everywhere, terminal included</td></tr>
-<tr><td>New agent</td><td>Top bar button, top right</td><td><b>+</b> at the right end of the sidebar's Agents heading, on every page and in both states; same New session sheet. No New agent button in any top bar.</td></tr>
-<tr><td>Queue "1 running · 0 waiting"</td><td>Top bar</td><td>Beside the Queue link in the sidebar ("1 · 0"); a dot on the Queue icon while page links are icons</td></tr>
-<tr><td>Overnight moon (☾, beside the bug button)</td><td>Top bar</td><td>Sidebar foot row; inside More while the agents list is open</td></tr>
-<tr><td>Agents overview (cards, By repo, With stopped)</td><td>The "Agents" page, landing page</td><td>Same page, reached by the Agents heading; still the landing page</td></tr>
-<tr><td>Analytics, History, Guestbook</td><td>Their own rows in the left column</td><td>A <b>new</b> "More ▾" menu in the sidebar foot (it does not exist today), and ⌘K. It frees three rows for agents.</td></tr>
-<tr><td>Documents</td><td>Side panel; full screen is a separate site</td><td>Main area, sidebar folded; never the side panel</td></tr>
-<tr><td>Agent details and messages, queue job, ticket, Notes</td><td>Side panel</td><td>Side panel, unchanged</td></tr>
-</tbody>
-</table>
+<span class="pr">❯ You own #2543 in rajeshgoli/session-manager. Begin</span>
 
-<h3>One top bar, about the thing in front of you</h3>
-<p>Today the top bar mixes two jobs: it is about the page (its title), and it carries app-wide things (search, queue status, the overnight moon, New agent). The terminal's bar does only the first job, which is why the two look different. The fix is one rule for every view: <b>the top bar is only about what you are looking at</b>. The app-wide things move to the sidebar, where they sit in the same place on every screen. What is left lines up in the same slots everywhere:</p>
-<table>
-<thead><tr><th style="width:17%">View</th><th style="width:27%">Left: what you are looking at</th><th>Middle and right: actions on it</th><th style="width:13%">Far right</th></tr></thead>
-<tbody>
-<tr><td>Agents overview</td><td>Agents · 1 needs you · 2 moving</td><td>By attention / By repo · Live / With stopped (today's row under the bar moves up into it)</td><td>Bug</td></tr>
-<tr><td>Notes</td><td>Notes</td><td>+ New (moves up the same way)</td><td>Bug</td></tr>
-<tr><td>Board, Queue, Inbox, Artifacts, Settings…</td><td>Page name</td><td>Nothing new; their own controls stay in the page</td><td>Bug</td></tr>
-<tr><td>Terminal</td><td>● sm-2543 (21)</td><td>Notes ⌘J · Details · Hand off… · ⋯ · Redraw</td><td>Bug · Retire</td></tr>
-<tr><td>Document</td><td>← document title</td><td>version · Review · Ask</td><td>Bug</td></tr>
-</tbody>
-</table>
-<p>The queue status ("1 running · 0 waiting") leaves the top bar for the Queue link in the sidebar. While the page links are icons, the Queue icon carries a dot that turns amber when a job has waited 30 minutes.</p>
+  Ran 5 shell commands
+
+● Claimed #2543; mapping the web app shell and the terminal page.
+
+● Read app.js, terminal.js, app.css (312 lines)
+
+● The terminal page drops the rail, top bar and ⌘K in app.js:186.
+  Writing the memo now.
+</pre><div class="tfoot"><pre>────────────────────────────────────────────────────────────── sm-2543 ─
+❯ ▌
+──────────────────────────────────────────────────────────────────────
+  Opus 5.5 (1M context)  [<span class="g">██</span>░░░░░░░░░] 21%
+  ▸▸ auto mode on (shift+tab to cycle)</pre><div class="tmux">[sm-rust-c1:main*]<span>"* sm-2543" 15:45 27-Oct-26</span></div></div></div></main></div></div><figcaption><b>Screen 1 · An agent’s terminal, ten agents live.</b> Drawn at your 1512 × 820 window. The sidebar puts the agents first: page links shrink to one row of icons, and every agent gets today’s two-line row. Settings keeps its own place at the bottom. Ten agents fit; the shells below them scroll into view. The top bar is today’s terminal bar plus the moon. The terminal is as wide as today.</figcaption></figure>
+
+<figure class="shot"><div class="zoom"><div class="scr"><nav class="sb">
+<div class="top"><span class="brand">sm</span><span class="search">Search or jump…<kbd>⌘K</kbd></span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9.5l1.8-6h8.4L14 9.5v3.5H2z"/><path d="M2 9.5h3.5l1 1.6h3l1-1.6H14"/></svg><span class="lb">Inbox</span><b class="magenta">1</b></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M2 6.5h12M6 6.5v7"/></svg><span class="lb">Board</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M2.5 8h11M2.5 12h7"/></svg><span class="lb">Queue</span><b>1 · 0</b></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg><span class="lb">Artifacts</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg><span class="lb">Notes</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13.5V8M8 13.5V3M13 13.5V6"/></svg><span class="lb">Analytics</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg><span class="lb">History</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg><span class="lb">Guestbook</span></div>
+<div class="ah on"><span class="an"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 14c.6-2.8 2.7-4.3 5.2-4.3s4.6 1.5 5.2 4.3"/></svg>Agents</span><span class="live">10 live ›</span><span class="nm">1</span><span class="plus">+</span></div>
+<div class="list">
+<div class="gap"></div>
+<div class="row1"><i class="dot magenta"></i><span class="nmx">far-2419-o-h3</span><span class="fs magenta">41h</span></div>
+<div class="gap"></div>
+<div class="row1"><i class="dot cyan"></i><span class="nmx">sm-2544</span><span class="fs cyan">done</span></div>
+<div class="gap"></div>
+<div class="row1"><i class="dot green"></i><span class="nmx">sm-2543</span><span class="fs green">0m</span></div>
+<div class="row1"><i class="dot green"></i><span class="nmx">far-2390-h2</span><span class="fs green">▶ 39m</span></div>
+<div class="row1"><i class="dot green"></i><span class="nmx">far-2454</span><span class="fs green">▶ 3m</span></div>
+<div class="row1"><i class="dot green"></i><span class="nmx">sm-2537</span><span class="fs green">2m</span></div>
+<div class="gap"></div>
+<div class="row1"><i class="dot amber"></i><span class="nmx">sm-2540</span><span class="fs amber">❚❚ review</span></div>
+<div class="row1"><i class="dot amber"></i><span class="nmx">far-2431</span><span class="fs amber">❚❚ queue</span></div>
+<div class="gap"></div><div class="row1"><i class="dot idl"></i><span class="nmx muted">Idle · 2 ›</span><span></span></div>
+<div class="row1"><span class="shell">▹</span><span class="nmx">studio-zsh</span><span class=fs>shell</span></div>
+</div>
+<div class="dash"><div class="dr"><span class="dk">Claude</span><span class="m"><i>5h</i><u><s class="green" style="width:2%"></s></u><b class="">2%</b></span><span class="m"><i>wk</i><u><s class="green" style="width:25%"></s></u><b class="">25%</b></span></div><div class="dr"><span class="dk">Codex</span><span class="m"><i>wk</i><u><s class="green" style="width:6%"></s></u><b class="">6%</b></span></div><div class="dr"><span class="dk">Mac</span><span class="m"><i>CPU</i><u><s class="red" style="width:100%"></s></u><b class="red">100%</b></span></div></div>
+<div class="item set"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6 5 5M11 11l1.4 1.4M3.6 12.4 5 11M11 5l1.4-1.4"/></svg><span class="lb">Settings</span></div>
+<div class="edge"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 4 5.5 8l4 4"/></svg></div></nav><main><header class="tb"><h1>Agents</h1><span class="sum"><b class="magenta">1</b> needs you · <b class="cyan">1</b> finished · <b class="green">4</b> moving · <b class="amber">2</b> waiting · <b>2</b> idle</span><span class="sp"></span><span class="seg"><span class="on">By attention</span><span>By repo</span></span><span class="seg"><span class="on">Live</span><span>With stopped</span></span><span class="ib"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13.2 10.1A5.6 5.6 0 0 1 5.9 2.8a5.6 5.6 0 1 0 7.3 7.3z"/></svg></span><span class="bug">🐞</span></header><div class="content"><div class="sh magenta">Needs you</div><div class="cards"><div class="card magenta"><span class="ring big">28</span><div class="cb"><div class="cn">far-2419-o-h3<span class="ci"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="2.8" width="12.4" height="10.4" rx="1.5"/><path d="M4.5 6l2 2-2 2M8 10.5h3.5"/></svg><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5h4.5V7M13.5 2.5 7.5 8.5M12 9.5v4H2.5V4h4"/></svg></span></div><div class="cd">Iteration 11 learning memo: everything iteration 11 taught us…</div><div class="cm"><span class="claude">CLAUDE</span> #2419 fractal-algo-rust</div><div class="cs">○ Idle 41h 50m &nbsp; No jobs</div><div class="cf magenta">◆ 41h 50m: Review: Iteration 11 learning memo</div></div></div></div><div class="sh cyan">Finished</div><div class="cards"><div class="card cyan"><span class="ring big">14</span><div class="cb"><div class="cn">sm-2544<span class="ci"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="2.8" width="12.4" height="10.4" rx="1.5"/><path d="M4.5 6l2 2-2 2M8 10.5h3.5"/></svg><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5h4.5V7M13.5 2.5 7.5 8.5M12 9.5v4H2.5V4h4"/></svg></span></div><div class="cd">no ticket</div><div class="cm"><span class="claude">CLAUDE</span> session-manager</div><div class="cs">○ Idle 1m &nbsp; No jobs</div><div class="cf cyan">✔ Fixed and live: an agent that is idle while a background…</div></div></div></div><div class="sh green">Moving</div><div class="cards"><div class="card green"><span class="ring big">21</span><div class="cb"><div class="cn">sm-2543<span class="ci"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="2.8" width="12.4" height="10.4" rx="1.5"/><path d="M4.5 6l2 2-2 2M8 10.5h3.5"/></svg><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5h4.5V7M13.5 2.5 7.5 8.5M12 9.5v4H2.5V4h4"/></svg></span></div><div class="cd">Terminal page feels disconnected from the rest of the app.</div><div class="cm"><span class="claude">CLAUDE</span> #2543 session-manager</div><div class="cs">● Working 0m &nbsp; No jobs</div></div></div><div class="card green"><span class="ring big">12</span><div class="cb"><div class="cn">far-2390-h2<span class="ci"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="2.8" width="12.4" height="10.4" rx="1.5"/><path d="M4.5 6l2 2-2 2M8 10.5h3.5"/></svg><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5h4.5V7M13.5 2.5 7.5 8.5M12 9.5v4H2.5V4h4"/></svg></span></div><div class="cd">Iteration 12, B4: rebuild every market on the new build…</div><div class="cm"><span class="claude">CLAUDE</span> #2390 fractal-algo-rust</div><div class="cs">○ Idle 6m &nbsp; <span class="green">▶ Background running 39m of 4h 0m</span></div></div></div></div></div></main></div></div><figcaption><b>Screen 2 · Agents overview, the landing page.</b> The same sidebar with pages first: every page link as today, and every agent on a one-line row, so any agent is one click away. The overview’s counts and toggles move up into its top bar. New agent is the <b>+</b> on the Agents heading.</figcaption></figure>
+
+<figure class="shot"><div class="zoom"><div class="scr"><nav class="sb">
+<div class="top"><span class="brand">sm</span><span class="search">Search or jump…<kbd>⌘K</kbd></span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9.5l1.8-6h8.4L14 9.5v3.5H2z"/><path d="M2 9.5h3.5l1 1.6h3l1-1.6H14"/></svg><span class="lb">Inbox</span><b class="magenta">1</b></div>
+<div class="item on"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M2 6.5h12M6 6.5v7"/></svg><span class="lb">Board</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M2.5 8h11M2.5 12h7"/></svg><span class="lb">Queue</span><b>1 · 0</b></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg><span class="lb">Artifacts</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg><span class="lb">Notes</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13.5V8M8 13.5V3M13 13.5V6"/></svg><span class="lb">Analytics</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg><span class="lb">History</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg><span class="lb">Guestbook</span></div>
+<div class="ah"><span class="an"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 14c.6-2.8 2.7-4.3 5.2-4.3s4.6 1.5 5.2 4.3"/></svg>Agents</span><span class="live">10 live ›</span><span class="nm">1</span><span class="plus">+</span></div>
+<div class="list">
+<div class="gap"></div>
+<div class="row1"><i class="dot magenta"></i><span class="nmx">far-2419-o-h3</span><span class="fs magenta">41h</span></div>
+<div class="gap"></div>
+<div class="row1"><i class="dot cyan"></i><span class="nmx">sm-2544</span><span class="fs cyan">done</span></div>
+<div class="gap"></div>
+<div class="row1"><i class="dot green"></i><span class="nmx">sm-2543</span><span class="fs green">0m</span></div>
+<div class="row1"><i class="dot green"></i><span class="nmx">far-2390-h2</span><span class="fs green">▶ 39m</span></div>
+<div class="row1"><i class="dot green"></i><span class="nmx">far-2454</span><span class="fs green">▶ 3m</span></div>
+<div class="row1"><i class="dot green"></i><span class="nmx">sm-2537</span><span class="fs green">2m</span></div>
+<div class="gap"></div>
+<div class="row1"><i class="dot amber"></i><span class="nmx">sm-2540</span><span class="fs amber">❚❚ review</span></div>
+<div class="row1"><i class="dot amber"></i><span class="nmx">far-2431</span><span class="fs amber">❚❚ queue</span></div>
+<div class="gap"></div><div class="row1"><i class="dot idl"></i><span class="nmx muted">Idle · 2 ›</span><span></span></div>
+<div class="row1"><span class="shell">▹</span><span class="nmx">studio-zsh</span><span class=fs>shell</span></div>
+</div>
+<div class="dash"><div class="dr"><span class="dk">Claude</span><span class="m"><i>5h</i><u><s class="green" style="width:2%"></s></u><b class="">2%</b></span><span class="m"><i>wk</i><u><s class="green" style="width:25%"></s></u><b class="">25%</b></span></div><div class="dr"><span class="dk">Codex</span><span class="m"><i>wk</i><u><s class="green" style="width:6%"></s></u><b class="">6%</b></span></div><div class="dr"><span class="dk">Mac</span><span class="m"><i>CPU</i><u><s class="red" style="width:100%"></s></u><b class="red">100%</b></span></div></div>
+<div class="item set"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6 5 5M11 11l1.4 1.4M3.6 12.4 5 11M11 5l1.4-1.4"/></svg><span class="lb">Settings</span></div>
+<div class="edge"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 4 5.5 8l4 4"/></svg></div></nav><main><header class="tb"><h1>Board</h1><span class="sp"></span><span class="ib"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13.2 10.1A5.6 5.6 0 0 1 5.9 2.8a5.6 5.6 0 1 0 7.3 7.3z"/></svg></span><span class="bug">🐞</span></header><div class="content"><div class="lanes"><div class="lane"><div class="lh">fractal-algo-rust · Iteration 12</div><div class="tk"><b>#2390</b> B4: rebuild every market on the new build<div class="tm">far-2390-h2 · moving</div></div><div class="tk"><b>#2431</b> Perf pass on the plant builder<div class="tm">far-2431 · waiting</div></div><div class="tk"><b>#2454</b> Forecast smoke tests<div class="tm">far-2454 · tests</div></div></div><div class="lane"><div class="lh">session-manager · web</div><div class="tk"><b>#2543</b> Terminal page feels disconnected<div class="tm">sm-2543 · moving</div></div><div class="tk"><b>#2540</b> Tmux in web shell usability<div class="tm">sm-2540 · review</div></div><div class="tk"><b>#2537</b> Recording a discovered artifact<div class="tm">sm-2537 · moving</div></div></div><div class="lane"><div class="lh">session-manager · bugs</div><div class="tk"><b>#2544</b> Idle agent with a background job<div class="tm">sm-2544 · finished</div></div><div class="tk"><b>#2538</b> Artifact delete: rebuildable dependents<div class="tm">merged</div></div></div></div></div></main></div></div><figcaption><b>Screen 3 · Board.</b> Same sidebar as Screen 2. The Board itself is unchanged (sketched here).</figcaption></figure>
+
+<figure class="shot"><div class="zoom"><div class="scr folded"><nav class="strip"><em class="magenta"></em><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 4l4 4-4 4"/></svg></nav><main><header class="tb"><span class="ib"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13 8H3M7 4 3 8l4 4"/></svg></span><b>2543 — One app: terminal, documents and pages</b><span class="sp"></span><span class="muted">rev 760c32a</span><span class="btn">Review</span><span class="btn">Ask</span><span class="ib"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13.2 10.1A5.6 5.6 0 0 1 5.9 2.8a5.6 5.6 0 1 0 7.3 7.3z"/></svg></span><span class="bug">🐞</span></header><div class="content docbg"><div class="docpage"><h2>2543 — One app: the terminal, documents and pages share one frame</h2><p class="by">Author: Claude (Opus 5.5) · Ticket #2543</p><h3>Memo</h3><p><b>I recommend that the terminal page’s layout become the layout of the whole web app.</b> Every page gets one left sidebar with three parts: page links, the live agents and shells, and usage meters…</p><p>The result is one sidebar and one top bar on every screen, both always in the same place. From a terminal, any page is one click away…</p><div class="docfig"></div><p>The two pages are already one web app sharing one stylesheet and one login. The split is a single deliberate choice in the code…</p></div></div></main></div></div><figcaption><b>Screen 4 · A document.</b> It fills the main area, and the sidebar folds to a thin strip with a dot when something needs you. ← or ⌘[ returns to where you came from, such as a terminal, which is still connected.</figcaption></figure>
+
+<figure class="shot"><div class="zoom side"><div class="pair"><div class="scr side-only"><nav class="sb">
+<div class="top"><span class="brand">sm</span><span class="search">Search or jump…<kbd>⌘K</kbd></span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9.5l1.8-6h8.4L14 9.5v3.5H2z"/><path d="M2 9.5h3.5l1 1.6h3l1-1.6H14"/></svg><span class="lb">Inbox</span><b class="magenta">1</b></div>
+<div class="item on"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M2 6.5h12M6 6.5v7"/></svg><span class="lb">Board</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M2.5 8h11M2.5 12h7"/></svg><span class="lb">Queue</span><b>1 · 0</b></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg><span class="lb">Artifacts</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg><span class="lb">Notes</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13.5V8M8 13.5V3M13 13.5V6"/></svg><span class="lb">Analytics</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg><span class="lb">History</span></div>
+<div class="item"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg><span class="lb">Guestbook</span></div>
+<div class="ah"><span class="an"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 14c.6-2.8 2.7-4.3 5.2-4.3s4.6 1.5 5.2 4.3"/></svg>Agents</span><span class="live">10 live ›</span><span class="nm">1</span><span class="plus">+</span></div>
+<div class="list">
+<div class="gap"></div>
+<div class="row1"><i class="dot magenta"></i><span class="nmx">far-2419-o-h3</span><span class="fs magenta">41h</span></div>
+<div class="gap"></div>
+<div class="row1"><i class="dot cyan"></i><span class="nmx">sm-2544</span><span class="fs cyan">done</span></div>
+<div class="gap"></div>
+<div class="row1"><i class="dot green"></i><span class="nmx">sm-2543</span><span class="fs green">0m</span></div>
+<div class="row1"><i class="dot green"></i><span class="nmx">far-2390-h2</span><span class="fs green">▶ 39m</span></div>
+<div class="row1"><i class="dot green"></i><span class="nmx">far-2454</span><span class="fs green">▶ 3m</span></div>
+<div class="row1"><i class="dot green"></i><span class="nmx">sm-2537</span><span class="fs green">2m</span></div>
+<div class="gap"></div>
+<div class="row1"><i class="dot amber"></i><span class="nmx">sm-2540</span><span class="fs amber">❚❚ review</span></div>
+<div class="row1"><i class="dot amber"></i><span class="nmx">far-2431</span><span class="fs amber">❚❚ queue</span></div>
+<div class="gap"></div><div class="row1"><i class="dot idl"></i><span class="nmx muted">Idle · 2 ›</span><span></span></div>
+<div class="row1"><span class="shell">▹</span><span class="nmx">studio-zsh</span><span class=fs>shell</span></div>
+</div>
+<div class="dash"><div class="dr"><span class="dk">Claude</span><span class="m"><i>5h</i><u><s class="green" style="width:2%"></s></u><b class="">2%</b></span><span class="m"><i>wk</i><u><s class="green" style="width:25%"></s></u><b class="">25%</b></span></div><div class="dr"><span class="dk">Codex</span><span class="m"><i>wk</i><u><s class="green" style="width:6%"></s></u><b class="">6%</b></span></div><div class="dr"><span class="dk">Mac</span><span class="m"><i>CPU</i><u><s class="red" style="width:100%"></s></u><b class="red">100%</b></span></div></div>
+<div class="item set"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6 5 5M11 11l1.4 1.4M3.6 12.4 5 11M11 5l1.4-1.4"/></svg><span class="lb">Settings</span></div>
+<div class="edge"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 4 5.5 8l4 4"/></svg></div></nav></div><div class="scr side-only"><nav class="sb">
+<div class="top"><span class="brand">sm</span><span class="search">Search or jump…<kbd>⌘K</kbd></span></div>
+<div class="icons"><span class="ic" title="Inbox"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9.5l1.8-6h8.4L14 9.5v3.5H2z"/><path d="M2 9.5h3.5l1 1.6h3l1-1.6H14"/></svg><em class=magenta></em></span><span class="ic" title="Board"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M2 6.5h12M6 6.5v7"/></svg></span><span class="ic" title="Queue"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 4h11M2.5 8h11M2.5 12h7"/></svg></span><span class="ic" title="Artifacts"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg></span><span class="ic" title="Notes"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg></span><span class="ic" title="Analytics"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13.5V8M8 13.5V3M13 13.5V6"/></svg></span><span class="ic" title="History"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg></span><span class="ic" title="Guestbook"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/></svg></span></div>
+<div class="ah"><span class="an"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 14c.6-2.8 2.7-4.3 5.2-4.3s4.6 1.5 5.2 4.3"/></svg>Agents</span><span class="live">10 live ⌄</span><span class="nm">1</span><span class="plus">+</span></div>
+<div class="list">
+<div class="sec magenta">Needs you</div>
+<div class="row"><i class="dot magenta"></i><span class="nmx">far-2419-o-h3</span><span class=tick magenta>✓</span><span class="fact magenta">◆ 41h 50m: Review: Iteration 11 learning memo</span></div>
+<div class="sec cyan">Finished</div>
+<div class="row"><i class="dot cyan"></i><span class="nmx">sm-2544</span><span class=tick cyan>✓</span><span class="fact cyan">✔ Fixed and live: an agent that is idle while…</span></div>
+<div class="sec green">Moving</div>
+<div class="row cur"><i class="dot green"></i><span class="nmx">sm-2543</span><span></span><span class="fact green">Working 0m</span></div>
+<div class="row"><i class="dot green"></i><span class="nmx">far-2390-h2</span><span></span><span class="fact green">▶ Background running 39m of 4h 0m</span></div>
+<div class="row"><i class="dot green"></i><span class="nmx">far-2454</span><span></span><span class="fact green">▶ Tests running 3m of 15m</span></div>
+<div class="row"><i class="dot green"></i><span class="nmx">sm-2537</span><span></span><span class="fact green">Working 2m</span></div>
+<div class="sec amber">Waiting</div>
+<div class="row"><i class="dot amber"></i><span class="nmx">sm-2540</span><span></span><span class="fact amber">❚❚ Waiting on review by GitHub Codex · 1m</span></div>
+<div class="row"><i class="dot amber"></i><span class="nmx">far-2431</span><span></span><span class="fact amber">❚❚ Waiting on queue · perf slot</span></div>
+<div class="sec idle">Idle · 2 ›</div><div class="sec ink3">Terminals</div>
+<div class="row"><span class="shell">▹</span><span class="nmx">studio-zsh</span><span></span><span class=fact>Shell · 2h</span></div>
+</div>
+<div class="dash"><div class="dr"><span class="dk">Claude</span><span class="m"><i>5h</i><u><s class="green" style="width:2%"></s></u><b class="">2%</b></span><span class="m"><i>wk</i><u><s class="green" style="width:25%"></s></u><b class="">25%</b></span></div><div class="dr"><span class="dk">Codex</span><span class="m"><i>wk</i><u><s class="green" style="width:6%"></s></u><b class="">6%</b></span></div><div class="dr"><span class="dk">Mac</span><span class="m"><i>CPU</i><u><s class="red" style="width:100%"></s></u><b class="red">100%</b></span></div></div>
+<div class="item set"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6 5 5M11 11l1.4 1.4M3.6 12.4 5 11M11 5l1.4-1.4"/></svg><span class="lb">Settings</span></div>
+<div class="edge"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 4 5.5 8l4 4"/></svg></div></nav></div></div></div><figcaption><b>Screen 5 · The sidebar’s two arrangements, full height.</b> Left: pages first (Screens 2 and 3). Right: agents first (Screen 1). The chevron after “10 live” swaps them on any page.</figcaption></figure>
+
+<figure class="shot"><div class="dashes"><div class="dcase"><div class="scr dash-only"><div class="dash"><div class="dr"><span class="dk">Claude</span><span class="m"><i>5h</i><u><s class="green" style="width:2%"></s></u><b class="">2%</b></span><span class="m"><i>wk</i><u><s class="green" style="width:25%"></s></u><b class="">25%</b></span></div><div class="dr"><span class="dk">Codex</span><span class="m"><i>wk</i><u><s class="green" style="width:6%"></s></u><b class="">6%</b></span></div><div class="dr"><span class="dk">Mac</span><span class="quiet">quiet</span></div></div></div><p>Nothing to know</p></div><div class="dcase"><div class="scr dash-only"><div class="dash"><div class="dr"><span class="dk">Claude</span><span class="m"><i>5h</i><u><s class="amber" style="width:64%"></s></u><b class="amber">64%</b></span><span class="m"><i>wk</i><u><s class="amber" style="width:81%"></s></u><b class="amber">81%</b></span></div><div class="dn amber">Week runs out Thu 3 pm</div><div class="dr"><span class="dk">Codex</span><span class="m"><i>wk</i><u><s class="green" style="width:6%"></s></u><b class="">6%</b></span></div><div class="dr"><span class="dk">Mac</span><span class="m"><i>CPU</i><u><s class="red" style="width:100%"></s></u><b class="red">100%</b></span></div></div></div><p>Claude will run out</p></div><div class="dcase"><div class="scr dash-only"><div class="dash"><div class="dr"><span class="dk">Claude</span><span class="m"><i>5h</i><u><s class="green" style="width:2%"></s></u><b class="">2%</b></span><span class="m"><i>wk</i><u><s class="green" style="width:25%"></s></u><b class="">25%</b></span></div><div class="dr"><span class="dk">Codex</span><span class="m"><i>wk</i><u><s class="green" style="width:18%"></s></u><b class="">18%</b></span></div><div class="dn cyan">On pace for 24% · about 75% unused at reset Sun</div><div class="dr"><span class="dk">Mac</span><span class="m"><i>CPU</i><u><s class="red" style="width:100%"></s></u><b class="red">100%</b></span></div></div></div><p>Codex will be left over</p></div><div class="dcase"><div class="scr dash-only"><div class="dash"><div class="dr"><span class="dk">Claude</span><span class="m"><i>5h</i><u><s class="green" style="width:2%"></s></u><b class="">2%</b></span><span class="m"><i>wk</i><u><s class="green" style="width:25%"></s></u><b class="">25%</b></span></div><div class="dr"><span class="dk">Codex</span><span class="m"><i>wk</i><u><s class="green" style="width:6%"></s></u><b class="">6%</b></span></div><div class="dr"><span class="dk">Mac</span><span class="m"><i>CPU</i><u><s class="red" style="width:100%"></s></u><b class="red">100%</b></span></div><div class="dr"><span class="dk"></span><span class="m"><i>Mem</i><u><s class="amber" style="width:78%"></s></u><b class="amber">200/256G</b></span></div></div></div><p>Mac under load</p></div></div><figcaption><b>Screen 6 · Meters show only what you need to know.</b> Each provider is one line with small bars for its windows. A second line appears only when the server’s pace says a limit runs out before reset, or that most of the week will go unused. Mac lists only the readings that are high; otherwise it says “quiet”.</figcaption></figure>
+
+
+<h3>What moves and what stays</h3>
+<ul>
+<li><b>Stays:</b> every page link (Inbox, Board, Queue, Artifacts, Notes, Analytics, History, Guestbook), Settings at the bottom on its own, and the moon and bug button at the top right. The moon and bug button now also appear on the terminal and document bars.</li>
+<li><b>Moves into the sidebar:</b> search goes to the top. New agent becomes the <b>+</b> on the Agents heading. Queue status ("1 · 0") sits beside the Queue link.</li>
+<li><b>Moves into the top bar:</b> the Agents overview's counts and By repo / With stopped toggles, and the Notes page's "+ New".</li>
+<li><b>Becomes smaller:</b> the meters, from about 300 points to about 75 (Screen 6).</li>
+<li><b>Moves out of the side panel:</b> documents, which open full width (Screen 4).</li>
+</ul>
 
 <h3>How it flows: one evening</h3>
-<p>You are watching far-2390 in its terminal. The sidebar shows Inbox 1. You click Inbox and read far-2419's question. You click far-2419 in the sidebar; its terminal opens, and you answer. Its message mentions the iteration 11 memo; you click the link, and the memo fills the screen with the sidebar folded. ⌘[ takes you back to far-2419's terminal, still connected and up to date. You click Queue to see whether the backtest finished, then "10 live ›" and far-2390. You never leave the tab, and the sidebar never moves.</p>
+<p>You are watching far-2390 in its terminal. The Inbox icon has a magenta dot. You click it and read far-2419's question. You click far-2419 in the sidebar; its terminal opens, and you answer. Its message links the iteration 11 memo. You click the link, and the memo fills the screen with the sidebar folded. ⌘[ takes you back to far-2419's terminal, still connected and up to date. You click Queue to see whether the backtest finished, then far-2390 in the sidebar. You never leave the tab, and the sidebar never moves.</p>
 
 <h3>Why this design</h3>
-<p><b>The terminal page already had the right layout.</b> Its left column is the list of agents; that list is the thing you navigate by. The old left navigation lists <i>pages</i>, and the old Agents page is a large version of the same agents list. Putting both lists in one column, pages above agents, gives a single place to go anywhere. Slack and Linear use this layout for the same reason: destinations and live items in one sidebar.</p>
-<p><b>It fits, measured on your screenshots.</b> Your window is about 820 points tall; a page link is 32 points, an agent row 48, a section heading about 26, today's meters about 300. With the agents list open, search, the icon row, the Agents heading and the one-line meters take about 135 points, leaving about 685. Ten agents in four sections need about 590, so your usual 8–10 fit without scrolling, and the list starts to scroll at about 12 (Idle stays collapsed, as today). On other pages, five page links, today's full meters, Settings and up to three agents that need you take about 710. Analytics, History and Guestbook move to a "More" menu to make that room.</p>
-<p><b>Focus views stay immersive.</b> The terminal keeps today's width and bar. A document gets the whole width, because reading is what you open it for, and the side panel is a poor place to read. Both keep one way back to everything: the sidebar, one click or ⌘\ away.</p>
+<p><b>The terminal page already had the right layout.</b> Its left column lists the agents, which is what you navigate by. Today's left column lists pages, and today's Agents page is a large version of the agents list. One column holding both gives one place to go anywhere. Slack and Linear use this layout for the same reason.</p>
+<p><b>It fits, measured on your screenshots.</b> A page link is 32 points, an agent's two-line row 48, its one-line row 26, a section heading 26.</p>
+<ul>
+<li><b>Pages first</b> takes about 730 of 820 points: search 40, eight page links 256, heading 34, ten one-line rows and group gaps 290, meters 75, Settings 36. The one-line rows drop the section headings; each dot's colour shows the section.</li>
+<li><b>Agents first</b> takes about 810: search 40, icon row 36, heading 34, ten two-line rows with headings 590, meters 75, Settings 36. Shells and anything past ten agents scroll.</li>
+</ul>
+<p><b>The meters show only what you need to know.</b> The server already computes each quota's pace: when it will run out, or what share it will reach at reset. A line under a provider appears only when a limit will run out before reset, or when most of the week will go unused. The Mac shows only readings that are already amber or red on today's scale; otherwise it says "quiet". sm does not measure disk today, so disk is not shown.</p>
+<p><b>Focus views stay immersive.</b> The terminal keeps today's width and bar. A document gets the full width, because the side panel is a poor place to read.</p>
 <p><b>Cost.</b> On Board and Queue the sidebar is wider than today's left column (15.5 rem against 9 rem, about 100 points), because it now holds agents. ⌘\ folds it on any page.</p>
 
 <h3>Decision surface</h3>
@@ -272,25 +454,27 @@
 <tr><th style="width:24%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
 </thead>
 <tbody>
-<tr><td>1. How do pages and agents share the screen?</td><td><b>One sidebar on every page</b>: pages, live agents and shells, meters. The agents list is open on a terminal and shrunk elsewhere; a click swaps. Rejected: two left columns; page links in a top bar; all parts open at once (does not fit 8–10 agents).</td><td>One place to go anywhere, always in the same spot, and it fits.</td></tr>
-<tr><td>2. What happens to the Agents page?</td><td><b>It stays as the overview</b>, opened by the Agents heading, and remains the landing page at <code>sm.rajeshgo.li/</code>. Alternative: land on the terminal of the agent that most needs you.</td><td>After hours away, the overview with stopped agents and By repo is the right first screen; the terminal is one click away.</td></tr>
-<tr><td>3. Where do documents open?</td><td><b>In the main area, sidebar folded</b>, from every link in the app (Inbox, Details, History, terminal output). The side panel stops showing documents.</td><td>Reading wants the width; the side panel is for small things.</td></tr>
-<tr><td>4. Keep the terminal connected while you are elsewhere?</td><td><b>Yes, the last terminal, for 15 minutes.</b> Coming back is instant and shows output that arrived meanwhile.</td><td>That is what your second browser tab gives you today.</td></tr>
-<tr><td>5. Phone width?</td><td><b>Unchanged</b>: bottom tab bar on pages; full-screen terminal and document.</td><td>The phone already works; the Android app is untouched.</td></tr>
+<tr><td>1. How do pages and agents share the screen?</td><td><b>One sidebar, two arrangements</b>: pages first on pages, agents first on a terminal, with a chevron to swap (Screens 1, 2, 5). Rejected: two left columns; page links in a top bar; everything at full size (does not fit 8–10 agents).</td><td>One place to go anywhere, always in the same spot, and it fits.</td></tr>
+<tr><td>2. What happens to the Agents page?</td><td><b>It stays as the overview</b> behind the Agents heading, and remains the landing page at <code>sm.rajeshgo.li/</code> (Screen 2). Alternative: land on the terminal of the agent that most needs you.</td><td>After hours away, the overview with stopped agents and By repo is the right first screen.</td></tr>
+<tr><td>3. Where do documents open?</td><td><b>Full width in the main area, sidebar folded</b>, from every link in the app (Screen 4). The side panel stops showing documents.</td><td>Reading wants the width; the side panel is for small things.</td></tr>
+<tr><td>4. Meters</td><td><b>Compact, by importance</b> (Screen 6). A quota line appears when it will run out before reset (amber, red at 85% used), or when it is on pace to leave half or more unused once the window is half over (teal). Mac readings appear only at 60% or more.</td><td>Same glance as today in a quarter of the space, and it calls out only what you would act on.</td></tr>
+<tr><td>5. Keep the terminal connected while you are elsewhere?</td><td><b>Yes, the last terminal, for 15 minutes.</b></td><td>That is what your second browser tab gives you today.</td></tr>
+<tr><td>6. Phone width?</td><td><b>Unchanged</b>: bottom tab bar on pages; full-screen terminal and document.</td><td>The phone already works; the Android app is untouched.</td></tr>
 </tbody>
 </table>
 
 <h3>Delivery</h3>
-<p>Two tickets, one after the other, both after the terminal mouse and copy fix (#2540, pull request #2542) merges, because all three edit the same files.</p>
+<p>Two tickets, one after the other. Both start after the terminal mouse and copy fix (#2540, pull request #2542) merges, because all three edit the same files.</p>
 <ol>
-<li><b>One sidebar.</b> The sidebar on every page, the terminal inside it, the top bar changes, search everywhere, and the kept terminal connection.</li>
-<li><b>Documents as a focus view.</b> Every document link opens the document in the main area; the side panel stops hosting documents.</li>
+<li><b>One sidebar</b>: the sidebar and its two arrangements, compact meters, the terminal inside the frame, the top bar rule, search everywhere, and the kept terminal connection.</li>
+<li><b>Documents as a focus view</b>: every document link opens full width; the side panel stops showing documents.</li>
 </ol>
-<p>After the first ticket I will ask you to try one thing: from a terminal, click Board, then the same agent in the sidebar, and see its screen come straight back. After the second: click a document link in an agent's Details, read, press ⌘[.</p>
+<p>After each ticket I will ask you to try one thing. After the first: from a terminal, click Board, then the same agent in the sidebar, and check that its screen comes straight back. After the second: click a document link in an agent's Details, read, and press ⌘[.</p>
 
-<h3>FAQ — what changed since the last revision</h3>
-<p><b>One rule for the top bar.</b> The top bar is only about what you are looking at; search, queue status, the moon and New agent move to the sidebar. The new table above shows each view's bar in the same slots.</p>
-<p><b>New agent and More, spelled out.</b> New agent is the <b>+</b> on the sidebar's Agents heading, on every page; no top bar has it. "More" is a new menu holding Analytics, History and Guestbook.</p>
+<h3>FAQ: what changed since the last revision</h3>
+<p><b>Nothing you use is folded away.</b> Every page link and Settings keep their own rows, and the moon stays at the top right. The "More" menu is gone.</p>
+<p><b>The space comes from the meters instead.</b> They shrink to about 75 points and show only what needs attention (decision 4, Screen 6).</p>
+<p><b>Screens replace the tables.</b> The six screens above show every view. With pages first, the agents' one-line rows drop their section headings so ten agents fit.</p>
 
 <!-- memo-print-scope keys on this divider: everything after it is hidden when printing
      "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
@@ -318,10 +502,11 @@
 <tr><td>One sidebar, every page (decision 1)</td><td>B</td><td><code>web/app.js</code> <code>App</code>, new <code>Sidebar</code> replacing <code>Rail</code>; <code>web/terminal.js</code> <code>Switcher</code> reused; <code>web/app.css</code></td><td>I.1, I.2</td><td>1</td></tr>
 <tr><td>Top bar rules</td><td>C</td><td><code>web/app.js</code> <code>TopBar</code>; <code>web/terminal.js</code> bars</td><td>I.1</td><td>1</td></tr>
 <tr><td>Agents overview behind the heading (decision 2)</td><td>D</td><td><code>web/app.js</code> <code>PAGES</code>, <code>pageFor</code>; <code>web/agents.js</code></td><td>I.3</td><td>1</td></tr>
-<tr><td>Kept terminal (decision 4)</td><td>E</td><td><code>web/app.js</code> <code>App</code>; <code>web/terminal.js</code> <code>TerminalPage</code></td><td>I.4, I.7</td><td>1</td></tr>
+<tr><td>Kept terminal (decision 5)</td><td>E</td><td><code>web/app.js</code> <code>App</code>; <code>web/terminal.js</code> <code>TerminalPage</code></td><td>I.4, I.7</td><td>1</td></tr>
 <tr><td>⌘K, ⌘\ everywhere</td><td>G</td><td><code>web/app.js</code> <code>useKeyboard</code>, <code>Palette</code>; <code>web/terminal.js</code> key handler</td><td>I.2</td><td>1</td></tr>
-<tr><td>Documents as focus view (decision 3)</td><td>F</td><td><code>web/reader.js</code>, <code>web/app.js</code>, link sites in F.4; <code>http.rs</code> route</td><td>I.5, I.6, I.8</td><td>2</td></tr>
-<tr><td>Phone unchanged (decision 5)</td><td>B.7</td><td><code>web/app.css</code> ≤720 px block</td><td>I.1</td><td>1</td></tr>
+<tr><td>Documents as focus view (decision 3)</td><td>F</td><td><code>web/reader.js</code>, <code>web/app.js</code>, link sites in F.4; <code>http.rs</code> route</td><td>I.5, I.6, I.9</td><td>2</td></tr>
+<tr><td>Meters by importance (decision 4)</td><td>B.6</td><td><code>web/app.js</code> <code>Dash</code>, <code>usageMeter</code>; <code>web/app.css</code></td><td>I.8</td><td>1</td></tr>
+<tr><td>Phone unchanged (decision 6)</td><td>B.7</td><td><code>web/app.css</code> ≤720 px block</td><td>I.1</td><td>1</td></tr>
 </tbody>
 </table>
 
@@ -332,46 +517,53 @@
 <li><b>Contents, top to bottom.</b>
   <ol type="a">
   <li>One 40 px row: "sm" (navigates to <code>/</code>) and the search box, label "Search or jump…", <kbd>⌘K</kbd> hint; click opens the palette.</li>
-  <li>Page links: Inbox, Board, Queue, Artifacts, Notes, with today's badges from <code>badges()</code>. Queue also shows <code>&lt;running&gt; · &lt;waiting&gt;</code> (amber when a job has waited 30 minutes), replacing the top bar meter. The current page is highlighted.</li>
-  <li>Agents heading (D.1) and the session list (D.2).</li>
-  <li>Usage: today's <code>Dash</code>.</li>
-  <li>Foot row: Settings, the overnight moon (today's top bar control), "More ▾" (Analytics, History, Guestbook).</li>
+  <li>Page links: Inbox, Board, Queue, Artifacts, Notes, Analytics, History, Guestbook (today's <code>PAGES</code> minus Agents and Settings), with today's badges from <code>badges()</code>. Queue also shows <code>&lt;running&gt; · &lt;waiting&gt;</code> (amber when a job has waited 30 minutes), replacing the top bar's queue meter. The current page is highlighted.</li>
+  <li>Agents heading (D.1) and the session list (D.2). Only this part scrolls.</li>
+  <li>Meters (B.6).</li>
+  <li>Settings, on its own row, as today.</li>
   </ol></li>
-<li><b>Agents open or shrunk.</b> The sidebar is in one of two states.
+<li><b>Two arrangements.</b>
   <table>
-  <thead><tr><th>Part</th><th>Agents open</th><th>Agents shrunk</th></tr></thead>
+  <thead><tr><th>Part</th><th>Pages first</th><th>Agents first</th></tr></thead>
   <tbody>
-  <tr><td>Page links (b)</td><td>One 36 px row of icons, each with today's badge as a dot (folded-rail style): Inbox, Board, Queue, Artifacts, Notes, More, Settings. Tooltip is the label. The moon moves into More.</td><td>Full rows as listed in B.3 b.</td></tr>
-  <tr><td>Agents (c)</td><td>Heading plus the full list; this part alone scrolls.</td><td>Heading only, reading "Agents &nbsp;<i>n</i> live ›", then the rows of Needs-you agents, at most 3, then "+<i>k</i> more" if there are more. Clicking "<i>n</i> live ›" or "+<i>k</i> more" opens the list.</td></tr>
-  <tr><td>Usage (d)</td><td>One 28 px line: Claude 5-hour·week, Codex week, then the Mac reading with the strongest tint (CPU, memory or GPU; CPU if none is tinted), each tinted as today. Click opens the agents-shrunk state.</td><td>Today's full <code>Dash</code>.</td></tr>
-  <tr><td>Foot row (e)</td><td>Hidden (its items are in the icon row).</td><td>Shown.</td></tr>
+  <tr><td>Page links (b)</td><td>Full rows, 32 px each, as today.</td><td>One 36 px row of the eight page icons, each with its badge as a dot (today's folded-rail rules); tooltip is the label; the current page's icon highlighted.</td></tr>
+  <tr><td>Agents (c)</td><td>One-line rows, 26 px: dot in the section colour, name, and the fact's short form right-aligned and truncated (examples: <code>41h</code>, <code>done</code>, <code>▶ 39m</code>, <code>❚❚ review</code>). No section headings; a 6 px gap between sections; Idle as one row "Idle · <i>n</i> ›" that expands in place; shells as rows with ▹ and "shell".</td><td>Today's switcher rows and headings, unchanged (D.2).</td></tr>
+  <tr><td>Meters, Settings</td><td colspan="2">Identical in both.</td></tr>
   </tbody></table>
-  "<i>n</i> live ›" switches to agents open; in the open state the heading shows "<i>n</i> live ⌄", and clicking it, or the one-line meters, switches back. The state is remembered per view kind in local storage <code>sm-sidebar-agents</code> = <code>{ pages, terminal }</code>, each <code>open|shrunk</code>; defaults <code>pages: shrunk</code>, <code>terminal: open</code>. The document view uses <code>pages</code> when unfolded.</li>
-<li><b>Sizes</b> (CSS px at today's root font): page row 32, icon row 36, agent row 48, section heading 26, one-line meters 28, full <code>Dash</code> about 300, foot row 36. Example at 820 px tall, agents open, ten agents in Needs you 1 / Finished 1 / Moving 4 / Waiting 2 / Idle 2 (collapsed): fixed parts 40+36+30+28 = 134; list = 5 headings × 26 + 8 rows × 48 = 514; no scroll. Agents shrunk, Board: 40 + 5×32 + 32 + 1×48 + 300 + 36 = 616.</li>
+  The heading's "<i>n</i> live ›" (pages first) or "<i>n</i> live ⌄" (agents first) swaps the arrangement. It is remembered per view kind in local storage <code>sm-sidebar-arrangement</code> = <code>{ pages, terminal }</code>, each <code>pages|agents</code>; defaults <code>pages: pages</code>, <code>terminal: agents</code>. The document view uses <code>pages</code> when its sidebar is unfolded.</li>
+<li><b>Sizes</b> (CSS px at today's 16 px root): page row 32, icon row 36, two-line agent row 48, one-line row 26, section heading 26, heading 34, meters about 75 (three rows of 20 plus padding; each extra note line 16), Settings 36. Example at 820 px tall with Needs you 1 / Finished 1 / Moving 4 / Waiting 2 / Idle 2 / one shell. Pages first: 40 + 256 + 34 + (8 rows + Idle row + shell row) × 26 + 5 gaps × 6 + 75 + 36 = 731. Agents first: 40 + 36 + 34 + 4 headings × 26 + 8 × 48 + Idle and Terminals headings 52 + 75 + 36 = 761 before the shell row, which scrolls into view.</li>
+<li><b>Meters.</b> One block, replacing today's <code>Dash</code> in the sidebar; Analytics keeps the full detail, and a click on a provider label opens <code>/analytics/spend</code> as today.
+  <ol type="a">
+  <li>A row per provider (Claude, Codex): label, then for each window a short name (<code>5h</code>, <code>wk</code>, or the scope's two letters), a 26 px bar and the percentage, coloured by today's <code>meterBand</code>. Several accounts: the window names carry the account as today's labels do.</li>
+  <li>A note line under a provider row appears when any of its windows has <code>pace.kind == "runs_out"</code>: "<i>Week</i> runs out <i>Thu 3 pm</i>", amber, red when that window is at 85% or more (today's rule in <code>usageMeter</code>).</li>
+  <li>Otherwise a note appears for a week window when <code>pace.kind == "on_pace"</code>, <code>pace.percent &lt; 50</code>, and more than half the window has elapsed (from <code>resets_at</code> and the 7-day length): "On pace for <i>p</i>% · about <i>100−p</i>% unused at reset <i>Sun</i>", teal (<code>--cyan</code>). Five-hour windows never get this note.</li>
+  <li>Mac row: the readings among memory, CPU and GPU whose <code>meterBand</code> is amber or red (60% or more), each as name, bar and value (memory as used/total G); one row each after the first. None: the word "quiet". Hover shows all three values. No host reading: the row is omitted.</li>
+  <li>Example (today's live values): Claude 5h 2%, wk 25% on pace for 76%: no note. Codex wk 6% on pace for 26%, 1.6 of 7 days elapsed: no note yet; from Thursday it reads "On pace for 26% · about 74% unused at reset Sun". Mac CPU 100% red, memory 44%, GPU 0%: Mac row shows CPU only.</li>
+  </ol></li>
 <li><b>Folded strip signal.</b> When folded, the strip shows one dot at its top: red if an agent is blocked, magenta if anything needs you (Inbox needs-you count &gt; 0 or a Needs-you agent), otherwise none.</li>
 <li><b>Fold state</b> is remembered per view kind in local storage <code>sm-sidebar</code> = <code>{ pages, terminal, doc }</code>, each <code>open|folded</code>. Defaults: <code>pages</code> open at ≥1100 px else folded; <code>terminal</code> open at ≥900 px else folded; <code>doc</code> folded. First run migrates <code>sm-layout.rail</code> (<code>full</code>→open) into <code>pages</code> and <code>sm-term-switcher</code> into <code>terminal</code>.</li>
 <li><b>720–900 px.</b> The sidebar, when opened, overlays <code>main</code> (today's switcher overlay rule) and closes after a pick.</li>
 <li><b>≤720 px (phone).</b> Unchanged. List pages keep today's bottom tab bar (the same page items as today, Agents first); the terminal is full screen with today's phone bar and key row; the document view is full screen with a back arrow. No sidebar.</li>
-<li>Example: 1512×820 window, Board page, <code>sm-sidebar.pages=open</code>. Sidebar 15.5 rem; Board gets the rest. The agents list is shrunk (<code>sm-sidebar-agents.pages=shrunk</code>); clicking "10 live ›" opens it, and clicking far-2390 navigates to <code>/terminal/&lt;far-2390 id&gt;</code>, where the list is open (<code>terminal=open</code>) with far-2390 highlighted and the page links as icons.</li>
+<li>Example: 1512×820 window, Board page, <code>sm-sidebar.pages=open</code>, pages first. Sidebar 15.5 rem; Board gets the rest. Clicking far-2390 navigates to <code>/terminal/&lt;far-2390 id&gt;</code>, where the sidebar is agents first (<code>sm-sidebar-arrangement.terminal=agents</code>) with far-2390 highlighted and the page links as icons.</li>
 </ol>
 
 <h3 id="c">C. Top bar</h3>
 <table>
 <thead><tr><th>View</th><th>Left</th><th>Right</th></tr></thead>
 <tbody>
-<tr><td>Agents overview</td><td>"Agents" and today's attention summary buttons (<code>agents.js</code> <code>.toolbar .sum</code>)</td><td>Today's two <code>Seg</code> toggles (Order, Show), then Bug. The <code>.toolbar</code> row leaves the page content.</td></tr>
-<tr><td>Notes</td><td>"Notes"</td><td>The page's "+ New" button (<code>notes.js</code>), then Bug; it leaves the page content.</td></tr>
-<tr><td>Other list pages</td><td>Page name</td><td>Bug. Page content unchanged.</td></tr>
-<tr><td>Terminal (wide)</td><td>Today's: dot, name, context ring, connection word when not live</td><td>Today's: Notes ⌘J, Details, Hide (shells), Hand off…, ⋯, hidden shells, Open in Claude, Redraw, Bug, Retire. The "sm" home link leaves the bar (the sidebar has it).</td></tr>
+<tr><td>Agents overview</td><td>"Agents" and today's attention summary buttons (<code>agents.js</code> <code>.toolbar .sum</code>)</td><td>Today's two <code>Seg</code> toggles (Order, Show), then Moon, Bug. The <code>.toolbar</code> row leaves the page content.</td></tr>
+<tr><td>Notes</td><td>"Notes"</td><td>The page's "+ New" button (<code>notes.js</code>), then Moon, Bug; it leaves the page content.</td></tr>
+<tr><td>Other list pages</td><td>Page name</td><td>Moon, Bug. Page content unchanged.</td></tr>
+<tr><td>Terminal (wide)</td><td>Today's: dot, name, context ring, connection word when not live</td><td>Today's: Notes ⌘J, Details, Hide (shells), Hand off…, ⋯, hidden shells, Open in Claude, Redraw, then Moon (new here), Bug, Retire. The "sm" home link leaves the bar (the sidebar has it).</td></tr>
 <tr><td>Terminal (phone)</td><td colspan="2">Today's phone bar, unchanged, including its "sm" link and back arrow.</td></tr>
-<tr><td>Document</td><td>← back, document title</td><td>The reader's existing controls (version, Review, Ask), Bug.</td></tr>
+<tr><td>Document</td><td>← back, document title</td><td>The reader's existing controls (version, Review, Ask), then Moon, Bug.</td></tr>
 </tbody>
 </table>
 <p>Bar height is 40 px everywhere. The <code>NightBanner</code> stays under the bar on list pages only.</p>
 
 <h3 id="d">D. Agents heading, rows, overview</h3>
 <ol>
-<li><b>Heading.</b> "Agents", then "<i>n</i> live" with › (shrunk) or ⌄ (open), then "<i>m</i> needs you" in magenta when m&gt;0, then a <b>+</b> button at the right. The word "Agents" navigates to <code>/</code> (the overview); "<i>n</i> live" toggles open and shrunk (B.4). <b>+</b> opens today's New session sheet (<code>bus.emit('new-agent')</code>), which already offers agent or terminal.</li>
+<li><b>Heading.</b> "Agents", then "<i>n</i> live" with › (pages first) or ⌄ (agents first), then <i>m</i> in magenta when <i>m</i> agents need you, then a <b>+</b> button at the right. The word "Agents" navigates to <code>/</code> (the overview); "<i>n</i> live" swaps the arrangement (B.4). <b>+</b> opens today's New session sheet (<code>bus.emit('new-agent')</code>), which already offers agent or terminal.</li>
 <li><b>Rows</b> are today's <code>Switcher</code> rows and grouping (<code>switcherGroups</code>), unchanged: two lines, ✓ mark-answered, Idle collapsed with its count, Terminals section, hidden shells excluded except the current one. A click navigates to <code>/terminal/&lt;id&gt;</code>. The current row is highlighted only on that agent's terminal view.</li>
 <li><b>Overview.</b> The Agents page (<code>/</code>) is unchanged in content except that its toolbar moves into the top bar (C): attention summary, By attention/By repo, Live/With stopped, cards, details band, shell tiles, keys j/k/Enter/t/c/x. Its page link leaves the page list (the heading replaces it); <code>g a</code> still goes there.</li>
 </ol>
@@ -428,11 +620,12 @@
 <li><b>Document openers:</b> each site in F.4 navigates to <code>/read…</code>; <code>?open=doc:</code> is rewritten; no <code>doc</code> panel renders anywhere.</li>
 <li><b>Route:</b> Rust test in <code>http/browser_terminal_tests.rs</code> style: <code>GET /read/docs/x</code> serves the app on the browser host and 404s on another host; <code>GET /docs/x</code> is unchanged.</li>
 <li><b>Live, ticket 1:</b> terminal → Board → same agent in sidebar: no "Connecting" notice, new output present, the agent's tmux size unchanged.</li>
+<li><b>Meters</b> (unit, <code>tests/web/</code>): the five cases of B.6 e plus a runs-out window at 85% (red note), a five-hour window on pace for 10% (no note), and no host reading (no Mac row).</li>
 <li><b>Live, ticket 2:</b> from an agent's Details, open a document link, read, ⌘[: back on the terminal, still connected.</li>
 </ol>
 
 <h3 id="z">Z. FAQ</h3>
-<p><b>How did the design get here?</b> Revision 1 kept the page links as a narrow icon column beside the terminal's agents list; the owner found two left columns overloaded and bolted on, and it left the Agents page and documents unaddressed. Revision 2 merged both lists into one sidebar, made the Agents page the overview behind the heading, and moved documents out of the side panel; it did not fit at real sizes. Revision 3 makes the sidebar's parts take turns, sized on real screenshots for 8–10 agents. Revision 4 gives the top bar one rule (only about what you are looking at) and states where New agent, the moon and the new More menu live. The separate "Terminal" page link and <code>g t</code> shortcut of revision 1 are gone: every agent is in the sidebar.</p>
+<p><b>How did the design get here?</b> Revision 1 kept the page links as a narrow icon column beside the terminal's agents list; the owner found two left columns overloaded and bolted on, and it left the Agents page and documents unaddressed. Revision 2 merged both lists into one sidebar, made the Agents page the overview behind the heading, and moved documents out of the side panel; it did not fit at real sizes. Revision 3 makes the sidebar's parts take turns, sized on real screenshots for 8–10 agents. Revision 4 gives the top bar one rule (only about what you are looking at). Revision 5 keeps every page link, Settings and the moon where the owner has them, takes the room from compact, importance-based meters instead of a More menu, and shows the design as six screens. The separate "Terminal" page link and <code>g t</code> shortcut of revision 1 are gone: every agent is in the sidebar.</p>
 <p><b>Why keep the Agents overview at all?</b> It is the only place showing stopped agents, the By repo grouping, and per-agent facts side by side. Web request logs for the last two weeks show the terminal screen about four times as busy as the Agents page, so it is a secondary view, but not an empty one. If it stays unused after this ships, landing on the terminal of the agent that most needs you is a one-line change.</p>
 <p><b>Why 15 minutes for the kept terminal?</b> It covers a look at Board, Queue or a document and back, which is what the second tab is used for, without a forgotten terminal streaming over the Cloudflare relay all afternoon. It is a constant.</p>
 <p><b>Why only one kept terminal?</b> Moving between agents through the sidebar reconnects today and is not part of the complaint. Keeping several multiplies streams for little gain.</p>
