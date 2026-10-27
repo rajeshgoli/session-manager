@@ -857,9 +857,17 @@ fn agent_facts(
             .min()
             .unwrap_or("");
         ("waiting_long", json!(reason), earliest.to_owned())
-    } else if working || !running.is_empty() {
+    } else if working
+        || !running.is_empty()
+        || !background.is_empty()
+        || !background_agents.is_empty()
+    {
+        // Work running on the agent's behalf moves it, whoever runs it (sm#2544).
         let latest = running
             .iter()
+            .copied()
+            .chain(background.iter().copied())
+            .chain(background_agents.iter())
             .map(|job| s(job, "started_at"))
             .chain(activity_since)
             .filter(|at| !at.is_empty())
@@ -1530,7 +1538,7 @@ mod facts_tests {
         let server = json!({"pid": 8, "command": "npm run dev"});
         let text = |background: Value, jobs: Value| {
             let session = json!({"status": "active", "activity_state": "idle", "background_jobs": background});
-            let (facts, _) = agent_facts(
+            let (facts, attention) = agent_facts(
                 &session,
                 &json!([]),
                 &json!([]),
@@ -1542,6 +1550,7 @@ mod facts_tests {
                 facts["jobs"]["text"].clone(),
                 facts["jobs"]["tone"].clone(),
                 facts["background"].clone(),
+                attention["section"].clone(),
             )
         };
         assert_eq!(
@@ -1549,12 +1558,18 @@ mod facts_tests {
             (
                 json!("◷ Watching: until grep -q Ready /tmp/dev.log; do sle…"),
                 json!("background"),
-                json!(1)
+                json!(1),
+                json!("moving")
             )
         );
         assert_eq!(
             text(json!([watcher, server]), json!([])),
-            (json!("◷ 2 in background"), json!("background"), json!(2))
+            (
+                json!("◷ 2 in background"),
+                json!("background"),
+                json!(2),
+                json!("moving")
+            )
         );
         let running = json!([{"type": "shell", "state": "running", "started_at": "2026-10-19T16:16:00Z", "timeout_seconds": 0}]);
         assert_eq!(
@@ -1562,10 +1577,21 @@ mod facts_tests {
             (
                 json!("Shell running 4m · 1 in background"),
                 json!("green"),
-                json!(1)
+                json!(1),
+                json!("moving")
             )
         );
-        assert_eq!(text(json!([]), json!([])).0, json!("No jobs"));
+        let nothing = text(json!([]), json!([]));
+        assert_eq!((nothing.0, nothing.3), (json!("No jobs"), json!("idle")));
+        // sm#2544: a background agent moves its idle parent, as a queue job does.
+        let session = json!({"status": "active", "activity_state": "idle",
+            "background_agents": [{"agent_type": "Explore", "description": "Find callers"}]});
+        let (facts, attention) = agent_facts(&session, &json!([]), &json!([]), &[], None, &context);
+        assert_eq!(
+            facts["jobs"]["text"],
+            "◷ Background agent working: Find callers"
+        );
+        assert_eq!(attention["section"], "moving");
     }
 
     #[test]
