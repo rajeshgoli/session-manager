@@ -550,6 +550,60 @@ test('links: URLs, OSC 8 and local file paths open in a new tab with tmux mouse 
   } finally { await browser.close(); }
 });
 
+test('tmux mouse mode on: a click sends nothing, a drag selects and Copy copies, the wheel still reaches tmux (#2540)', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { context, page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin: ORIGIN });
+    await page.addInitScript(() => { window.termOutput = '\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h' + 'copy this line please\r\n> '; });
+    await page.goto(`${ORIGIN}/terminal/iter8-run`);
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
+    await page.locator('.xterm-rows', { hasText: 'copy this line' }).waitFor();
+    const inputs = () => page.evaluate(() => window.sockets.flatMap((s) => s.sent).filter((f) => f.type === 'input').map((f) => f.data));
+    const box = await page.evaluate(() => {
+      const r = document.querySelector('.xterm-screen').getBoundingClientRect();
+      const row = document.querySelector('.xterm-rows > div').getBoundingClientRect();
+      return { x: r.left, y: r.top, h: row.height, w: r.width };
+    });
+    const y = box.y + box.h / 2;
+    await page.mouse.click(box.x + 40, y);
+    await page.keyboard.type('hi');
+    assert.deepEqual(await inputs(), ['h', 'i'], 'the click reaches no one and typing goes to the agent');
+    await page.mouse.move(box.x + 2, y);
+    await page.mouse.down();
+    await page.mouse.move(box.x + box.w / 2, y, { steps: 8 });
+    await page.mouse.up();
+    assert.deepEqual(await inputs(), ['h', 'i'], 'a drag sends no mouse report to tmux');
+    const copy = page.locator('.term-copy');
+    await copy.waitFor({ state: 'visible' });
+    await copy.click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), 'copy this line please');
+    await copy.waitFor({ state: 'hidden' });
+    await page.mouse.move(box.x + 40, y);
+    await page.mouse.wheel(0, -200);
+    await page.waitForFunction(() => window.sockets.flatMap((s) => s.sent).some((f) => f.type === 'input' && f.data.startsWith('\x1b[<64;')));
+    assert.ok((await inputs()).every((d) => !/^\x1b\[A/.test(d)), 'the wheel is not turned into arrow keys');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('a mouse request sharing a sequence with the alternate screen draws in the alternate screen, and clicks still send nothing', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    await page.addInitScript(() => { window.termOutput = 'normal screen text\x1b[?1049;1000;1006hALTERNATE SCREEN'; });
+    await page.goto(`${ORIGIN}/terminal/iter8-run`);
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
+    await page.locator('.xterm-rows', { hasText: 'ALTERNATE SCREEN' }).waitFor();
+    assert.ok(!(await page.locator('.xterm-rows').innerText()).includes('normal screen text'));
+    const box = await page.evaluate(() => { const r = document.querySelector('.xterm-screen').getBoundingClientRect(); return { x: r.left, y: r.top }; });
+    await page.mouse.click(box.x + 40, box.y + 30);
+    await page.waitForTimeout(100);
+    assert.deepEqual(await page.evaluate(() => window.sockets.flatMap((s) => s.sent).filter((f) => f.type === 'input')), []);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
 test('terminal theme: picked in Settings, light or dark from Appearance, switching live (#2304)', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {

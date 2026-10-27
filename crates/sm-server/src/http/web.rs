@@ -58,6 +58,7 @@ const ASSETS: &[Asset] = &[
     asset!("devices.css", "text/css; charset=utf-8"),
     asset!("terminal.js", JS),
     asset!("terminal-images.js", JS),
+    asset!("terminal-mouse.js", JS),
     asset!("terminal-files.js", JS),
     asset!("terminal-route.js", JS),
     asset!("terminal-theme.js", JS),
@@ -279,7 +280,8 @@ mod tests {
         // The Queue page's per-job usage and pins (#2475) add ~10 KiB.
         // Overnight mode's moon, banner and settings (#2494) add ~4 KiB.
         // Clickable terminal file paths (#2502) add ~3 KiB.
-        const BUDGET: usize = 496 * 1024;
+        // Web-page mouse and Copy in the terminal (#2540) add ~5 KiB.
+        const BUDGET: usize = 500 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",

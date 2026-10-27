@@ -8,6 +8,7 @@ import { NotesView } from './notes.js';
 import { CONTRAST_FLOOR, THEME_KEY, isLight, terminalTheme } from './terminal-theme.js';
 import { installImagePaste } from './terminal-images.js';
 import { installFileLinks } from './terminal-files.js';
+import { installPageMouse } from './terminal-mouse.js';
 import { isShell, shellFact, ShellCloseButton, ShellAwayPanel, ShellMenu, ShellName, setShellHidden, hiddenShells, HiddenShells } from './shell.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
@@ -285,6 +286,9 @@ export function TerminalPage({ id, open }) {
       focus: () => terminal.focus(),
       redraw: () => { redraw(); terminal.focus(); },
     };
+    const mouse = installPageMouse(terminal, host.current, input, async (text) => {
+      try { await navigator.clipboard.writeText(text); toast('Copied'); } catch (err) { toast(`Could not copy: ${err.message}`); }
+    });
     const removeImagePaste = installImagePaste(host.current, {
       connection: () => !stopped && live ? socket : null,
       upload: (body) => api(`/client/sessions/${encodeURIComponent(id)}/terminal-images`, { method: 'POST', body }),
@@ -433,6 +437,7 @@ export function TerminalPage({ id, open }) {
         if (event.type === 'keydown') { event.preventDefault(); back(); }
         return false;
       }
+      if (mouse.copyKey(event, /Mac/.test(navigator.platform))) return false;
       // Let the browser deliver Ctrl+V as a clipboard event, including images,
       // on Windows/Linux. On macOS the capture handler reads it explicitly.
       if (event.ctrlKey && !event.altKey && event.key.toLowerCase() === 'v') return false;
@@ -452,7 +457,7 @@ export function TerminalPage({ id, open }) {
     fitNow();
     connect();
     return () => {
-      removeImagePaste();
+      removeImagePaste(); mouse.dispose();
       stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); clearTimeout(resizeTimer); clearTimeout(nudgeTimer); stopDirect(); detach(); observer.disconnect(); themeWatch.disconnect(); scheme.removeEventListener('change', retheme); window.removeEventListener('storage', storageWatch); data.dispose(); terminal.dispose();
       window.removeEventListener('pagehide', pagehide); window.removeEventListener('pageshow', pageshow); control.current = null;
     };
