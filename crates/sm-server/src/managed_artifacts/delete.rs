@@ -48,6 +48,24 @@ fn remove_directory(
         result => result,
     }
 }
+/// Splits the live dependents of `name` outside its own set into those sm
+/// can rebuild, which block an agent delete, and those it already cannot
+/// (incomplete recipe, GPU cost, or another input already gone), which a
+/// delete cannot make any less rebuildable.
+fn dependents(conn: &Connection, root: &str, name: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let rows = store::query(conn, "SELECT DISTINCT a.*, EXISTS(SELECT 1 FROM artifact_inputs j LEFT JOIN artifacts b ON b.root=j.root AND b.name=j.input WHERE j.root=a.root AND j.name=a.name AND (b.name IS NULL OR b.state='deleted')) AS missing_input FROM artifact_inputs i JOIN artifacts a ON a.root=i.root AND a.name=i.name WHERE i.root=?1 AND i.input=?2 AND a.state!='deleted' AND a.set_id<>(SELECT set_id FROM artifacts WHERE root=?1 AND name=?2) ORDER BY a.name", &[&root, &name])?;
+    let (mut blocking, mut bypassed) = (Vec::new(), Vec::new());
+    for a in rows {
+        let dependent = a["name"].as_str().unwrap_or_default().to_owned();
+        if a["recipe_complete"] == 1 && !store::has_gpu(&a) && a["missing_input"] != 1 {
+            blocking.push(dependent);
+        } else {
+            bypassed.push(dependent);
+        }
+    }
+    Ok((blocking, bypassed))
+}
+
 impl ManagedArtifacts {
     pub fn delete(
         &self,
@@ -142,7 +160,7 @@ impl ManagedArtifacts {
                 bail!("{n} is kept for the project; remove the mark first");
             }
             ensure_not_in_use(&tx, &root.path, n)?;
-            let dependents=store::query(&tx,"SELECT DISTINCT i.name FROM artifact_inputs i JOIN artifacts a ON a.root=i.root AND a.name=i.name WHERE i.root=?1 AND i.input=?2 AND a.state!='deleted' AND a.set_id<>(SELECT set_id FROM artifacts WHERE root=?1 AND name=?2)",&[&root.path,&n])?;
+            let (dependents, _) = dependents(&tx, &root.path, n)?;
             if !owner && !dependents.is_empty() {
                 bail!("{n} is an input of {}", json!(dependents));
             }
@@ -188,6 +206,7 @@ impl ManagedArtifacts {
             &[&root.path, &a["set_id"].as_str().unwrap_or(name)],
         )?;
         let mut removal_started = false;
+        let mut bypassed = std::collections::BTreeMap::new();
         let result = (|| {
             if pressure {
                 score::deletion_eligible(&tx, &root.path, &members)?;
@@ -201,9 +220,12 @@ impl ManagedArtifacts {
                     bail!("{n} is kept for the project; remove the mark first");
                 }
                 ensure_not_in_use(&tx, &root.path, n)?;
-                let dependents = store::query(&tx,"SELECT i.name FROM artifact_inputs i JOIN artifacts a ON a.root=i.root AND a.name=i.name WHERE i.root=?1 AND i.input=?2 AND a.state!='deleted' AND a.set_id<>(SELECT set_id FROM artifacts WHERE root=?1 AND name=?2)",&[&root.path,&n])?;
+                let (dependents, unrebuildable) = dependents(&tx, &root.path, n)?;
                 if !owner && !dependents.is_empty() {
                     bail!("{n} is an input of {}", json!(dependents));
+                }
+                if !owner && !unrebuildable.is_empty() {
+                    bypassed.insert(n.to_owned(), unrebuildable);
                 }
             }
             for member in &members {
@@ -278,7 +300,10 @@ impl ManagedArtifacts {
                 n,
                 "deleted",
                 actor,
-                json!({"reason":reason}),
+                match bypassed.get(n) {
+                    Some(names) => json!({"reason":reason,"bypassed_dependents":names}),
+                    None => json!({"reason":reason}),
+                },
             )?;
         }
         let result = store::detail(&tx, &root.path, name)?;
