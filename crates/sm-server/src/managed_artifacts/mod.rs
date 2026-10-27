@@ -21,7 +21,7 @@ pub mod store;
 pub mod submission;
 use anyhow::{bail, Result};
 use config::{ArtifactRoot, ManagedArtifactsConfig};
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use store::{artifact, event, ArtifactStore};
@@ -255,6 +255,7 @@ impl ManagedArtifacts {
         names: &[String],
         flags: &RecordFlags,
         actor: &str,
+        actor_name: &str,
     ) -> Result<Value> {
         flags.validate(&self.config, root)?;
         if names.is_empty() {
@@ -288,9 +289,17 @@ impl ManagedArtifacts {
                 .map_err(|error| anyhow::anyhow!("{name} cannot be recorded: {error}"))?;
         }
         for name in names {
+            let a = artifact(&tx, &root.path, name)?;
             apply_record(&tx, root, name, flags, actor)?;
             tx.execute("UPDATE artifacts SET state='live',recipe_complete=?3,origin=CASE WHEN origin='unrecorded' THEN 'adopted' ELSE origin END WHERE root=?1 AND name=?2",params![root.path,name,flags.recipe_complete])?;
-            event(&tx, &root.path, name, "recorded", actor, json!({}))?;
+            // Discovery only guessed who owns an unrecorded folder; whoever records it is its author (sm#2537).
+            let detail = if a["origin"] == "unrecorded" && a["owner_session_id"] != actor {
+                set_owner(&tx, &root.path, name, actor, actor_name)?;
+                json!({"previous_owner":a["owner_session_id"]})
+            } else {
+                json!({})
+            };
+            event(&tx, &root.path, name, "recorded", actor, detail)?;
             tx.execute(
                 "DELETE FROM artifact_meta WHERE key=?1 AND value=?2",
                 params![
@@ -326,6 +335,43 @@ impl ManagedArtifacts {
             actor,
             json!({"done":true}),
         )?;
+        let result = store::detail(&tx, &root.path, name)?;
+        tx.commit()?;
+        Ok(result)
+    }
+    /// Takes ownership of a folder the actor recorded after discovery had routed
+    /// it to someone else. Ownership a session chose stays put.
+    pub fn adopt(
+        &self,
+        root: &ArtifactRoot,
+        name: &str,
+        actor: &str,
+        actor_name: &str,
+    ) -> Result<Value> {
+        let mut conn = self.store.open()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let a = artifact(&tx, &root.path, name)?;
+        let recorder: Option<String> = tx
+            .query_row(
+                "SELECT actor FROM artifact_events WHERE root=?1 AND name=?2 COLLATE NOCASE AND kind='recorded' ORDER BY id DESC LIMIT 1",
+                params![root.path, name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if a["origin"] != "adopted" || recorder.as_deref() != Some(actor) {
+            bail!("adopt requires a discovered artifact you recorded");
+        }
+        if a["owner_session_id"] != actor {
+            set_owner(&tx, &root.path, name, actor, actor_name)?;
+            event(
+                &tx,
+                &root.path,
+                name,
+                "adopted",
+                actor,
+                json!({"previous_owner":a["owner_session_id"]}),
+            )?;
+        }
         let result = store::detail(&tx, &root.path, name)?;
         tx.commit()?;
         Ok(result)
@@ -386,6 +432,13 @@ impl ManagedArtifacts {
         tx.commit()?;
         Ok(result)
     }
+}
+fn set_owner(conn: &Connection, root: &str, name: &str, id: &str, name_of: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE artifacts SET owner_session_id=?3,owner_session_name=?4 WHERE root=?1 AND name=?2",
+        params![root, name, id, name_of],
+    )?;
+    Ok(())
 }
 fn apply_record(
     conn: &Connection,

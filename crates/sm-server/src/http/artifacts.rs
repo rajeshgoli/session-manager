@@ -585,7 +585,7 @@ fn mutate(
                         .map(|v| serde_json::from_value::<Vec<String>>(v.clone()))
                         .transpose()?
                         .unwrap_or_else(|| vec![name]);
-                    svc.record(root, &names, &flags, &actor.id)
+                    svc.record(root, &names, &flags, &actor.id, &actor.name)
                 }
             }
             "rebuild" => ma::rebuild::start(
@@ -618,6 +618,7 @@ fn mutate(
             ),
             "cancel" => ma::ops::cancel(svc, root, &name, &actor.id, false),
             "done" => svc.done(root, &name, &actor.id),
+            "adopt" => svc.adopt(root, &name, &actor.id, &actor.name),
             "consumers" | "marks" => svc.edit(root, &name, &action, &body, &actor.id),
             "delete" => svc.delete(
                 root,

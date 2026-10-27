@@ -201,6 +201,7 @@ fn record_is_atomic_and_adopts_without_recipe() {
             &f.root,
             &["123_data".into(), "missing".into()],
             &f.flags(),
+            "maker",
             "maker"
         )
         .is_err());
@@ -210,14 +211,87 @@ fn record_is_atomic_and_adopts_without_recipe() {
     );
     let result = f
         .svc
-        .record(&f.root, &["123_data".into()], &f.flags(), "maker")
+        .record(&f.root, &["123_data".into()], &f.flags(), "maker", "maker")
         .unwrap();
     assert_eq!(result[0]["origin"], "adopted");
     assert_eq!(result[0]["rebuildable"], false);
     assert!(f
         .svc
-        .record(&f.root, &["123_data".into()], &f.flags(), "maker")
+        .record(&f.root, &["123_data".into()], &f.flags(), "maker", "maker")
         .is_err());
+}
+#[test]
+fn recording_a_discovered_folder_moves_ownership_to_the_recorder() {
+    let f = Fixture::new();
+    fs::create_dir(f.path("123_data")).unwrap();
+    fs::create_dir(f.path("456_data")).unwrap();
+    f.svc.scan(&f.root).unwrap();
+    // Discovery routed both record requests to the ticket holder.
+    f.svc
+        .store
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE artifacts SET owner_session_id='holder',owner_session_name='far-123'",
+            [],
+        )
+        .unwrap();
+    let result = f
+        .svc
+        .record(
+            &f.root,
+            &["123_data".into()],
+            &f.flags(),
+            "maker",
+            "maker-agent",
+        )
+        .unwrap();
+    assert_eq!(result[0]["owner_session_id"], "maker");
+    assert_eq!(result[0]["owner_session_name"], "maker-agent");
+    let events = &result[0]["events"];
+    assert_eq!(events[0]["kind"], "recorded");
+    assert_eq!(
+        serde_json::from_str::<Value>(events[0]["detail_json"].as_str().unwrap()).unwrap(),
+        json!({"previous_owner":"holder"})
+    );
+    // A hand-made folder keeps the owner who created it.
+    let hand = f.create("789_data");
+    assert_eq!(hand["owner_session_id"], "maker");
+
+    // A record made before this fix left the discovery owner in place; adopt corrects it.
+    f.svc
+        .record(
+            &f.root,
+            &["456_data".into()],
+            &f.flags(),
+            "maker",
+            "maker-agent",
+        )
+        .unwrap();
+    f.svc
+        .store
+        .open()
+        .unwrap()
+        .execute(
+            "UPDATE artifacts SET owner_session_id='holder',owner_session_name='far-123' WHERE name='456_data'",
+            [],
+        )
+        .unwrap();
+    assert!(f
+        .svc
+        .adopt(&f.root, "456_data", "holder", "far-123")
+        .is_err());
+    assert!(f
+        .svc
+        .adopt(&f.root, "789_data", "maker", "maker-agent")
+        .is_err());
+    let adopted = f
+        .svc
+        .adopt(&f.root, "456_data", "maker", "maker-agent")
+        .unwrap();
+    assert_eq!(adopted["owner_session_id"], "maker");
+    assert_eq!(adopted["owner_session_name"], "maker-agent");
+    assert_eq!(adopted["events"][0]["kind"], "adopted");
 }
 #[test]
 fn scan_known_directory_and_cold_link_are_unchanged() {
@@ -526,6 +600,7 @@ fn record_refuses_vanished_entry_without_partial_updates() {
             &f.root,
             &["123_data".into(), "456_data".into()],
             &f.flags(),
+            "maker",
             "maker"
         )
         .is_err());

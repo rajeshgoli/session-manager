@@ -1041,6 +1041,7 @@ fn rebuild_replays_a_preserved_recipe_and_retains_records() {
                 project: true,
                 ..Default::default()
             },
+            "maker",
             "maker"
         )
         .is_err());
