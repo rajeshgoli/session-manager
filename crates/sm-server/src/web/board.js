@@ -320,11 +320,13 @@ export function BoardPage() {
   const saveCollapsed = (ids) => { store('sm-board-collapsed', ids); setCollapsed(ids); };
   const toggleLane = (id) => saveCollapsed(collapsed.includes(id) ? collapsed.filter((x) => x !== id) : [...collapsed, id]);
   /** Scroll to a lane or a ticket row, opening whatever hides it. */
-  const jump = (laneId, key = null) => {
+  const jump = (laneId, key = null, retried = false) => {
     if (laneId != null && collapsed.includes(laneId)) saveCollapsed(collapsed.filter((x) => x !== laneId));
     requestAnimationFrame(() => requestAnimationFrame(() => {
       const lane = laneId != null ? document.querySelector(`[data-lane="${laneId}"]`) : document;
       const el = key ? lane?.querySelector(`[data-ticket="${CSS.escape(key)}"]`) : lane;
+      // A filter or search can hide the target: show all work and try once more.
+      if ((!el || el === document) && !retried) { setFilter('all'); setQuery(''); jump(laneId, key, true); return; }
       if (!el || el === document) return;
       const fold = el.closest('details'); if (fold) fold.open = true;
       el.scrollIntoView({ behavior: 'smooth', block: key ? 'center' : 'start' });
