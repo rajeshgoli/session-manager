@@ -1,7 +1,7 @@
 // Board (1710 D6.4). The server owns ticket states, ordering and clock rules.
 import { createContext } from 'preact';
 import { useContext, useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, bus, providerLabel, usePoll, stored, store, Seg, Popover, Links, openItem, openPanel, navigate, setShared, toast, age, useNow } from './ui.js';
+import { html, api, bus, providerLabel, usePoll, stored, store, Popover, Links, openItem, openPanel, navigate, setShared, toast, age, useNow } from './ui.js';
 import { TicketStart, LaneWhenReady, blockedReasons, canStartAnyway, chipText, retryBody, laneCandidates } from './board-start.js';
 import { SharedLaunchSetup, LaneLaunchDefault } from './launch-setup.js';
 import { exactConfig } from './launch-fields.js';
@@ -110,10 +110,9 @@ export function currentReviews(ticket) {
   return list;
 }
 export const hasOperations = t => !!(t.holder || t.needs_you || t.auto_start || t.jobs?.length || currentReviews(t).length || t.warnings?.length);
-export function matchesFilter(ticket, filter, query = '', goalTitle = '') {
-  const match = filter==='all' || filter==='finished' && ticket.state==='done' || filter==='armed' && !!ticket.auto_start || filter==='attention' && (ticket.needs_you || ticket.warnings?.length || ticket.auto_start?.state==='failed' || ticket.jobs?.some(j=>j.quiet_since) || ['stalled','no_agent'].includes(ticket.clock?.ball));
-  return !!match && `${ticket.repo} #${ticket.number} ${ticket.title} ${goalTitle}`.toLowerCase().includes(query.toLowerCase());
-}
+/** Find matches the repo, number, title or lane goal, ignoring case. */
+export const matchesQuery = (ticket, query = '', goalTitle = '') =>
+  `${ticket.repo} #${ticket.number} ${ticket.title} ${goalTitle}`.toLowerCase().includes(query.toLowerCase());
 function TicketRow({ ticket, end, hours, onStart, onClose, busy, lanePolicy = null }) {
   const [menu, setMenu] = useState(null);
   const now = useNow();
@@ -164,7 +163,11 @@ function TicketRow({ ticket, end, hours, onStart, onClose, busy, lanePolicy = nu
   </div>`;
 }
 /** Column names once per lane instead of on every row. */
-const ColumnHeads = ({ hours }) => html`<div class="board-ticket board-cols" aria-hidden="true"><span>Ticket</span><span>Agent · last ${hours} h</span><span>Work / waits</span><span>Launch</span></div>`;
+export const CLOCK_HOURS = [3, 6, 24];
+/** Column names once per lane; the agent heading also picks the time strip's window. */
+const ColumnHeads = ({ hours }) => html`<div class="board-ticket board-cols"><span>Ticket</span>
+  <span>Agent · <button class="link-btn board-hours" title="Change the time strip window" onClick=${() => bus.emit('board-hours', CLOCK_HOURS[(CLOCK_HOURS.indexOf(hours) + 1) % CLOCK_HOURS.length])}>last ${hours} h ▾</button></span>
+  <span>Work / waits</span><span>Launch</span></div>`;
 function Fold({ tickets, label, end, hours, onStart, onClose, busy, lanePolicy = null, open = false }) {
   if (!tickets.length) return null;
   const blockers = [...new Map(tickets.flatMap(openBlockers).map((t) => [ticketKey(t), t])).values()];
@@ -173,7 +176,7 @@ function Fold({ tickets, label, end, hours, onStart, onClose, busy, lanePolicy =
     ${tickets.map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${lanePolicy} slim />`)}
   </details>`;
 }
-function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, move, showDone = false, collapsed = false, onToggle }) {
+function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, move, collapsed = false, onToggle }) {
   const [ending, setEnding] = useState(false);
   const [reviews, setReviews] = useState(false);
   const [lining, setLining] = useState(false);
@@ -225,7 +228,7 @@ function Lane({ lane, index, count, end, hours, onStart, onClose, mutate, busy, 
     ${groups.blocked.filter(hasOperations).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} slim />`)}
     <div class="lane-folds"><${Fold} tickets=${groups.blocked.filter(t=>!hasOperations(t))} label="Blocked" end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} />
       ${groups.done.filter(hasOperations).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} slim />`)}
-      <${Fold} tickets=${groups.done.filter(t=>!hasOperations(t))} label="Done" open=${showDone} end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} /></div>`}
+      <${Fold} tickets=${groups.done.filter(t=>!hasOperations(t))} label="Done" end=${end} hours=${hours} onStart=${onStart} onClose=${onClose} busy=${busy} lanePolicy=${policy} /></div>`}
   </section>`;
 }
 /** The lane's Handoff pill: what the lane sets, or "default" (sm#2293). */
@@ -308,13 +311,12 @@ function LaneStrip({ lanes, attention, collapsed, jump, setAll }) {
   </nav>`;
 }
 export function BoardPage() {
-  const [hours, setHours] = useState(() => { const saved = stored('sm-board-clock-hours', 3); return [3, 6, 24].includes(saved) ? saved : 3; });
+  const [hours, setHours] = useState(() => { const saved = stored('sm-board-clock-hours', 3); return CLOCK_HOURS.includes(saved) ? saved : 3; });
   const [data, error, reload] = usePoll(() => api(`/client/board?clock_hours=${hours}`), 30000, [hours]);
   const [actionError, setActionError] = useState(null);
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
   const [starting, setStarting] = useState(null);
-  const [filter, setFilter] = useState('all');
   const [query, setQuery] = useState('');
   const [collapsed, setCollapsed] = useState(() => { const saved = stored('sm-board-collapsed', []); return Array.isArray(saved) ? saved : []; });
   const saveCollapsed = (ids) => { store('sm-board-collapsed', ids); setCollapsed(ids); };
@@ -325,19 +327,20 @@ export function BoardPage() {
     requestAnimationFrame(() => requestAnimationFrame(() => {
       const lane = laneId != null ? document.querySelector(`[data-lane="${laneId}"]`) : document;
       const el = key ? lane?.querySelector(`[data-ticket="${CSS.escape(key)}"]`) : lane;
-      // A filter or search can hide the target: show all work and try once more.
-      if ((!el || el === document) && !retried) { setFilter('all'); setQuery(''); jump(laneId, key, true); return; }
+      // A search can hide the target: clear it and try once more.
+      if ((!el || el === document) && !retried) { setQuery(''); jump(laneId, key, true); return; }
       if (!el || el === document) return;
       const fold = el.closest('details'); if (fold) fold.open = true;
       el.scrollIntoView({ behavior: 'smooth', block: key ? 'center' : 'start' });
       el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
     }));
   };
-  const visibleLanes = data?.lanes.map(l=>({...l,tickets:(l.tickets||[]).filter(t=>matchesFilter(t,filter,query,l.goal.title))})).filter(l=>l.tickets.length)||[];
-  const visibleOthers = (data?.other||[]).map(g=>({...g,tickets:g.tickets.filter(t=>matchesFilter(t,filter,query))})).filter(g=>g.tickets.length);
+  const visibleLanes = data?.lanes.map(l=>({...l,tickets:(l.tickets||[]).filter(t=>matchesQuery(t,query,l.goal.title))})).filter(l=>l.tickets.length)||[];
+  const visibleOthers = (data?.other||[]).map(g=>({...g,tickets:g.tickets.filter(t=>matchesQuery(t,query))})).filter(g=>g.tickets.length);
   const refreshTimer = useRef(null);
   useEffect(() => () => clearTimeout(refreshTimer.current), []);
   useEffect(() => bus.on('board-changed', reload), [reload]);
+  useEffect(() => bus.on('board-hours', (n) => { store('sm-board-clock-hours', n); setHours(n); }), []);
   useEffect(() => {
     if (!data) return;
     // Acknowledge each rendered snapshot, never an unseen poll result.
@@ -376,12 +379,9 @@ export function BoardPage() {
   const attention = data ? attentionItems(data.lanes, data.other || []) : [];
   const ready = data ? readyItems(data.lanes, data.other || []) : [];
   return html`<${AutoStartPaused.Provider} value=${!!(data && data.auto_start_paused)}><div class="content board-content">
-    <div class="board-toolbar"><${Seg} label="Board filter" value=${filter} onChange=${setFilter} options=${[{value:'all',label:'All work'},{value:'attention',label:'Needs attention'},{value:'armed',label:'Armed'},{value:'finished',label:'Finished'}]} />
-      <input class="inp" aria-label="Find a ticket or goal" placeholder="Find a ticket or goal…" value=${query} onInput=${e=>setQuery(e.target.value)} />
-      <span class="sub board-updated">${data ? `${data.lanes.length} lanes · updated ${age(data.generated_at)} ago` : 'Loading board…'}</span>
-      <${Seg} label="Clock window" value=${hours} options=${[3, 6, 24].map((n) => ({ value: n, label: `${n} h` }))} onChange=${(n) => { store('sm-board-clock-hours', n); setHours(n); }} />
-      <button class="btn" disabled=${busy} onClick=${() => mutate('/client/board/refresh', 'POST')}>Refresh</button>
-      <span class="anchor"><button class="btn" data-pop-anchor onClick=${() => setAdding(!adding)}>Add lane</button>
+    <div class="board-toolbar"><input class="inp" aria-label="Find a ticket or goal" placeholder="Find a ticket or goal…" value=${query} onInput=${e=>setQuery(e.target.value)} />
+      <button class="link-btn board-updated" disabled=${busy || !data} title="Refresh from GitHub" onClick=${() => mutate('/client/board/refresh', 'POST')}>${data ? `Updated ${age(data.generated_at)} ago` : 'Loading board…'} ↻</button>
+      <span class="anchor"><button class="icon-btn" data-pop-anchor aria-label="Add lane" title="Add lane" onClick=${() => setAdding(!adding)}>+</button>
         ${adding ? html`<${AddLane} repos=${data ? data.repos : []} mutate=${mutate} busy=${busy} onClose=${() => setAdding(false)} />` : null}</span>
     </div>
     ${data ? html`<${YourMove} attention=${attention} ready=${ready} jump=${jump} onStart=${startTicket} onClose=${close} busy=${busy} />
@@ -391,7 +391,7 @@ export function BoardPage() {
     ${data ? html`
       ${data.lanes.length ? null : html`<div class="stub">No active lanes. Add a goal ticket to start a lane.</div>`}
       ${boardSections(visibleLanes, visibleOthers).map(({ lane, other: group }) => lane ? html`<${Lane} key=${lane.id} lane=${lane} index=${data.lanes.findIndex(l=>l.id===lane.id)} count=${data.lanes.length}
-        end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} mutate=${mutate} busy=${busy} move=${move} showDone=${filter==='finished'}
+        end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} mutate=${mutate} busy=${busy} move=${move} 
         collapsed=${collapsed.includes(lane.id)} onToggle=${() => toggleLane(lane.id)} />` : html`<section key=${`other ${group.repo}`} class="board-lane other-tickets"><h2>${group.repo} · Other tickets</h2><${ColumnHeads} hours=${hours} />
         ${visibleOther(group.tickets).map((ticket) => html`<${TicketRow} key=${ticketKey(ticket)} ticket=${ticket} end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} busy=${busy} />`)}
         ${group.tickets.length > visibleOther(group.tickets).length ? html`<${Fold} tickets=${group.tickets.filter((ticket) => !visibleOther(group.tickets).includes(ticket))} label="More" end=${data.generated_at} hours=${hours} onStart=${startTicket} onClose=${close} busy=${busy} />` : null}</section>`)}

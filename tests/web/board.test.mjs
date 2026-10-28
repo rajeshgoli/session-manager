@@ -231,11 +231,11 @@ test('lane form and row entry offer only open tickets nobody holds', () => {
 });
 
 test('compact board keeps concurrent waits independent and labels unknown ages honestly', () => {
-  const {currentReviews,operationalAge,hasOperations,matchesFilter}=board.namespace;
+  const {currentReviews,operationalAge,hasOperations,matchesQuery}=board.namespace;
   const ticket={repo:'a/b',number:1,title:'Simultaneous work',state:'in_progress',holder:{state:'idle'},jobs:[{state:'running',quiet_since:'2026-10-02T00:00:00Z'},{state:'waiting'}],reviews:[{reviewer_label:'Your review'},{reviewer_label:'Codex review'}]};
-  assert.equal(currentReviews(ticket).length,2);assert.equal(hasOperations(ticket),true);assert.equal(matchesFilter(ticket,'attention'),true);
+  assert.equal(currentReviews(ticket).length,2);assert.equal(hasOperations(ticket),true);assert.equal(matchesQuery(ticket,'simultaneous'),true);
   assert.equal(operationalAge(null),'age unavailable');assert.equal(operationalAge('2099-01-01'),'age unavailable');
-  assert.equal(matchesFilter(ticket,'finished'),false);
+  assert.equal(matchesQuery(ticket,'#2'),false);assert.equal(matchesQuery(ticket,'goal x','Goal X'),true);
 });
 
 test('selection identity deduplicates lane appearances and bulk excludes goals and live work', () => {
