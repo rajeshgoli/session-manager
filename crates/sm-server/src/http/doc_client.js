@@ -329,22 +329,26 @@
     pollHead();
   }
   var subTimer = null;
-  var subSeen = {};
+  // Per submission id: posted already handled, failure already refreshed.
+  var subPosted = {};
+  var subFailed = {};
   function trackSubmission(sub) {
     var was = S.sub;
     S.sub = sub || null;
     if (sub && sub.status === 'posted') {
       if (S.attempt && S.attempt.id === sub.submission_id) S.attempt = null;
-      if (!subSeen[sub.submission_id] && was && was.submission_id === sub.submission_id && sub.delivered_to_session_id == null) {
+      if (!subPosted[sub.submission_id] && was && was.submission_id === sub.submission_id && sub.delivered_to_session_id == null) {
         S.undelivered = { id: sub.submission_id, url: sub.github_review_url }; S.assigned = '';
       }
-      subSeen[sub.submission_id] = 1;
+      subPosted[sub.submission_id] = 1;
     }
-    // A failed review keeps its drafts on the server: show them again.
-    if (sub && sub.status === 'failed' && !subSeen[sub.submission_id]) {
-      subSeen[sub.submission_id] = 1;
+    // A failed review keeps its drafts on the server: show them again,
+    // once per failure (Submit again can fail anew).
+    if (sub && sub.status === 'failed' && !subFailed[sub.submission_id]) {
+      subFailed[sub.submission_id] = 1;
       refreshDrafts().catch(function () {});
     }
+    if (sub && sub.status !== 'failed') delete subFailed[sub.submission_id];
     clearTimeout(subTimer);
     if (posting(sub)) subTimer = setTimeout(pollHead, 3000);
   }
