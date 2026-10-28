@@ -493,6 +493,12 @@ button.sw-sec { cursor: pointer; }
   .bar > .search { display: flex; min-width: 0; }
   .content { padding: 10px 12px 20px; }
   .app:not(.term) > .panel { position: fixed; inset: 0; width: auto; z-index: 25; border-left: 0; }
+  /* The document view is full screen with its back arrow (B.10). */
+  .app.doc, .app.doc.folded { grid-template-rows: minmax(0, 1fr); }
+  .app.doc > .tabbar { display: none; }
+  .doc-bar { overflow-x: auto; gap: 6px; padding: 0 6px; }
+  .doc-bar > * { flex-shrink: 0; }
+  .doc-bar .pop { position: fixed; top: 44px !important; right: 12px !important; left: auto !important; }
   .panel .grip { display: none; }
   .details-band:has(> .acts) { grid-template-columns: minmax(0, 1fr); }
   .details-band:has(> .acts) > .phd { grid-column: 1; grid-row: 1; }
@@ -662,31 +668,17 @@ button.sw-sec { cursor: pointer; }
 .inbox-reader,.doc-reader,.thread-reader { display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
 .inbox-actions,.reader-bar { display:flex; gap:8px; align-items:center; padding:8px 12px; border-bottom:1px solid var(--line); background:var(--panel); flex-wrap:wrap; }
 .inbox-actions span,.reader-title { flex:1; min-width:2.667rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.panel:has(.doc-reader.ask-open) { width:min(70vw, calc(var(--panel-w) + 17rem)); }
-@media (max-width: 720px) {
-  .panel:has(.doc-reader.ask-open) { width:100vw; }
-  .doc-reader.ask-open iframe { display:none; }
-  .doc-reader.ask-open .doc-ask { width:100%; }
-}
 .doc-reader-body { display:flex; flex:1; min-height:0; min-width:0; }
 .doc-reader iframe { flex:1; width:100%; border:0; min-height:0; min-width:0; background:var(--panel); }
-.doc-ask { width:17rem; flex:none; display:flex; flex-direction:column; min-height:0; border-left:1px solid var(--line); }
-.doc-ask-head,.doc-ask-actions { display:flex; align-items:center; justify-content:space-between; gap:6px; }
-.doc-ask-head { padding:8px; border-bottom:1px solid var(--line); }
-.doc-ask-items { flex:1; overflow:auto; padding:8px; font-size:.8rem; }
-.doc-ask-item { margin-bottom:8px; overflow-wrap:anywhere; }
-.doc-ask-item .b { padding:8px; border-radius:8px; background:var(--panel-2); }
-.doc-ask-item .ev { color:var(--ink-3); font-size:.72rem; }
-.doc-ask-item .m { color:var(--ink-3); font-size:.7rem; }
-.doc-ask-compose { display:flex; flex-direction:column; gap:7px; padding:8px; border-top:1px solid var(--line); }
-.doc-ask-compose select,.doc-ask-compose textarea { width:100%; background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:6px; }
-.doc-ask-compose blockquote { margin:0; padding:6px; border-left:3px solid var(--accent); white-space:pre-wrap; max-height:6rem; overflow:auto; }
-.doc-ask-compose blockquote button { float:right; }
-.doc-ask-actions [role=alert] { color:var(--red); overflow-wrap:anywhere; }
-.reader-bar select { max-width:6.667rem; background:var(--panel); border:1px solid var(--line); }
-.reader-print { display:inline-flex; }
-.reader-print button + button { border-top-left-radius:0; border-bottom-left-radius:0; border-left:1px solid var(--line); }
-.reader-print button:first-child:not(:last-child) { border-top-right-radius:0; border-bottom-right-radius:0; }
+/* The document bar (2543 C): what it is on the left; author, Print, ⋯, moon, bug and Review on the right. */
+.doc-bar { gap:10px; padding:0 12px; }
+.doc-bar > .doc-title { flex:0 1 auto; min-width:4rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:650; }
+.doc-bar .doc-replies { color:var(--magenta); white-space:nowrap; }
+.doc-bar .doc-author { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; max-width:12rem; overflow:hidden; text-overflow:ellipsis; }
+.doc-bar .pop { top:34px; left:0; }
+.doc-bar .sp ~ .doc-menu .pop { left:auto; right:0; }
+.doc-bar .pop.menu button { white-space:nowrap; }
+.doc-bar .pop.menu button.on { font-weight:650; }
 .ticket-reader { display:flex; flex-direction:column; flex:1; min-height:0; min-width:0; }
 .ticket-reader > .seg { margin:8px 12px; align-self:flex-start; }
 .ticket-reader-content { flex:1; overflow:auto; padding:12px 18px; overflow-wrap:anywhere; }

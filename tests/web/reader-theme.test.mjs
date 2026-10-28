@@ -32,15 +32,6 @@ test('memo button respects reader default, explicitly selects light on dark OS, 
  root.setAttribute('data-theme','dark');observe();assert.equal(button.textContent,'☀︎ Light');
 });
 
-test('doc rows open stored pages inside the reader and external notes in a browser',()=>{
- const source=readFileSync('crates/sm-server/src/web/ui.js','utf8');
- const functionSource=source.slice(source.indexOf('export function openDoc('),source.indexOf('/** Shared related-item chips.')).replace('export ','');
- const panels=[],external=[];
- const context={URL,location:{origin:'https://sm.example.com'},openPanel:p=>panels.push(p),window:{open:(...args)=>external.push(args)}};
- vm.runInNewContext(`${functionSource}\nopenDoc('/docs/~handoff/agent');openDoc('https://github.com/a/b/issues/1');openDoc('javascript:alert(1)');`,context);
- assert.deepEqual(panels,['doc:/docs/~handoff/agent']);assert.deepEqual(external,[['https://github.com/a/b/issues/1','_blank','noopener']]);
-});
-
 test('fullscreen reader updates its document and navigation on system and cross-tab theme changes',()=>{
  const source=readFileSync('crates/sm-server/src/web/reader-bar.js','utf8');
  const nodes=[],listeners={},media={matches:false,addEventListener:(k,f)=>listeners.media=f};

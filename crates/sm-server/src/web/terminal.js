@@ -1,7 +1,7 @@
 // Terminal page (spec 1710; 1782 G1-G4; 2543 C, E.1): session rows, phone keys, route and round-trip time.
 // It renders inside the app frame; the app's sidebar lists the sessions and its side panel holds Details.
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { html, api, openPanel, navigate, openItem, Icon, Ring, stored, toast, age, basename } from './ui.js';
+import { html, api, openPanel, navigate, openItem, Icon, Ring, stored, toast, age, basename, readerPath, openReader } from './ui.js';
 import { AgentMenus, RetireButton, openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
 import { BugButton } from './bug.js';
 import { chooseRoute, shellBrowserAllowed, relayRoute, rememberRoute, routeText, findDirect, markDirect, recentlyDirect, DIRECT_RETRY_MS } from './terminal-route.js';
@@ -31,10 +31,16 @@ export const retiredIds = new Set();
 /** The open terminal, for the app's Notes pane ("Type into terminal") and focus after the palette closes. */
 export const activeTerminal = { id: null, paste: () => false, focus: () => {} };
 // Terminal links open in a new tab; web URLs only.
+// A link to one of sm's own documents opens the document view (2543 F.4); anything else, a new tab.
+const openTarget = (uri) => {
+  const doc = readerPath(uri);
+  if (doc) openReader(doc);
+  else window.open(uri, '_blank', 'noopener,noreferrer');
+};
 const openLink = (event, uri) => {
   if (!/^https?:\/\//i.test(uri)) return;
   event?.preventDefault?.();
-  window.open(uri, '_blank', 'noopener,noreferrer');
+  openTarget(uri);
 };
 const session = () => { try { return window.sessionStorage; } catch (e) { return null; } };
 
@@ -232,7 +238,7 @@ export function TerminalPage({ id, watch, moon, visible = true, onEnded }) {
     terminal.loadAddon(new window.WebLinksAddon.WebLinksAddon(openLink));
     installFileLinks(terminal, id, (event, uri) => {
       event?.preventDefault?.();
-      window.open(uri, '_blank', 'noopener,noreferrer');
+      openTarget(uri);
     });
     terminal.open(host.current);
     // Follow Settings › Appearance and, on System, the OS switching light or dark (#2304).

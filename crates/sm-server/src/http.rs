@@ -2278,6 +2278,7 @@ pub fn router(state: AppState) -> Router {
         .route("/analytics/{view}", get(web::get_shell_only_page))
         .route("/settings", get(web::get_shell_only_page))
         .route("/terminal/{session_id}", get(web::get_shell_only_page))
+        .route("/read/{*rest}", get(web::get_shell_only_page))
         .route("/assets/{*name}", get(web::get_asset))
         .route("/docs/~handoff/{session_id}", get(docs::get_handoff_doc))
         .route("/docs/{doc_id}", get(docs::get_owner_doc))
@@ -16372,6 +16373,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/settings"
         || path == "/notes"
         || path.starts_with("/terminal/")
+        || path.starts_with("/read/")
         || path.starts_with("/assets/")
         || path == "/docs"
         || path.starts_with("/docs/")
@@ -22138,6 +22140,8 @@ mod tests {
             "/analytics/spend",
             "/settings",
             "/terminal/abc12345",
+            "/read/docs/x",
+            "/read/docs/widgets/docs/memo.html?version=abc",
         ] {
             let response = app.clone().oneshot(browser(uri)).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{uri}");
@@ -22245,6 +22249,9 @@ mod tests {
         let html = body_text(response).await;
         assert!(html.contains("Handoff defaults"));
         assert!(!html.contains(r#"id="sm-config""#));
+        // The document view (2543 F.1) is a shell path only; `/docs/…` keeps its page.
+        let response = app.clone().oneshot(app_host("/read/docs/x")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         for uri in ["/inbox", "/history", "/guestbook"] {
             let response = app.clone().oneshot(app_host(uri)).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{uri}");

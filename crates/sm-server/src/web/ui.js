@@ -478,11 +478,22 @@ export function linkifyHtml(source) {
 
 export const threadHref = thread => `/inbox?open=thread:${encodeURIComponent(thread.key.replace(/^agent:/, ''))}${thread.at ? `&at=${encodeURIComponent(thread.at)}` : ''}`;
 
-/** Open external handoff links in the browser and local docs in the reader. */
+/** A same-origin reader path (`/docs/…`, `/messages/…`, `/t/…`) with its query and fragment, else null. */
+export function readerPath(value) {
+  try {
+    const url = new URL(value, location.origin);
+    return url.origin === location.origin && /^\/(docs|messages|t)\//.test(url.pathname) ? url.pathname + url.search + url.hash : null;
+  } catch (_) { return null; }
+}
+/** Documents open full width at `/read/<reader path>` (2543 F.1, F.4). */
+export const readHref = (path) => `/read${path}`;
+export const openReader = (path) => navigate(readHref(path));
+
+/** Open external handoff links in the browser and local docs in the document view. */
 export function openDoc(path) {
   try {
     const url = new URL(path, location.origin);
-    if (url.origin === location.origin) openPanel(`doc:${url.pathname}${url.search}${url.hash}`);
+    if (url.origin === location.origin) openReader(`${url.pathname}${url.search}${url.hash}`);
     else if (url.protocol === 'https:' || url.protocol === 'http:') window.open(url.href, '_blank', 'noopener');
   } catch (_) {}
 }

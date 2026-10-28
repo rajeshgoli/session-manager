@@ -2,7 +2,7 @@
 // on/off, skip this week, resume, this week's budget, decisions waiting on
 // the owner, live changes with 👍 / 👎, and the chip a changed screen shows.
 import { useState } from 'preact/hooks';
-import { html, api, usePoll, navigate, toast, useSwitch, stored, store, Toggle } from './ui.js';
+import { html, api, usePoll, navigate, toast, useSwitch, stored, store, Toggle, readHref } from './ui.js';
 
 export const STATE_TEXT = { live: 'Live', measuring: 'Measuring', rolling_back: 'Rolling back', kept: 'Kept', reverted: 'Reverted' };
 
@@ -136,7 +136,7 @@ export function AutoPmSettings({ write }) {
     ${view.waiting.length ? html`<button type="button" class="autopm-waiting" onClick=${() => navigate('/inbox')}>
       <strong>Waiting on you: ${view.waiting.length} decision${view.waiting.length === 1 ? '' : 's'}</strong>
       <span class="sub">${view.waiting.map((x) => x.title).join(' · ')} · open the Inbox to answer</span></button>` : null}
-    ${view.readout ? html`<p><a href=${`/inbox?open=doc:${view.readout.reader_path}`}>Latest readout: ${view.readout.week || view.readout.title} ›</a></p>` : null}
+    ${view.readout ? html`<p><a href=${readHref(view.readout.reader_path)}>Latest readout: ${view.readout.week || view.readout.title} ›</a></p>` : null}
     <${WhatChanged} view=${view} reload=${reload} />`;
 }
 

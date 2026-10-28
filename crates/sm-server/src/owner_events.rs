@@ -634,6 +634,7 @@ pub const ACTIONS: &[(&str, &str, &str, Option<&str>)] = &[
     ("GET", "/analytics/{view}", "web.analytics", Some("view")),
     ("GET", "/settings", "web.settings", None),
     ("GET", "/terminal/{session_id}", "web.terminal", Some("session")),
+    ("GET", "/read/{*rest}", "web.doc", None),
     ("GET", "/assets/{*name}", "web.asset", None),
     ("GET", "/docs/{doc_id}", "doc.open", Some("doc")),
     ("GET", "/docs/{doc_id}/{*rest}", "doc.open", Some("doc")),

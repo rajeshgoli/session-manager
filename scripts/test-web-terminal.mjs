@@ -548,7 +548,7 @@ test('route: another server on localhost and a failed direct socket both use Clo
   } finally { await browser.close(); }
 });
 
-test('links: URLs, OSC 8 and local file paths open in a new tab with tmux mouse mode on', async () => {
+test('links: URLs, OSC 8 and local file paths open in a new tab, sm documents in the document view, with tmux mouse mode on', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
     const { page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
@@ -584,13 +584,18 @@ test('links: URLs, OSC 8 and local file paths open in a new tab with tmux mouse 
       await page.mouse.click(x, y);
     };
     await click(10, 0);
+    // A link to one of sm's documents opens the document view (2543 F.4); Back returns to the live terminal.
     await click(2, 1);
+    await page.waitForURL(`${ORIGIN}/read/docs/memo`);
+    await page.locator('.doc-reader').waitFor();
+    await page.goBack();
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
+    await page.waitForTimeout(200);
     await click(1, 2);
     await click(3, 3);
     await click(3, 4);
     assert.deepEqual(await page.evaluate(() => window.opened), [
       ['https://github.com/rajeshgoli/session-manager/pull/2177', '_blank', 'noopener,noreferrer'],
-      ['https://sm.example.com/docs/memo', '_blank', 'noopener,noreferrer'],
       ['/client/terminal/file?session=iter8-run&path=%2FUsers%2Frajesh%2Fmemo.html', '_blank', 'noopener,noreferrer'],
       ['/client/terminal/file?session=iter8-run&path=src%2Fmain.rs', '_blank', 'noopener,noreferrer'],
     ]);
