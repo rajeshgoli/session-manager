@@ -170,7 +170,7 @@ fun WatchScreen(
     var filter by remember { mutableStateOf("all") }
     var toast by remember { mutableStateOf<String?>(null) }
     // Terminal text waiting in the copy dialog (#2547).
-    var copyText by remember { mutableStateOf<String?>(null) }
+    var copyText by remember { mutableStateOf<TerminalCopy?>(null) }
     var openPage by remember { mutableStateOf<ReaderPage?>(null) }
     var followDialogSession by remember { mutableStateOf<ClientSession?>(null) }
     var pendingNotificationAction by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -570,18 +570,22 @@ fun WatchScreen(
                 onRendererWritten = viewModel::markTerminalRendererWritten,
                 onDetach = viewModel::detachTerminal,
                 onReconnect = viewModel::reconnectTerminal,
-                onCopy = { selectedText -> copyText = selectedText.ifBlank { terminal.copyBuffer } },
+                onCopy = { screen, all ->
+                    copyText = TerminalCopy(screen = screen, all = all.ifBlank { terminal.copyBuffer })
+                },
             )
         }
-        copyText?.let { text ->
+        copyText?.let { copy ->
+            val clip = { text: String, done: String ->
+                val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm terminal", text))
+                copyText = null
+                toast = done
+            }
             TerminalCopyDialog(
-                text = text,
-                onCopyAll = {
-                    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
-                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm terminal", text))
-                    copyText = null
-                    toast = "Terminal output copied"
-                },
+                text = copy.screen,
+                onCopyScreen = { clip(copy.screen, "Screen copied") },
+                onCopyAll = { clip(copy.all, "Terminal history copied") },
                 onDismiss = { copyText = null },
             )
         }
@@ -634,7 +638,7 @@ private fun MobileTerminalOverlay(
     onRendererWritten: (sequence: Long, bytes: Int) -> Unit,
     onDetach: () -> Unit,
     onReconnect: () -> Unit,
-    onCopy: (String) -> Unit,
+    onCopy: (screen: String, all: String) -> Unit,
 ) {
     var copyRequest by remember { mutableStateOf(0L) }
     val controls = remember(terminal.connectionGeneration) { TerminalControls() }
@@ -792,15 +796,17 @@ private fun MobileTerminalOverlay(
     }
 }
 
+/** What Copy terminal found: the rows on screen (or the selection), and the whole buffer. */
+private data class TerminalCopy(val screen: String, val all: String)
+
 /**
- * The terminal's text, selectable with Android's own handles: long-press, drag the
- * handles, then Copy in the menu that appears. Copy all takes everything. Opens at
- * the latest lines (#2547).
+ * The terminal's screen as it is now, wherever it is scrolled, selectable with
+ * Android's own handles: long-press, drag the handles, then Copy in the menu that
+ * appears. Copy screen takes it all; Copy all history takes the whole buffer (#2547, #2549).
  */
 @Composable
-private fun TerminalCopyDialog(text: String, onCopyAll: () -> Unit, onDismiss: () -> Unit) {
+private fun TerminalCopyDialog(text: String, onCopyScreen: () -> Unit, onCopyAll: () -> Unit, onDismiss: () -> Unit) {
     val vertical = rememberScrollState()
-    LaunchedEffect(text) { vertical.scrollTo(vertical.maxValue) }
     androidx.compose.material3.AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Copy from terminal") },
@@ -815,8 +821,13 @@ private fun TerminalCopyDialog(text: String, onCopyAll: () -> Unit, onDismiss: (
                 )
             }
         },
-        confirmButton = { TextButton(onClick = onCopyAll) { Text("Copy all") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        confirmButton = { TextButton(onClick = onCopyScreen) { Text("Copy screen") } },
+        dismissButton = {
+            Row {
+                TextButton(onClick = onDismiss) { Text("Close") }
+                TextButton(onClick = onCopyAll) { Text("Copy all history") }
+            }
+        },
     )
 }
 
@@ -856,7 +867,7 @@ private fun TerminalWebView(
     onRendererReady: (cols: Int, rows: Int) -> Unit,
     onRendererError: (String) -> Unit,
     onRendererWritten: (sequence: Long, bytes: Int) -> Unit,
-    onCopyText: (String) -> Unit,
+    onCopyText: (screen: String, all: String) -> Unit,
 ) {
     var deliveredSequence by remember { mutableStateOf(0L) }
     var deliveredCopyRequest by remember { mutableStateOf(0L) }
@@ -1079,7 +1090,7 @@ private fun blockedTerminalAssetResponse(): WebResourceResponse {
 private class TerminalJavascriptBridge(
     private val onInput: (String) -> Unit,
     private val onResize: (cols: Int, rows: Int) -> Unit,
-    private val onCopyText: (String) -> Unit,
+    private val onCopyText: (screen: String, all: String) -> Unit,
     private val onStatus: (String) -> Unit,
     private val onReady: (cols: Int, rows: Int) -> Unit,
     private val onError: (String) -> Unit,
@@ -1104,8 +1115,8 @@ private class TerminalJavascriptBridge(
     }
 
     @JavascriptInterface
-    fun copy(text: String) {
-        mainHandler.post { onCopyText(text) }
+    fun copy(screen: String, all: String) {
+        mainHandler.post { onCopyText(screen, all) }
     }
 
     @JavascriptInterface

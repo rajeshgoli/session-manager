@@ -14,6 +14,7 @@ function renderer() {
   const acks = [];
   const scrollbarVisibility = [];
   const inputs = [];
+  const copies = [];
   const elements = {};
   const makeElement = () => ({ style: {}, hidden: false, attributes: {}, listeners: {},
     clientHeight: 96, clientWidth: 320, querySelector() { return null; },
@@ -26,13 +27,13 @@ function renderer() {
   const context = vm.createContext({
     Terminal, FitAddon: { FitAddon }, Uint8Array, atob,
     document: { getElementById: id => elements[id] ||= makeElement() },
-    window: { TerminalBridge: { input: data => inputs.push(data), written: seq => acks.push(Number(seq)), scrollbarVisibility: visible => scrollbarVisibility.push(visible) }, addEventListener() {}, requestAnimationFrame() {}, setTimeout() {}, clearTimeout() {} },
+    window: { TerminalBridge: { copy: (screen, all) => copies.push({ screen, all }), input: data => inputs.push(data), written: seq => acks.push(Number(seq)), scrollbarVisibility: visible => scrollbarVisibility.push(visible) }, addEventListener() {}, requestAnimationFrame() {}, setTimeout() {}, clearTimeout() {} },
   });
   vm.runInContext(source, context);
   vm.runInContext('ready = true; opened = true;', context);
   const term = vm.runInContext('term', context);
   term.resize(40, 8);
-  return { context, term, acks, element: elements['terminal-scrollbar'], elements, inputs, scrollbarVisibility, api: context.window };
+  return { context, term, acks, copies, element: elements['terminal-scrollbar'], elements, inputs, scrollbarVisibility, api: context.window };
 }
 
 const drain = term => new Promise(resolve => term.write('', resolve));
@@ -321,5 +322,20 @@ test('a combined mouse request leaves an escape sequence split across frames int
     assert.equal(line.translateToString(true).trim(), 'RED');
     assert.equal(line.getCell(line.translateToString(false).indexOf('R')).getFgColor(), 1, 'RED is drawn red');
     assert.equal(r.term.modes.mouseTrackingMode, 'none');
+  } finally { r.term.dispose(); }
+});
+
+test('Copy terminal hands over the rows in view wherever the terminal is scrolled, plus the whole buffer', async () => {
+  const r = renderer();
+  try {
+    r.api.smWriteText(1, Array.from({length: 100}, (_, i) => `line ${i}`).join('\r\n'));
+    await drain(r.term);
+    r.api.smCopySelection();
+    assert.equal(r.copies.at(-1).screen, Array.from({length: 8}, (_, i) => `line ${92 + i}`).join('\n'));
+    r.term.scrollToLine(15);
+    r.api.smCopySelection();
+    const { screen, all } = r.copies.at(-1);
+    assert.equal(screen, Array.from({length: 8}, (_, i) => `line ${15 + i}`).join('\n'), 'what is on screen, not the bottom');
+    assert.ok(all.startsWith('line 0\n') && all.endsWith('line 99'));
   } finally { r.term.dispose(); }
 });
