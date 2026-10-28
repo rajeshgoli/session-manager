@@ -627,7 +627,7 @@ test('links: URLs, OSC 8 and local file paths open in a new tab, sm documents in
   } finally { await browser.close(); }
 });
 
-test('tmux mouse mode on: a click sends nothing, a drag selects and Copy copies, the wheel still reaches tmux (#2540)', async () => {
+test('tmux mouse mode on: a tap reaches the agent with no motion, a drag selects and Copy copies, the wheel still reaches tmux (#2540, #2589)', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
     const { context, page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
@@ -643,14 +643,18 @@ test('tmux mouse mode on: a click sends nothing, a drag selects and Copy copies,
       return { x: r.left, y: r.top, h: row.height, w: r.width };
     });
     const y = box.y + box.h / 2;
+    // A tap goes as a press and release on its cell, never a drag, so tmux stays out of
+    // copy mode and typing still goes to the agent.
     await page.mouse.click(box.x + 40, y);
     await page.keyboard.type('hi');
-    assert.deepEqual(await inputs(), ['h', 'i'], 'the click reaches no one and typing goes to the agent');
+    const tapped = await inputs();
+    assert.match(tapped[0], /^\x1b\[<0;(\d+);1M\x1b\[<0;\1;1m$/, JSON.stringify(tapped));
+    assert.deepEqual(tapped.slice(1), ['h', 'i']);
     await page.mouse.move(box.x + 2, y);
     await page.mouse.down();
     await page.mouse.move(box.x + box.w / 2, y, { steps: 8 });
     await page.mouse.up();
-    assert.deepEqual(await inputs(), ['h', 'i'], 'a drag sends no mouse report to tmux');
+    assert.deepEqual((await inputs()).slice(1), ['h', 'i'], 'a drag sends no mouse report to tmux');
     const copy = page.locator('.term-copy');
     await copy.waitFor({ state: 'visible' });
     await copy.click();
@@ -664,7 +668,7 @@ test('tmux mouse mode on: a click sends nothing, a drag selects and Copy copies,
   } finally { await browser.close(); }
 });
 
-test('a mouse request sharing a sequence with the alternate screen draws in the alternate screen, and clicks still send nothing', async () => {
+test('a mouse request sharing a sequence with the alternate screen draws in the alternate screen, and a tap still reaches the agent', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
     const { page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
@@ -679,7 +683,9 @@ test('a mouse request sharing a sequence with the alternate screen draws in the 
     const box = await page.evaluate(() => { const r = document.querySelector('.xterm-screen').getBoundingClientRect(); return { x: r.left, y: r.top }; });
     await page.mouse.click(box.x + 40, box.y + 30);
     await page.waitForTimeout(100);
-    assert.deepEqual(await page.evaluate(() => window.sockets.flatMap((s) => s.sent).filter((f) => f.type === 'input')), []);
+    const sent = await page.evaluate(() => window.sockets.flatMap((s) => s.sent).filter((f) => f.type === 'input').map((f) => f.data));
+    assert.equal(sent.length, 1, JSON.stringify(sent));
+    assert.match(sent[0], /^\x1b\[<0;\d+;\d+M\x1b\[<0;\d+;\d+m$/);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
