@@ -47,6 +47,7 @@ const ASSETS: &[Asset] = &[
     asset!("artifacts-model.js", JS),
     asset!("artifacts.css", "text/css; charset=utf-8"),
     asset!("queue-model.js", JS),
+    asset!("meters.js", JS),
     asset!("queue-start.js", JS),
     asset!("analytics.js", JS),
     asset!("queue.css", "text/css; charset=utf-8"),
