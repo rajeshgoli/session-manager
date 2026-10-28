@@ -103,7 +103,7 @@ const validWorkspace = (path) => !!path && (path.startsWith('/') || path === '~'
  * `prefill` may carry provider, model, effort and workspace (Clone), and a
  * name and first message (an artifact investigation).
  */
-export function NewAgentPopover({ prefill = {}, onClose }) {
+export function NewAgentPopover({ prefill = {}, onClose, align = 'right' }) {
   const [settings, setSettings] = useState(null);
   const local = useLocalModel();
   const open = useOpen();
@@ -273,7 +273,7 @@ export function NewAgentPopover({ prefill = {}, onClose }) {
         <button type="button" class="btn pri" disabled=${busy || (!terminal && localBlocked(local, form.provider))} onClick=${start}>${busy ? (!terminal && form.provider === 'opencode' && !local?.models?.length ? 'Loading model…' : 'Starting…') : 'Start'}</button>
       </div>`;
   }
-  return html`<${Popover} onClose=${onClose} align="right">
+  return html`<${Popover} onClose=${onClose} align=${align}>
     <h2>New agent</h2>
     ${content}
   <//>`;

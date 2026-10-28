@@ -325,6 +325,10 @@ export function NotesView({ pane = false, onClose, onType, target }) {
       setHistoryRows(null); setStatus('Saved · now'); search();
     } catch (err) { setError(err.message); }
   };
+  // On the Notes page, New note is the top bar's main action (2543 C).
+  const creator = useRef(create);
+  creator.current = create;
+  useEffect(() => (pane ? undefined : bus.on('notes-new', () => creator.current())), [pane]);
   const selection = () => selectedText(editor.current, current.current.body);
   const cardText = id => async () => (await api(notePath(id))).body;
   const transfer = async () => { if (await save() === false) return; store('sm-notes-open', open?.id || ''); if (pane) navigate('/notes'); else openPanel('notes:view'); };
@@ -333,7 +337,7 @@ export function NotesView({ pane = false, onClose, onType, target }) {
   return html`<section class=${`notes-view ${pane ? 'notes-pane' : 'notes-page'}`}>
     <header class="notes-head"><h1>Notes</h1><div class="notes-tools">
       <input type="search" aria-label="Search notes" placeholder="Search notes…" value=${query} onInput=${e => changeQuery(e.target.value)} />
-      <button type="button" class="btn pri" onClick=${create}>+ New</button>
+      ${pane ? html`<button type="button" class="btn pri" onClick=${create}>+ New</button>` : null}
       <button type="button" class="btn" onClick=${() => file.current?.click()}>Import</button>
       <input ref=${file} hidden type="file" accept=".md,.txt,text/markdown,text/plain" onChange=${importFile} />
       <button type="button" class="btn" title=${pane ? 'Open on page' : 'Send to pane'} onClick=${transfer}>${pane ? '⤢' : '⇥'}</button>
@@ -352,7 +356,7 @@ export function NotesView({ pane = false, onClose, onType, target }) {
         <${ActivitySummary} event=${activities[hit.id]} onClick=${async () => { await choose(hit.id); setActivityFocus(previous => ({ id: hit.id, token: (previous?.token || 0) + 1 })); }} />
         ${(pane || compact) && open?.id === hit.id ? editorView() : null}
       </article>`)}
-      ${!hits.length && !pinned ? html`<p class="notes-empty">${query ? 'No matching notes.' : 'No notes yet. Choose + New.'}</p>` : null}
+      ${!hits.length && !pinned ? html`<p class="notes-empty">${query ? 'No matching notes.' : `No notes yet. Choose ${pane ? '+ New' : 'New note'}.`}</p>` : null}
     </div>
     ${!pane && !compact ? html`<div class="notes-editor-slot">${open ? editorView() : html`<p class="notes-empty">Choose a note or create one.</p>`}</div>` : null}</div>
     ${conflict ? html`<div class="notes-dialog-backdrop"><div class="notes-dialog" role="dialog" aria-modal="true" aria-label="Changed on another device">

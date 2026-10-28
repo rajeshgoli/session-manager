@@ -34,13 +34,18 @@ function fixture(direct = [], { storage, probes } = {}) {
     setInterval:()=>0,clearInterval(){},config:{},stored:(key,fallback)=>fallback,store(){},sectionAgents:()=>[],
     SECTION_LABEL:{},SECTION_TONE:{},youFact:()=>null,jobsFact:()=>null,agentFact:()=>null,markAnswered(){},
     ResizeObserver:class {observe(){} disconnect(){}},
+    isShell:()=>false, hiddenShells:()=>[], age:()=>'', basename:(path)=>path, openItem(){}, pairedText:()=>null,
+    installFileLinks(){}, installPageMouse:()=>({dispose(){},copyKey:()=>false}),
+    RetireButton:null, AgentMenus:null, ShellCloseButton:null, ShellMenu:null, ShellName:null, ShellAwayPanel:null, HiddenShells:null, setShellHidden(){},
+    openPanel(){}, navigate(){}, openInClaude(){}, routeText:()=>'',
     useRef:()=>({current:{style:{},addEventListener(){},removeEventListener(){}}}), useState:initial=>{const index=states.push(initial)-1;return [initial,value=>{states[index]=value;}];},
     useEffect:fn=>{effect=fn;}, usePoll:()=>[null], panels:new Map(), html:()=>null, Icon:()=>null, Ring:()=>null, BugButton:()=>null,
     api:async()=>({ws_url:'/client/terminal',ticket_id:`test-${++minted}`,ticket_secret:'test',server_instance:'inst',direct}),
     fetch:async()=>({ok:true,json:async()=>({instance:probes?probes.shift()??'inst':'inst'})}),AbortController,toast(){},
     setTimeout:fn=>{timers.set(++timerId,fn);return timerId;},clearTimeout:id=>timers.delete(id),
   });
-  vm.runInContext(source+'\nTerminalPage({id:"test",open:false});',context);
+  // The app's poll of GET /watch/state: one live agent, so the page connects.
+  vm.runInContext(source+'\nTerminalPage({id:"test",watch:[{sessions:[{id:"test",name:"test",state:"idle",attention:{section:"idle"}}]},null,()=>{}]});',context);
   cleanup=effect();
   const settle=async()=>{for(let n=0;n<40;n++)await Promise.resolve();};
   return {minted:()=>minted,states,sockets,timers,cleanup,settle,async tick(){const [id,fn]=timers.entries().next().value;timers.delete(id);fn();await settle();}};

@@ -1,6 +1,7 @@
-// Terminal page (spec 1710; 1782 G1-G4): switcher, phone keys, route and round-trip time.
+// Terminal page (spec 1710; 1782 G1-G4; 2543 C, E.1): session rows, phone keys, route and round-trip time.
+// It renders inside the app frame; the app's sidebar lists the sessions and its side panel holds Details.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, usePoll, panels, openPanel, closePanel, navigate, Icon, Ring, config, stored, store, toast } from './ui.js';
+import { html, api, openPanel, navigate, openItem, Icon, Ring, stored, toast, age, basename } from './ui.js';
 import { AgentMenus, RetireButton, openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
 import { BugButton } from './bug.js';
 import { chooseRoute, shellBrowserAllowed, relayRoute, rememberRoute, routeText, findDirect, markDirect, recentlyDirect, DIRECT_RETRY_MS } from './terminal-route.js';
@@ -24,7 +25,8 @@ const RESIZE_SETTLE_MS = 150;
 // ...and once the agent has redrawn at that size, a one-column nudge makes it repaint every cell.
 const REDRAW_SETTLE_MS = 400;
 const REDRAW_NUDGE_MS = 120;
-const refreshMs = () => Math.max(1, config.refresh_seconds || 3) * 1000;
+/** The open terminal, for the app's Notes pane ("Type into terminal") and focus after the palette closes. */
+export const activeTerminal = { id: null, paste: () => false, focus: () => {} };
 // Terminal links open in a new tab; web URLs only.
 const openLink = (event, uri) => {
   if (!/^https?:\/\//i.test(uri)) return;
@@ -64,6 +66,35 @@ export function switcherGroups(sessions, currentId, idleOpen) {
   return { groups, order: groups.flatMap((g) => g.agents) };
 }
 
+/** Where `/` lands (2543 D.5): the last terminal you had open if it is live, else the top row; null when none is live. */
+export function landingFor(sessions, lastId) {
+  const last = lastId && sessions.find((s) => s.id === lastId && s.state !== 'stopped' && s.attention?.section !== 'stopped');
+  return last || switcherGroups(sessions, null, true).order[0] || null;
+}
+
+/** A one-line row's fact (2543 B.4): `41h`, `done`, `▶ 39m`, `⏸ review`, `2m`, `shell`. */
+export function shortFact(agent, now = Date.now()) {
+  if (isShell(agent)) return { text: 'shell', tone: 'muted' };
+  const first = (text) => (text || '').split(' ')[0];
+  const span = (text) => first((/\d+h(?: \d+m)?|\d+m|\d+s/.exec(text) || [''])[0]);
+  const you = youFact(agent, now);
+  if (you) return you.tone === 'cyan' ? { text: 'done', tone: 'cyan' } : { text: first(age(agent.facts.you.since, now)) || 'now', tone: you.tone };
+  const jobs = agent.facts && agent.facts.jobs;
+  if ((jobs && jobs.tone) || pairedText(agent.paired_reviewer)) {
+    const fact = jobsFact(agent);
+    if (fact.text.startsWith('▶')) return { text: `▶ ${span(fact.text)}`.trim(), tone: fact.tone };
+    if (fact.text.startsWith('⏸')) {
+      const why = /review/i.test(fact.text) ? 'review' : /queue|in line/i.test(fact.text) ? 'queue' : span(fact.text);
+      return { text: `⏸ ${why}`.trim(), tone: fact.tone };
+    }
+    if (/review/i.test(fact.text)) return { text: 'review', tone: fact.tone };
+    return { text: span(fact.text) || first(fact.text), tone: fact.tone };
+  }
+  const state = agent.facts && agent.facts.agent && agent.facts.agent.state;
+  if (state === 'parked') return { text: 'parked', tone: 'amber' };
+  return { text: first(age(agent.facts && agent.facts.agent && agent.facts.agent.since, now)), tone: state === 'working' ? 'green' : 'muted' };
+}
+
 /** The row `step` away from the current one; from outside the list, the first or last. */
 export function stepRow(order, currentId, step) {
   if (!order.length) return null;
@@ -81,6 +112,8 @@ export function rowAfterRetire(order, currentId) {
 }
 
 const narrow = () => window.innerWidth < 900;
+/** Whether the Idle section is expanded; the sidebar and this page share it. */
+export const IDLE_KEY = 'sm-term-switcher-idle';
 // Key buttons only where there is no keyboard to send them (G2).
 const touchKeys = () => window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 720;
 
@@ -94,12 +127,14 @@ function useWidth(test) {
   return on;
 }
 
-function Switcher({ groups, currentId, idleOpen, toggleIdle, pick, reload }) {
+/** Two-line session rows in attention sections (the sidebar's agents-first arrangement). */
+export function Switcher({ groups, currentId, idleOpen, toggleIdle, pick, reload, hover }) {
   const row = (section) => (agent) => {
     const fact = switcherFact(agent);
     const label = fact.tone === 'cyan' ? 'read' : 'answered';
     return html`<div key=${agent.id} role="button" tabindex="-1" aria-current=${agent.id === currentId ? 'page' : null}
-        class=${`sw-row${agent.id === currentId ? ' cur' : ''}${agent.hidden ? ' sw-hidden' : ''}`} onClick=${() => pick(agent)}>
+        class=${`sw-row${agent.id === currentId ? ' cur' : ''}${agent.hidden ? ' sw-hidden' : ''}`} onClick=${() => pick(agent)}
+        ...${hover ? hover(agent) : {}}>
       ${isShell(agent) ? html`<span class="sw-shell muted">▹</span>` : html`<i class=${`sw-dot ${SECTION_TONE[section]}`}></i>`}
       <span class="sw-nm" title=${agent.name}>${agent.name}</span>
       ${fact.dismissible
@@ -109,19 +144,20 @@ function Switcher({ groups, currentId, idleOpen, toggleIdle, pick, reload }) {
       <span class=${`sw-fact ${fact.tone}`} title=${fact.text}>${fact.text}</span>
     </div>`;
   };
-  return html`<nav class="term-switch" aria-label="Sessions">
+  return html`<div class="term-switch" role="list" aria-label="Sessions">
     ${groups.map(({ section, count, agents }) => html`
       ${section === 'idle'
         ? html`<button type="button" class="sw-sec muted" aria-expanded=${idleOpen} onClick=${toggleIdle}>
             ${SECTION_LABEL.idle} · ${count} ${idleOpen ? '⌄' : '›'}</button>`
         : html`<div class=${`sw-sec ${section === 'terminals' ? 'muted sw-terminals-heading' : SECTION_TONE[section]}`}>${section === 'terminals' ? 'Terminals' : SECTION_LABEL[section]}</div>`}
       ${agents.map(row(section))}`)}
-  </nav>`;
+  </div>`;
 }
 
 // ---- page --------------------------------------------------------------------
 
-export function TerminalPage({ id, open }) {
+/** `watch` is the app's poll of GET /watch/state: `[doc, error, reload]`. `moon` is the app's overnight button. */
+export function TerminalPage({ id, watch, moon }) {
   const host = useRef(null);
   const control = useRef(null);
   const [transportConnection, setConnection] = useState('Connecting');
@@ -130,13 +166,11 @@ export function TerminalPage({ id, open }) {
   const [route, setRoute] = useState({ label: '', samples: [] });
   const [away, setAway] = useState(false);
   const [directError, setDirectError] = useState('');
-  const [switcher, setSwitcher] = useState(() => stored('sm-term-switcher', !narrow()));
-  const [idleOpen, setIdleOpen] = useState(() => stored('sm-term-switcher-idle', false));
   const [renaming, setRenaming] = useState(false);
   const showKeys = useWidth(touchKeys);
   // Touch screens keep the phone bar and its keys, even a tablet held wide.
   const wide = !useWidth(narrow) && !showKeys;
-  const [doc, watchError, reload] = usePoll(() => api('/watch/state'), refreshMs(), []);
+  const [doc, watchError, reload] = watch;
   const agent = doc && (doc.sessions || []).find((s) => s.id === id);
   const shell = isShell(agent);
   // Wait for identity before connecting, so a shell can never attach as an agent.
@@ -146,22 +180,11 @@ export function TerminalPage({ id, open }) {
   const unavailable = !!doc && !targetKind;
   const connection = lookupFailed || unavailable ? 'Ended' : targetKind ? transportConnection : 'Connecting';
   const error = lookupFailed ? 'Could not load session information. Retry to check whether this terminal is still available.'
-    : unavailable ? 'This terminal has ended or could not be found. The session may have stopped or been retired. Choose another session from Agents.'
+    : unavailable ? 'This terminal has ended or could not be found. The session may have stopped or been retired. Choose another session in the sidebar.'
     : transportError;
-  const { groups, order } = switcherGroups((doc && doc.sessions) || [], id, idleOpen);
+  // The sidebar's order, for Retire's next row.
+  const { order } = switcherGroups((doc && doc.sessions) || [], id, stored(IDLE_KEY, false));
   const hidden = hiddenShells(doc?.sessions);
-  // Details, and whatever it links to (a ticket, PR, doc or job), open beside the terminal.
-  const split = open ? open.indexOf(':') : -1;
-  const Renderer = split > 0 ? panels.get(open.slice(0, split)) : null;
-  const panelId = split > 0 ? open.slice(split + 1) : null;
-
-  const toggleSwitcher = () => { store('sm-term-switcher', !switcher); setSwitcher(!switcher); };
-  const toggleIdle = () => { store('sm-term-switcher-idle', !idleOpen); setIdleOpen(!idleOpen); };
-  const pick = (next) => {
-    // Below 900 px the switcher covers the terminal, so it closes once you choose.
-    if (narrow() && switcher) { store('sm-term-switcher', false); setSwitcher(false); }
-    if (next.id !== id) navigate(`/terminal/${encodeURIComponent(next.id)}`);
-  };
   // A click on the bar gives the keyboard back to the terminal, except inside the
   // Report-a-bug dialog, which renders within the bar and has its own fields.
   const refocus = (event) => {
@@ -182,26 +205,6 @@ export function TerminalPage({ id, open }) {
     if (undone) navigate(`/terminal/${encodeURIComponent(agent.id)}`);
     else if (now) retired(true);
   });
-
-  // ⌘\ toggles the switcher; ⌘⌥↑ and ⌘⌥↓ switch agents. xterm lets these through.
-  const latest = useRef({});
-  latest.current = { order, id, pick, toggleSwitcher };
-  useEffect(() => {
-    const down = (event) => {
-      if (!event.metaKey) return;
-      const now = latest.current;
-      if (event.key === '\\' && !event.altKey) {
-        event.preventDefault();
-        now.toggleSwitcher();
-      } else if (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
-        event.preventDefault();
-        const next = stepRow(now.order, now.id, event.key === 'ArrowUp' ? -1 : 1);
-        if (next) now.pick(next);
-      }
-    };
-    window.addEventListener('keydown', down);
-    return () => window.removeEventListener('keydown', down);
-  }, []);
 
   useEffect(() => {
     if (!targetKind) return;
@@ -286,6 +289,7 @@ export function TerminalPage({ id, open }) {
       focus: () => terminal.focus(),
       redraw: () => { redraw(); terminal.focus(); },
     };
+    Object.assign(activeTerminal, { id, paste: (text) => !!control.current?.paste(text), focus: () => control.current?.focus() });
     const mouse = installPageMouse(terminal, host.current, input, async (text) => {
       try { await navigator.clipboard.writeText(text); toast('Copied'); } catch (err) { toast(`Could not copy: ${err.message}`); }
     });
@@ -441,9 +445,9 @@ export function TerminalPage({ id, open }) {
       // Let the browser deliver Ctrl+V as a clipboard event, including images,
       // on Windows/Linux. On macOS the capture handler reads it explicitly.
       if (event.ctrlKey && !event.altKey && event.key.toLowerCase() === 'v') return false;
-      // The page handles ⌘\ and ⌘⌥↑/↓ (G1).
+      // The app handles ⌘J, ⌘K, ⌘\ and ⌘⌥↑/↓ (2543 G); Ctrl+K and Ctrl+\ still reach the terminal.
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'j') return false;
-      if (event.metaKey && (event.key === '\\' || (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')))) return false;
+      if (event.metaKey && (event.key.toLowerCase() === 'k' || event.key === '\\' || (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')))) return false;
       return true;
     });
     const observer = new ResizeObserver(resize);
@@ -460,6 +464,7 @@ export function TerminalPage({ id, open }) {
       removeImagePaste(); mouse.dispose();
       stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); clearTimeout(resizeTimer); clearTimeout(nudgeTimer); stopDirect(); detach(); observer.disconnect(); themeWatch.disconnect(); scheme.removeEventListener('change', retheme); window.removeEventListener('storage', storageWatch); data.dispose(); terminal.dispose();
       window.removeEventListener('pagehide', pagehide); window.removeEventListener('pageshow', pageshow); control.current = null;
+      if (activeTerminal.id === id) Object.assign(activeTerminal, { id: null, paste: () => false, focus: () => {} });
     };
   }, [id, attempt, targetKind]);
 
@@ -481,16 +486,23 @@ export function TerminalPage({ id, open }) {
   const hide = shell && targetKind === 'shell' ? html`<button type="button" class="btn sm" title=${agent.hidden ? 'Put this shell back in the lists' : 'Hide this shell from the lists; it keeps running'}
     onClick=${() => hideShell(!agent.hidden)}>${agent.hidden ? 'Unhide' : 'Hide'}</button>` : null;
   const notes = html`<button type="button" class="btn sm" onClick=${() => openPanel('notes:view')}>Notes ⌘J</button>`;
-  // Desktop (#2242): who and how full on the left; connection words only when not live,
-  // with the route in the dot's tooltip; actions on the right, Retire last.
+  // The agent's ticket fills the bar's empty middle (2543 C): number, title, repo.
+  const claim = !shell && agent ? ((agent.claims || []).find((c) => c.kind === 'ticket') || (agent.claims || [])[0]) : null;
+  const ticket = claim ? html`<span class="term-ticket">
+      ${claim.kind === 'ticket' ? html`<button type="button" class="plain-btn tk" title="Open the ticket"
+        onClick=${(event) => { event.stopPropagation(); openItem('ticket', `${claim.repo}#${claim.number}`, claim.url); }}>#${claim.number}</button>` : null}
+      ${claim.title ? html`<span class="ttl">${claim.title}</span>` : null}
+      ${claim.kind === 'ticket' && claim.repo ? html`<span class="repo">${basename(claim.repo)}</span>` : null}</span>` : null;
+  // Desktop (#2242, 2543 C): who and how full on the left, then the ticket; connection words only when
+  // not live, with the route in the dot's tooltip; actions on the right, then Moon, Bug and Retire last.
   const desktopBar = () => html`<div class="term-bar wide" onClick=${refocus}>
-      <a class="term-home" href="/" title="Home" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
       <span class="term-who" title=${[agent?.state, connection, live && route.label ? routeText(route.label, route.samples) : ''].filter(Boolean).join(' · ')}>
         ${shell ? html`<span class="muted">▹</span>` : html`<i class=${`sw-dot ${SECTION_TONE[agent?.attention?.section] || 'muted'}`}></i>`}
         ${name}
         ${agent && !shell ? html`<${Ring} percent=${agent.context_percent} />` : null}
       </span>
       ${live || shellAway ? null : html`<span class="term-connection" role="status">${connection}</span>`}
+      ${ticket}
       <span class="sp"></span>
       ${notes}${details}${hide}${menus(false)}
       <span class="term-icons">
@@ -499,6 +511,7 @@ export function TerminalPage({ id, open }) {
           onClick=${() => openInClaude(agent)}><${Icon} name="external" /></button>` : null}
         <button type="button" class="icon-btn" disabled=${!live} title=${shell ? 'Redraw the screen' : "Redraw the agent's screen"} aria-label="Redraw"
           onClick=${() => control.current?.redraw()}><${Icon} name="redraw" /></button>
+        ${moon}
         <${BugButton} page="Terminal" />
       </span>
       ${retire}
@@ -528,24 +541,13 @@ export function TerminalPage({ id, open }) {
         onClick=${() => control.current?.redraw()}>Redraw</button>
       ${details}
     </div>`}
-    <div class=${`term-main${open && (open === 'notes:view' || Renderer) ? ' with-panel' : ''}`}>
-      <div class="term-side">
-        ${switcher ? html`<div class="term-switch-wrap" onClick=${refocus}><${Switcher} groups=${groups} currentId=${id}
-          idleOpen=${idleOpen} toggleIdle=${toggleIdle} pick=${pick} reload=${reload} /></div>` : null}
-        <button type="button" class="term-edge" title=${`${switcher ? 'Fold' : 'Unfold'} session list (⌘\\)`}
-          aria-label=${`${switcher ? 'Fold' : 'Unfold'} session list`} aria-expanded=${switcher}
-          onClick=${() => { toggleSwitcher(); refocus(); }}><${Icon} name=${switcher ? 'fold' : 'unfold'} size="14" /></button>
-      </div>
+    <div class="term-main">
       <div class="term-body" ref=${host} hidden=${shellAway}></div>
       ${shellAway ? html`<${ShellAwayPanel} key=${id} id=${id} directError=${directError} onRetry=${() => setAttempt(n => n + 1)} />` : null}
-      ${open === 'notes:view' ? html`<aside class="panel term-panel" aria-label="Notes"><${NotesView} pane onClose=${closePanel}
-        target=${{ id, label: agent?.name || id }} onType=${text => !!control.current?.paste(text)} /></aside>` : null}
-      ${open && open !== 'notes:view' && Renderer ? html`<aside class="panel term-panel" aria-label="Details"><${Renderer} key=${open} id=${panelId} beside=${open === `agent:${id}` ? 'terminal' : null} controls=${html`<span class="ctl">
-        <button type="button" class="icon-btn" title="Close details" onClick=${closePanel}><${Icon} name="close" size="14" /></button></span>`} /></aside>` : null}
     </div>
     ${connection !== 'Live' && !shellAway ? html`<div class="term-notice" role="status">${error || connection}
       ${lookupFailed ? html`<button type="button" class="btn" onClick=${reload}>Retry</button>`
-        : unavailable ? html`<a class="btn" href="/" onClick=${(event) => { event.preventDefault(); navigate('/'); }}>Back to Agents</a>`
+        : unavailable ? html`<a class="btn" href="/" onClick=${(event) => { event.preventDefault(); navigate('/'); }}>Open another agent</a>`
         : connection === 'Ended' ? html`<button type="button" class="btn" onClick=${() => setAttempt((n) => n + 1)}>Reconnect</button>` : null}</div>` : null}
   </div>`;
 }

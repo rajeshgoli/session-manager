@@ -225,17 +225,18 @@ test('switcher, keys and route at desktop and phone sizes', async () => {
           // G2: key buttons on phones only.
           assert.equal(await page.locator('.term-keys').count(), phone ? 1 : 0);
           if (!phone) {
-            // The desktop bar (#2242): who and how full on the left, actions on the right, Retire last;
-            // no Back button and no "Live" while live.
+            // The desktop bar (#2242, 2543 C): who and how full on the left, actions on the right, then Moon,
+            // Bug and Retire last; no Back button, no "sm" link and no "Live" while live.
             assert.deepEqual(await page.locator('.term-bar button').evaluateAll((b) => b.map((x) => x.getAttribute('aria-label') || x.textContent.trim())),
-              ['Notes ⌘J', 'Details', 'Hand off…', 'More', 'Open in Claude', 'Redraw', 'Report a bug', 'Retire']);
+              ['Notes ⌘J', 'Details', 'Hand off…', 'More', 'Open in Claude', 'Redraw', 'Overnight mode', 'Report a bug', 'Retire']);
+            assert.equal(await page.locator('.term-bar .term-home').count(), 0);
             assert.equal(await page.locator('.term-bar .term-connection').count(), 0);
             assert.equal(await page.locator('.term-who .t').innerText(), 'iter8-run');
           }
           if (phone) {
-            // G1: hidden by default below 900 px; the edge bar opens it over the terminal.
+            // G1, 2543 B.9: folded by default below 900 px; the strip opens it over the terminal.
             assert.equal(await page.locator('.term-switch').count(), 0);
-            await page.getByRole('button', { name: 'Unfold session list' }).click();
+            await page.getByRole('button', { name: 'Unfold sidebar' }).click();
           }
           await page.locator('.sw-row').first().waitFor();
           assert.deepEqual(await page.locator('.sw-sec').allInnerTexts(), ['NEEDS YOU', 'FINISHED', 'MOVING', 'WAITING', 'IDLE · 3 ›']);
@@ -294,33 +295,63 @@ test('switching agents, ✓, the idle fold and ⌘\\ at 1440 px', async () => {
     await page.waitForFunction(() => document.querySelectorAll('.sw-row .ok').length === 1);
     assert.deepEqual(state.answered, ['sm-1726-engineer']);
     assert.equal(new URL(page.url()).pathname, '/terminal/iter8-run');
-    // ⌘\ hides the switcher and remembers it.
+    // ⌘\ folds the sidebar and remembers it for terminals (2543 B.8).
+    const folds = () => page.evaluate(() => JSON.parse(localStorage.getItem('sm-sidebar')));
     await page.keyboard.press('Meta+Backslash');
     await page.waitForFunction(() => !document.querySelector('.term-switch'));
-    assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-switcher')), 'false');
-    // The fold control is the list's own edge bar, not a bar button by Back (#2242).
+    assert.equal((await folds()).terminal, 'folded');
+    assert.equal((await folds()).pages, 'open');
+    // The fold control is the sidebar's own edge strip, not a bar button by Back (#2242).
     assert.equal(await page.locator('.term-bar').getByRole('button', { name: /agent/i }).count(), 0);
-    // Folded, only the edge bar stays, and the terminal starts right after it.
+    // Folded, only the strip stays, and the terminal starts right after it.
     const box = (q) => page.locator(q).boundingBox();
-    const edge = await box('.term-edge');
+    const edge = await box('.sb-edge');
     assert.ok(edge.x === 0 && edge.width <= 16 && edge.height > 800, JSON.stringify(edge));
     assert.ok(Math.abs((await box('.term-body')).x - edge.width) <= 1);
     // Unfold and fold by the edge bar, twice: the terminal is always right of the list.
     for (let round = 0; round < 2; round += 1) {
-      await page.getByRole('button', { name: 'Unfold session list' }).click();
+      await page.getByRole('button', { name: 'Unfold sidebar' }).click();
       await page.locator('.term-switch').waitFor();
-      assert.equal(await page.evaluate(() => localStorage.getItem('sm-term-switcher')), 'true');
-      const list = await box('.term-switch-wrap'), open = await box('.term-edge');
-      assert.ok(Math.abs(open.x - list.width) <= 1, 'the edge bar sits at the list\'s right edge');
-      assert.ok(Math.abs((await box('.term-body')).x - (open.x + open.width)) <= 1, 'the terminal sits right of the list');
-      await page.getByRole('button', { name: 'Fold session list' }).click();
+      assert.equal((await folds()).terminal, 'open');
+      const list = await box('.sidebar'), open = await box('.sb-edge');
+      assert.ok(Math.abs(open.x - list.width) <= 1, 'the strip sits at the sidebar\'s right edge');
+      assert.ok(Math.abs(list.width - 15.5 * 15) <= 1, `the sidebar is 15.5 rem (got ${list.width})`);
+      assert.ok(Math.abs((await box('.term-body')).x - (open.x + open.width)) <= 1, 'the terminal sits right of the sidebar');
+      await page.getByRole('button', { name: 'Fold sidebar' }).click();
       await page.waitForFunction(() => !document.querySelector('.term-switch'));
       assert.ok(Math.abs((await box('.term-body')).x - edge.width) <= 1);
     }
     if (process.env.SHOTS_DIR) await page.screenshot({ path: `${process.env.SHOTS_DIR}/terminal-folded-1440.png` });
-    // After all that switching, sm at the top left goes home in one click.
-    await page.locator('.term-bar').getByRole('link', { name: 'sm', exact: true }).click();
-    await page.waitForFunction(() => location.pathname === '/' && !document.querySelector('.term-bar'));
+    // After all that switching, "sm" at the sidebar's top goes home, which reopens the last terminal (2543 D.5).
+    await page.getByRole('button', { name: 'Unfold sidebar' }).click();
+    await page.locator('.sidebar').getByRole('link', { name: 'sm', exact: true }).click();
+    await page.waitForFunction(() => location.pathname === '/terminal/iter8-run');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('⌘K on a terminal opens search and types nothing; Ctrl+K still reaches the agent (2543 G)', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    await page.goto(`${ORIGIN}/terminal/iter8-run`);
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
+    const inputs = () => page.evaluate(() => window.sockets.flatMap((ws) => ws.sent).filter((f) => f.type === 'input').map((f) => f.data));
+    await page.locator('.xterm-helper-textarea').focus();
+    await page.keyboard.press('Meta+k');
+    await page.locator('.palette').waitFor();
+    assert.deepEqual(await inputs(), []);
+    // Closing search gives the keyboard back to the terminal.
+    await page.locator('.scrim').click({ position: { x: 5, y: 5 } });
+    await page.waitForFunction(() => document.activeElement?.classList.contains('xterm-helper-textarea'));
+    await page.keyboard.press('Control+k');
+    await page.waitForFunction(() => window.sockets.flatMap((ws) => ws.sent).some((f) => f.type === 'input' && f.data === '\x0b'));
+    assert.equal(await page.locator('.palette').count(), 0);
+    // The palette opens an agent's terminal.
+    await page.keyboard.press('Meta+k');
+    await page.locator('.palette input').fill('sm-1776');
+    await page.locator('.palette li', { hasText: 'sm-1776' }).first().click();
+    await page.waitForFunction(() => location.pathname === '/terminal/sm-1776');
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

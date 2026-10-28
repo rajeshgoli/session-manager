@@ -1,34 +1,34 @@
-// The sm web shell (spec 1710 D1, D2): router, left menu, top bar, side
-// panel, command palette, rail badges and toasts. Pages are modules; a page
-// whose module has not landed yet links to today's page (`legacy`) or shows
-// a placeholder.
+// The sm web shell (spec 1710 D1, D2; 2543 B-D, G): router, sidebar, top bar,
+// side panel, command palette, badges and toasts. Every page, the terminal
+// included, renders inside one frame: sidebar | main | side panel. Pages are
+// modules; a page whose module has not landed yet shows a placeholder.
 import { render } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
-  html, api, bus, build, network, clientNav, screenFor, pageData, usePoll, useShared, setShared, shared, stored, store, panels,
-  openPanel, closePanel, navigate, openItem, toast, typingIn, Icon, Ring, Seg, gigabytes, basename, meterBand,
+  html, api, bus, build, network, clientNav, screenFor, pageData, usePoll, useShared, setShared, shared, stored, store, panels, config,
+  openPanel, closePanel, navigate, openItem, toast, typingIn, Icon, gigabytes, basename, meterBand,
 } from './ui.js';
 import { BoardPage } from './board.js';
 import { InboxPage } from './inbox.js';
 import { HistoryPage } from './history.js';
 import { GuestbookPage } from './guestbook.js';
-import { AgentsPage } from './agents.js';
+import { AgentCard, HostRestartBanner, SECTION_TONE } from './agents.js';
 import { QueuePage } from './queue.js';
 import { ArtifactsPage } from './artifacts.js';
 import { AnalyticsPage } from './analytics.js';
 import { SettingsPage } from './settings.js';
-import { TerminalPage } from './terminal.js';
+import { TerminalPage, Switcher, switcherGroups, shortFact, stepRow, landingFor, activeTerminal, IDLE_KEY } from './terminal.js';
 import { NotesView } from './notes.js';
 import { NewAgentPopover } from './start.js';
 import { BugButton } from './bug.js';
-import { HiddenShells } from './shell.js';
+import { HiddenShells, hiddenShells, isShell } from './shell.js';
 
 // ---- pages ------------------------------------------------------------------
 
+// The sidebar's page links (2543 B.3): the Agents page is gone; `/` lands on a terminal (D.5).
 const PAGES = [
-  { key: 'agents', label: 'Agents', icon: 'agents', path: '/', key_hint: 'a' },
-  { key: 'board', label: 'Board', icon: 'board', path: '/board', key_hint: 'b' },
   { key: 'inbox', label: 'Inbox', icon: 'inbox', path: '/inbox', key_hint: 'i' },
+  { key: 'board', label: 'Board', icon: 'board', path: '/board', key_hint: 'b' },
   { key: 'queue', label: 'Queue', icon: 'queue', path: '/queue', key_hint: 'q' },
   { key: 'artifacts', label: 'Artifacts', icon: 'history', path: '/artifacts' },
   { key: 'notes', label: 'Notes', icon: 'history', path: '/notes', key_hint: 'n' },
@@ -38,11 +38,15 @@ const PAGES = [
   { key: 'settings', label: 'Settings', icon: 'settings', path: '/settings', key_hint: 's', bottom: true },
 ];
 
+// The phone's bottom tab bar keeps today's items (B.10), the agents list first.
+const HOME = { key: 'home', label: 'Agents', icon: 'agents', path: '/' };
+const TABS = [HOME, ...['board', 'inbox', 'queue', 'artifacts', 'notes', 'analytics', 'history', 'guestbook', 'settings']
+  .map((key) => PAGES.find((p) => p.key === key))];
+
 function pageFor(path) {
-  if (path === '/' || path === '/watch') return 'agents';
   if (path.startsWith('/terminal/')) return 'terminal';
-  const page = PAGES.find((p) => p.path !== '/' && (path === p.path || path.startsWith(`${p.path}/`)));
-  return page ? page.key : 'agents';
+  const page = PAGES.find((p) => path === p.path || path.startsWith(`${p.path}/`));
+  return page ? page.key : 'home';
 }
 
 function readLocation() {
@@ -70,7 +74,9 @@ function urlFor(path, open) {
   return `${path}${query ? `?${query}` : ''}`;
 }
 
-const bandKind = ref => /^(agent|job):/.test(ref || '');
+// Where a details ref shows (1710 D2): a job, or an agent on History, opens as a band under the row
+// it came from; everything else, and anything on a terminal, opens in the side panel.
+const inBand = (ref, page) => page !== 'terminal' && (/^job:/.test(ref || '') || (/^agent:/.test(ref || '') && page === 'history'));
 let openOrigin = null;
 
 // ---- layout (D2 folding and sizing) ------------------------------------------
@@ -80,19 +86,59 @@ const REM = () => parseFloat(getComputedStyle(document.documentElement).fontSize
 function initialLayout() {
   const saved = stored('sm-layout', {}) || {};
   return {
-    rail: saved.rail === 'full' || saved.rail === 'folded' ? saved.rail : window.innerWidth < 1100 ? 'folded' : 'full',
     panel_width_rem: typeof saved.panel_width_rem === 'number' ? saved.panel_width_rem : 28,
     panel_mode: saved.panel_mode === 'wide' ? 'wide' : 'side',
   };
 }
 
 const clampWidth = (rem) => Math.max(20, Math.min(rem, (window.innerWidth * 0.6) / REM()));
+const refreshMs = () => Math.max(1, config.refresh_seconds || 3) * 1000;
+
+// ---- sidebar state (2543 B.4, B.8) ---------------------------------------------
+
+/** Fold and arrangement are remembered per view kind; documents join in a later ticket. */
+const viewKind = (page) => (page === 'terminal' ? 'terminal' : 'pages');
+const SIDEBAR_KEY = 'sm-sidebar';
+const ARRANGE_KEY = 'sm-sidebar-arrangement';
+
+/** `{ pages, terminal, doc }`, each open or folded; the first run carries over the old rail and switcher choices. */
+function initialSidebar() {
+  const saved = stored(SIDEBAR_KEY, null);
+  const pick = (value, fallback) => (value === 'open' || value === 'folded' ? value : fallback);
+  const rail = (stored('sm-layout', {}) || {}).rail;
+  const switcher = stored('sm-term-switcher', null);
+  const next = saved && typeof saved === 'object' ? {
+    pages: pick(saved.pages, window.innerWidth >= 1100 ? 'open' : 'folded'),
+    terminal: pick(saved.terminal, window.innerWidth >= 900 ? 'open' : 'folded'),
+    doc: pick(saved.doc, 'folded'),
+  } : {
+    pages: rail === 'full' ? 'open' : rail === 'folded' ? 'folded' : window.innerWidth >= 1100 ? 'open' : 'folded',
+    terminal: switcher === true ? 'open' : switcher === false ? 'folded' : window.innerWidth >= 900 ? 'open' : 'folded',
+    doc: 'folded',
+  };
+  if (!saved) store(SIDEBAR_KEY, next);
+  return next;
+}
+
+/** Pages first on pages, agents first on a terminal, unless swapped. */
+function initialArrangement() {
+  const saved = stored(ARRANGE_KEY, {}) || {};
+  return { pages: saved.pages === 'agents' ? 'agents' : 'pages', terminal: saved.terminal === 'pages' ? 'pages' : 'agents' };
+}
+
+const remembered = (key, setter) => (patch) => setter((prev) => {
+  const next = { ...prev, ...patch };
+  store(key, next);
+  return next;
+});
 
 // ---- shell ------------------------------------------------------------------
 
 function App() {
   const [loc, setLoc] = useState(readLocation);
   const [layout, setLayout] = useState(initialLayout);
+  const [sidebar, setSidebar] = useState(initialSidebar);
+  const [arrangement, setArrangement] = useState(initialArrangement);
   const [palette, setPalette] = useState(false);
   const [creating, setCreating] = useState(null);
   const [toasts, setToasts] = useState([]);
@@ -106,6 +152,12 @@ function App() {
       return next;
     });
   }, []);
+  // Stable, so the sheet's Escape and outside-click listeners stay attached across renders.
+  const closeCreating = useCallback(() => setCreating(null), []);
+  const updateSidebar = useCallback(remembered(SIDEBAR_KEY, setSidebar), []);
+  const updateArrangement = useCallback(remembered(ARRANGE_KEY, setArrangement), []);
+  // The sidebar, the terminal and the landing share one poll of the live sessions.
+  const watch = usePoll(() => api('/watch/state'), refreshMs(), [], { background: true });
 
   useEffect(() => {
     let committedIndex = Number.isInteger(history.state?.smHistoryIndex) ? history.state.smHistoryIndex : 0;
@@ -131,8 +183,7 @@ function App() {
         clientNav.acted();
         if (!(await canLeaveNotes())) return;
         openOrigin = null;
-        const target = PAGES.find((p) => p.path === path);
-        if ((target && target.legacy) || build.stale) {
+        if (build.stale) {
           location.href = urlFor(path, null);
           return;
         }
@@ -146,10 +197,9 @@ function App() {
         if (!(await canLeaveNotes())) return;
         openOrigin = document.activeElement?.closest?.('.board-ticket,.history-card,.q-job,.card') || null;
         const kind = ref?.split(':', 1)[0];
-        // The terminal page shows every panel beside its terminal, so it never jumps to Agents or Queue.
+        // A job opened from outside Queue goes to Queue; anything else opens where you are.
         const page = pageFor(current.path);
-        const path = bandKind(ref) && !openOrigin && page !== 'terminal' && page !== (kind === 'agent' ? 'agents' : 'queue')
-          ? kind === 'agent' ? '/' : '/queue' : current.path;
+        const path = kind === 'job' && !openOrigin && page !== 'terminal' && page !== 'queue' ? '/queue' : current.path;
         history.pushState({ smHistoryIndex: ++committedIndex }, '', urlFor(path, ref));
         setLoc(readLocation());
       }),
@@ -158,7 +208,7 @@ function App() {
         setToasts((prev) => [...prev, { ...item, id }]);
         setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), item.ms || 6000);
       }),
-      bus.on('new-agent', (prefill) => setCreating(prefill)),
+      bus.on('new-agent', (prefill) => setCreating({ prefill: prefill || {}, at: 'bar' })),
       bus.on('network', setOffline),
       bus.on('stale-build', setStale),
     ];
@@ -169,46 +219,88 @@ function App() {
   }, []);
 
   const page = pageFor(loc.path);
+  const termId = page === 'terminal' ? decodeURIComponent(loc.path.slice('/terminal/'.length)) : null;
+  const kind = viewKind(page);
+  const folded = sidebar[kind] !== 'open';
+  const [watchDoc] = watch;
+  const sessions = (watchDoc && watchDoc.sessions) || [];
+  const { order } = switcherGroups(sessions, termId, stored(IDLE_KEY, false));
+  const toggleSidebar = () => updateSidebar({ [kind]: folded ? 'open' : 'folded' });
   // Every owner request names the screen it came from (spec 2170 A.5).
   clientNav.setScreen(() => screenFor(page, loc.open, `${location.pathname}${location.hash}`));
   // Page data for a bug report is what this page fetched since it opened.
   const marked = useRef(null);
   if (marked.current !== page) { marked.current = page; pageData.markPage(); }
-  useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, creating });
+  useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, creating, toggleSidebar, order, termId });
   useRailData();
   useDetailsBand(loc.open, page);
+  useLanding(page, loc, watchDoc, setLoc);
 
   useEffect(() => {
     const current = PAGES.find((p) => p.key === page);
     document.title = page === 'terminal' ? 'sm · Terminal' : `sm · ${current ? current.label : 'Agents'}`;
   }, [page]);
+  // The landing reopens the last terminal you had open (D.5).
+  useEffect(() => { if (termId) store('sm-term-last', termId); }, [termId]);
 
-  if (page === 'terminal') {
-    return html`<${TerminalPage} id=${decodeURIComponent(loc.path.slice('/terminal/'.length))} open=${loc.open} />
-      <${Toasts} items=${toasts} />`;
-  }
-
-  const panelOpen = !!loc.open && !bandKind(loc.open) && !(page === 'inbox' && /^(doc|thread|work):/.test(loc.open));
-  const cls = ['app', layout.rail === 'folded' && 'folded', panelOpen && layout.panel_mode === 'wide' && 'wide']
+  const term = page === 'terminal';
+  const panelOpen = !!loc.open && !inBand(loc.open, page) && !(page === 'inbox' && /^(doc|thread|work):/.test(loc.open));
+  const cls = ['app', term && 'term', folded && 'folded', panelOpen && 'with-panel', panelOpen && layout.panel_mode === 'wide' && 'wide']
     .filter(Boolean).join(' ');
+  const termName = termId ? (sessions.find((s) => s.id === termId)?.name || termId) : '';
+  const newAgent = (at) => creating && creating.at === at
+    ? html`<${NewAgentPopover} key=${JSON.stringify(creating.prefill)} prefill=${creating.prefill} align=${at === 'sidebar' ? 'left' : 'right'}
+        onClose=${closeCreating} />` : null;
+  // Pages without a New agent button (the terminal, Notes) still open the sheet, at the top right.
+  const barHost = term || page === 'notes';
+  const closePalette = () => { setPalette(false); if (term) setTimeout(() => activeTerminal.focus(), 0); };
   return html`<div class=${cls} style=${`--panel-w:${clampWidth(layout.panel_width_rem)}rem`}>
-      <${Rail} page=${page} layout=${layout} updateLayout=${updateLayout} />
+      <${Sidebar} page=${page} termId=${termId} watch=${watch} folded=${folded} arrangement=${arrangement[kind]}
+        setFolded=${(value) => updateSidebar({ [kind]: value ? 'folded' : 'open' })}
+        swap=${() => updateArrangement({ [kind]: arrangement[kind] === 'pages' ? 'agents' : 'pages' })}
+        onSearch=${() => setPalette(true)} onNew=${() => setCreating(creating ? null : { prefill: {}, at: 'sidebar' })}
+        newAgent=${newAgent('sidebar')} />
       <main class="main">
-        <${TopBar} page=${page} offline=${offline} stale=${stale} onSearch=${() => setPalette(true)}
-          creating=${creating} setCreating=${setCreating} />
-        <${NightBanner} />
-        <${Page} page=${page} loc=${loc} />
+        ${term ? html`<${TerminalPage} id=${termId} watch=${watch} moon=${html`<${MoonButton} />`} />` : html`
+          <${TopBar} page=${page} offline=${offline} stale=${stale} onSearch=${() => setPalette(true)}
+            creating=${creating} setCreating=${setCreating} newAgent=${newAgent('bar')} watch=${watch} />
+          <${NightBanner} />
+          <${HostRestartBanner} />
+          <${Page} page=${page} loc=${loc} watch=${watch} />`}
       </main>
-      ${panelOpen ? html`<${Panel} openRef=${loc.open} layout=${layout} updateLayout=${updateLayout} />` : null}
+      ${panelOpen ? html`<${Panel} openRef=${loc.open} layout=${layout} updateLayout=${updateLayout}
+        beside=${term && loc.open === `agent:${termId}` ? 'terminal' : null}
+        notesTarget=${term ? { id: termId, label: termName } : null} />` : null}
+      <${TabBar} page=${page} />
     </div>
-    ${palette ? html`<${Palette} onClose=${() => setPalette(false)} />` : null}
+    ${barHost && creating?.at === 'bar' ? html`<span class="anchor new-agent-host">${newAgent('bar')}</span>` : null}
+    ${palette ? html`<${Palette} onClose=${closePalette} />` : null}
     <${Toasts} items=${toasts} />`;
+}
+
+/**
+ * `/` and `/watch` (2543 D.5): wider than 720 px, the last terminal you had open if it is live,
+ * else the top sidebar row; `?open=agent:<id>` lands on that agent's terminal with Details.
+ * At phone width `/` stays: it is the agents list.
+ */
+function useLanding(page, loc, doc, setLoc) {
+  useEffect(() => {
+    if (page !== 'home' || window.innerWidth <= 720) return;
+    const go = (id, open) => {
+      history.replaceState(history.state, '', urlFor(`/terminal/${encodeURIComponent(id)}`, open));
+      setLoc(readLocation());
+    };
+    if (loc.open?.startsWith('agent:')) { go(loc.open.slice('agent:'.length), loc.open); return; }
+    if (!doc) return;
+    const target = landingFor(doc.sessions || [], stored('sm-term-last', null));
+    if (target) go(target.id, loc.open);
+  }, [page, loc, doc]);
 }
 
 /** Mount the detail renderer in the clicked row without making it part of the page's data tree. */
 function useDetailsBand(openRef, page) {
   useEffect(() => {
-    if (!bandKind(openRef) || page === 'terminal') return;
+    if (!inBand(openRef, page)) return;
     const host = document.createElement('section');
     host.className = 'details-band';
     host.setAttribute('aria-label', 'Details');
@@ -239,8 +331,8 @@ function useDetailsBand(openRef, page) {
   }, [openRef, page]);
 }
 
-function Page({ page, loc }) {
-  if (page === 'agents') return html`<${AgentsPage} openRef=${loc.open} />`;
+function Page({ page, loc, watch }) {
+  if (page === 'home') return html`<${Home} watch=${watch} />`;
   if (page === 'queue') return html`<${QueuePage} />`;
   if (page === 'artifacts') return html`<${ArtifactsPage} />`;
   if (page === 'analytics') return html`<${AnalyticsPage} path=${loc.path} />`;
@@ -250,7 +342,7 @@ function Page({ page, loc }) {
   if (page === 'notes') return html`<div class="content notes-content"><${NotesView} /></div>`;
   if (page === 'history') return html`<${HistoryPage} path=${loc.path} />`;
   if (page === 'guestbook') return html`<${GuestbookPage} />`;
-  const current = PAGES.find((p) => p.key === page);
+  const current = PAGES.find((p) => p.key === page) || HOME;
   return html`<div class="content"><div class="stub">
     <h2>${current.label}</h2>
     <p>The ${current.label} page is not built yet. It arrives in a later web ticket; until then the phone app has it.</p>
@@ -347,7 +439,8 @@ function badges(queue, inbox, board) {
   if (queue) {
     const waiting = queue.queued || [];
     const long = waiting.some((job) => job.queued_at && Date.now() - Date.parse(job.queued_at) >= 30 * 60 * 1000);
-    out.queue = { count: waiting.length, tone: long ? 'amber' : '' };
+    // The sidebar shows running · waiting beside Queue (2543 B.3); the folded icon and the tab bar, waiting.
+    out.queue = { count: waiting.length, text: `${(queue.running || []).length} · ${waiting.length}`, tone: long ? 'amber' : '' };
   }
   // A blocked agent (sm#2494) turns the badge red.
   const blocked = (inbox?.rows || []).some((row) => row.group === 'blocked');
@@ -355,37 +448,160 @@ function badges(queue, inbox, board) {
   return out;
 }
 
-function Rail({ page, layout, updateLayout }) {
+function useBadges() {
   const queue = useShared('queue');
   const inbox = useShared('inbox');
   const board = useShared('board_badge');
   const counts = badges(queue, inbox, board);
   const artifacts = useShared('artifacts');
   counts.artifacts = { count: (artifacts?.artifacts || []).filter(a => a.needs_you?.reasons?.includes('would_delete')).length, tone: 'amber' };
-  const folded = layout.rail === 'folded';
-  const item = (p) => {
-    const badge = counts[p.key];
-    const click = (event) => {
-      if (p.legacy || event.metaKey || event.ctrlKey || event.shiftKey) return;
-      event.preventDefault();
-      navigate(p.path);
-    };
-    return html`<a href=${p.path} class=${['item', page === p.key && 'on', p.minor && 'minor'].filter(Boolean).join(' ')}
-      title=${folded ? p.label : ''} aria-current=${page === p.key ? 'page' : null} onClick=${click}>
-      <${Icon} name=${p.icon} /><span class="lb">${p.label}</span>
-      ${badge ? html`<b class=${[badge.tone, badge.count ? '' : 'zero'].filter(Boolean).join(' ')}>${badge.count || ''}</b>` : null}
-    </a>`;
+  return { counts, inbox };
+}
+
+/** A page link: a full row, or (`icon`) an icon with its badge as a dot and the label as tooltip. */
+function pageLink(p, page, counts, { icon = false, full = false } = {}) {
+  const badge = counts[p.key];
+  const click = (event) => {
+    if (event.metaKey || event.ctrlKey || event.shiftKey) return;
+    event.preventDefault();
+    navigate(p.path);
   };
-  return html`<nav class="rail" aria-label="Pages">
-    <div class="brand"><a href="/" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
-      <button type="button" class="fold" title=${folded ? 'Expand menu (⌘\\)' : 'Fold menu (⌘\\)'}
-        onClick=${() => updateLayout({ rail: folded ? 'full' : 'folded' })}>
-        <${Icon} name=${folded ? 'unfold' : 'fold'} size="14" /></button></div>
-    ${PAGES.filter((p) => !p.bottom).map(item)}
-    <span class="grow"></span>
-    <${Dash} />
-    ${PAGES.filter((p) => p.bottom).map(item)}
-  </nav>`;
+  const text = full && badge?.text ? badge.text : badge?.count || '';
+  return html`<a href=${p.path} class=${['item', icon && 'icon', page === p.key && 'on', p.minor && 'minor'].filter(Boolean).join(' ')}
+    title=${icon ? p.label : ''} aria-label=${icon ? p.label : null} aria-current=${page === p.key ? 'page' : null} onClick=${click}>
+    <${Icon} name=${p.icon} /><span class="lb">${p.label}</span>
+    ${badge ? html`<b class=${[badge.tone, badge.count || (full && badge.text) ? '' : 'zero'].filter(Boolean).join(' ')}>${text}</b>` : null}
+  </a>`;
+}
+
+const live = (s) => s.state !== 'stopped' && s.attention?.section !== 'stopped';
+const HOVER_MS = 400;
+
+/**
+ * The one left column (2543 B): search, page links, the Agents heading and the live
+ * sessions (the only part that scrolls), meters, Settings. Pages first shows every page
+ * link and one-line session rows; agents first shows the links as icons and today's
+ * two-line rows. Folded, it is a 14 px strip with a dot when something needs you.
+ */
+function Sidebar({ page, termId, watch, folded, arrangement, setFolded, swap, onSearch, onNew, newAgent }) {
+  const [doc, , reload] = watch;
+  const [idleOpen, setIdleOpen] = useState(() => stored(IDLE_KEY, false));
+  const [card, setCard] = useState(null);
+  const timer = useRef(null);
+  const { counts, inbox } = useBadges();
+  const term = page === 'terminal';
+  const sessions = (doc && doc.sessions) || [];
+  const current = term ? termId : null;
+  const { groups } = switcherGroups(sessions, current, idleOpen);
+  const agents = sessions.filter((s) => !isShell(s) && live(s));
+  const needs = agents.filter((s) => ['blocked', 'you'].includes(s.attention?.section)).length;
+  const signal = agents.some((s) => s.attention?.section === 'blocked') || (inbox?.rows || []).some((row) => row.group === 'blocked') ? 'red'
+    : needs || inbox?.needs_you_count ? 'magenta' : '';
+  useEffect(() => () => clearTimeout(timer.current), []);
+  useEffect(() => { if (folded) setCard(null); }, [folded]);
+
+  const refocus = () => { if (term) setTimeout(() => activeTerminal.focus(), 0); };
+  const pick = (agent) => {
+    clearTimeout(timer.current);
+    setCard(null);
+    // Between 720 and 900 px the sidebar covers the page, so it closes once you choose (B.9).
+    if (window.innerWidth < 900) setFolded(true);
+    if (agent.id === current) refocus();
+    else navigate(`/terminal/${encodeURIComponent(agent.id)}`);
+  };
+  const toggleIdle = () => { store(IDLE_KEY, !idleOpen); setIdleOpen(!idleOpen); refocus(); };
+  // The hover card (D.3): after 400 ms on an agent row; it stays while the pointer is on the row or the card.
+  const touch = typeof matchMedia === 'function' && matchMedia('(hover: none)').matches;
+  const hover = (agent) => (isShell(agent) || touch ? {} : {
+    onMouseEnter: (event) => {
+      const row = event.currentTarget;
+      clearTimeout(timer.current);
+      timer.current = setTimeout(() => {
+        const box = row.getBoundingClientRect();
+        setCard({ id: agent.id, top: box.top, left: (row.closest('.sb-wrap')?.getBoundingClientRect().right || box.right) + 6 });
+      }, HOVER_MS);
+    },
+    onMouseLeave: () => { clearTimeout(timer.current); timer.current = setTimeout(() => setCard(null), 150); },
+  });
+  const shown = card && sessions.find((s) => s.id === card.id);
+
+  const strip = html`<button type="button" class="sb-edge" title=${`${folded ? 'Unfold' : 'Fold'} sidebar (⌘\\)`}
+    aria-label=${`${folded ? 'Unfold' : 'Fold'} sidebar`} aria-expanded=${!folded}
+    onClick=${() => { setFolded(!folded); refocus(); }}>
+    ${folded && signal ? html`<i class=${`sb-signal ${signal}`}></i>` : null}
+    <${Icon} name=${folded ? 'unfold' : 'fold'} size="14" /></button>`;
+  if (folded) return html`<div class="sb-wrap">${strip}</div>`;
+  const pagesFirst = arrangement === 'pages';
+  const top = PAGES.filter((p) => !p.bottom);
+  return html`<div class="sb-wrap">
+    <nav class=${`sidebar ${pagesFirst ? 'pages-first' : 'agents-first'}`} aria-label="Sidebar">
+      <div class="sb-top">
+        <a class="sb-brand" href="/" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
+        <button type="button" class="search" onClick=${onSearch}><span>Search or jump…</span><kbd>⌘K</kbd></button>
+      </div>
+      ${pagesFirst
+        ? html`<div class="sb-pages">${top.map((p) => pageLink(p, page, counts, { full: true }))}</div>`
+        : html`<div class="sb-icons">${top.map((p) => pageLink(p, page, counts, { icon: true }))}</div>`}
+      <div class="sb-head">
+        <span class="lb">Agents</span>
+        <button type="button" class="plain-btn sb-live" title=${pagesFirst ? 'Show agents first' : 'Show pages first'}
+          aria-label=${`${agents.length} live; ${pagesFirst ? 'show agents first' : 'show pages first'}`} onClick=${swap}>
+          ${agents.length} live ${pagesFirst ? '›' : '⌄'}</button>
+        ${needs ? html`<b class="magenta" title=${`${needs} need${needs === 1 ? 's' : ''} you`}>${needs}</b>` : null}
+        <span class="sp"></span>
+        <span class="anchor"><button type="button" class="icon-btn sb-new" data-pop-anchor title="New agent or terminal" aria-label="New agent"
+          onClick=${onNew}>+</button>${newAgent}</span>
+      </div>
+      <div class="sb-agents">
+        ${pagesFirst
+          ? html`<${Lines} groups=${groups} currentId=${current} idleOpen=${idleOpen} toggleIdle=${toggleIdle} pick=${pick} hover=${hover} />`
+          : html`<${Switcher} groups=${groups} currentId=${current} idleOpen=${idleOpen} toggleIdle=${toggleIdle}
+              pick=${pick} reload=${reload} hover=${hover} />`}
+      </div>
+      <${Dash} />
+      ${PAGES.filter((p) => p.bottom).map((p) => pageLink(p, page, counts))}
+    </nav>
+    ${strip}
+    ${shown ? html`<div class="sb-card" style=${`top:${Math.max(8, Math.min(card.top, window.innerHeight - 220))}px;left:${card.left}px`}
+        onMouseEnter=${() => clearTimeout(timer.current)} onMouseLeave=${() => setCard(null)}>
+        <${AgentCard} agent=${shown} now=${Date.now()} onAnswered=${reload} onRetired=${reload} onOpen=${() => pick(shown)} /></div>` : null}
+  </div>`;
+}
+
+/** Pages first's one-line rows (B.4): dot, name, short fact; no headings, a gap between sections. */
+function Lines({ groups, currentId, idleOpen, toggleIdle, pick, hover }) {
+  return html`<div class="sb-lines" role="list" aria-label="Sessions">${groups.map(({ section, count, agents }) => html`<div class="sb-group" key=${section}>
+    ${section === 'idle' ? html`<button type="button" class="sb-line sb-idle" aria-expanded=${idleOpen} onClick=${toggleIdle}>
+      Idle · ${count} ${idleOpen ? '⌄' : '›'}</button>` : null}
+    ${agents.map((agent) => {
+      const fact = shortFact(agent);
+      return html`<div key=${agent.id} role="button" tabindex="-1" aria-current=${agent.id === currentId ? 'page' : null}
+        class=${`sb-line${agent.id === currentId ? ' cur' : ''}`} onClick=${() => pick(agent)} ...${hover(agent)}>
+        ${isShell(agent) ? html`<span class="sw-shell muted">▹</span>` : html`<i class=${`sw-dot ${SECTION_TONE[section]}`}></i>`}
+        <span class="sw-nm" title=${agent.name}>${agent.name}</span>
+        <span class=${`sb-fact ${fact.tone}`}>${fact.text}</span></div>`;
+    })}</div>`)}</div>`;
+}
+
+/** The phone's bottom tab bar (B.10), unchanged from the old rail at that width. */
+function TabBar({ page }) {
+  const { counts } = useBadges();
+  return html`<nav class="tabbar" aria-label="Pages">${TABS.map((p) => pageLink(p, page, counts))}</nav>`;
+}
+
+/** `/`: wider than 720 px the landing moves on to a terminal, so this shows only when none is live; at phone width, the agents list. */
+function Home({ watch }) {
+  const [doc, error, reload] = watch;
+  const [idleOpen, setIdleOpen] = useState(() => stored(IDLE_KEY, false));
+  if (!doc) return html`<div class="content">${error ? html`<p class="err">${error.message}</p>` : html`<p class="muted">Loading…</p>`}</div>`;
+  const { groups } = switcherGroups(doc.sessions || [], null, idleOpen);
+  if (!groups.length || window.innerWidth > 720) {
+    return html`<div class="content home-empty"><p>No live agents</p>
+      <button type="button" class="btn pri" onClick=${() => bus.emit('new-agent', {})}>New agent</button></div>`;
+  }
+  return html`<div class="content home-list"><${Switcher} groups=${groups} currentId=${null} idleOpen=${idleOpen}
+    toggleIdle=${() => { store(IDLE_KEY, !idleOpen); setIdleOpen(!idleOpen); }}
+    pick=${(agent) => navigate(`/terminal/${encodeURIComponent(agent.id)}`)} reload=${reload} /></div>`;
 }
 
 // ---- usage dash (sm#1881) ------------------------------------------------------
@@ -477,38 +693,33 @@ function Dash() {
 
 // ---- top bar ----------------------------------------------------------------
 
-function TopBar({ page, offline, stale, onSearch, creating, setCreating }) {
-  const queue = useShared('queue');
-  const hidden = useShared('hidden_shells');
-  const current = PAGES.find((p) => p.key === page);
-  const running = queue ? (queue.running || []).length : null;
-  const waiting = queue ? (queue.queued || []).length : null;
-  const waitingLong = queue?.queued?.some(job => Date.now() - Date.parse(job.queued_at) >= 30 * 60 * 1000);
+/** List pages (2543 C): the page name; then Moon, Bug and the page's main action in the top-right corner. */
+function TopBar({ page, offline, stale, onSearch, creating, setCreating, newAgent, watch }) {
+  const [doc, , reload] = watch;
+  const hidden = hiddenShells(doc?.sessions);
+  const current = PAGES.find((p) => p.key === page) || HOME;
   return html`<header class="bar">
-    <h1>${current ? current.label : ''}</h1>
+    <h1>${current.label}</h1>
     <button type="button" class="search" onClick=${onSearch}><span>Search or jump…</span><kbd>⌘K</kbd></button>
     <span class="sp"></span>
     ${offline ? html`<span class="offline" role="status">Offline, retrying</span>` : null}
     ${stale ? html`<button type="button" class="stale-build" onClick=${() => location.reload()}>sm was updated · Reload</button>` : null}
-    <span class="meters">
-      ${queue
-        ? html`<a class=${`meter link ${waitingLong ? 'amber' : ''}`} href="/queue" onClick=${(e) => { e.preventDefault(); navigate('/queue'); }}>
-            Queue ${running} running · ${waiting} waiting</a>`
-        : null}
-    </span>
-    ${hidden ? html`<${HiddenShells} shells=${hidden.shells} onChanged=${hidden.reload} />` : null}
+    ${hidden.length ? html`<${HiddenShells} shells=${hidden} onChanged=${reload} />` : null}
     <${MoonButton} />
-    <${BugButton} page=${current ? current.label : ''} />
-    <span class="anchor">
-      <button type="button" class="btn pri" data-pop-anchor onClick=${() => setCreating(creating ? null : {})}>New agent</button>
-      ${creating ? html`<${NewAgentPopover} key=${JSON.stringify(creating)} prefill=${creating} onClose=${() => setCreating(null)} />` : null}
-    </span>
+    <${BugButton} page=${current.label} />
+    ${page === 'notes'
+      ? html`<button type="button" class="btn pri" onClick=${() => bus.emit('notes-new')}>New note</button>`
+      : html`<span class="anchor">
+          <button type="button" class="btn pri" data-pop-anchor onClick=${() => setCreating(creating ? null : { prefill: {}, at: 'bar' })}>New agent</button>
+          ${newAgent}
+        </span>`}
   </header>`;
 }
 
 // ---- side panel ---------------------------------------------------------------
 
-function Panel({ openRef, layout, updateLayout }) {
+/** `beside` is 'terminal' for the open terminal's own agent; `notesTarget` lets Notes type into that terminal. */
+function Panel({ openRef, layout, updateLayout, beside = null, notesTarget = null }) {
   const split = openRef.indexOf(':');
   const kind = split < 0 ? openRef : openRef.slice(0, split);
   const id = split < 0 ? '' : openRef.slice(split + 1);
@@ -540,10 +751,11 @@ function Panel({ openRef, layout, updateLayout }) {
       onClick=${() => updateLayout({ panel_mode: wide ? 'side' : 'wide' })}><${Icon} name=${wide ? 'narrow' : 'wide'} size="14" /></button>
     <button type="button" class="icon-btn" title="Close (Esc)" onClick=${closePanel}><${Icon} name="close" size="14" /></button>
   </span>`;
-  return html`<aside class="panel" aria-label=${kind === 'notes' ? 'Notes' : 'Details'}>
+  return html`<aside class=${notesTarget ? 'panel term-panel' : 'panel'} aria-label=${kind === 'notes' ? 'Notes' : 'Details'}>
     <div class="grip" ref=${grip} onMouseDown=${drag}></div>
-    ${kind === 'notes' ? html`<${NotesView} pane onClose=${closePanel} />` : Renderer
-      ? html`<${Renderer} key=${openRef} id=${id} controls=${controls} />`
+    ${kind === 'notes' ? html`<${NotesView} pane onClose=${closePanel} target=${notesTarget || undefined}
+        onType=${notesTarget ? (text) => activeTerminal.paste(text) : undefined} />` : Renderer
+      ? html`<${Renderer} key=${openRef} id=${id} controls=${controls} beside=${beside} />`
       : html`<div class="phd"><span></span><span class="t">${kind}</span>${controls}
           <span class="s">This item does not open in the panel yet.</span></div>`}
   </aside>`;
@@ -568,7 +780,7 @@ function Palette({ onClose }) {
       if (watch.status === 'fulfilled') {
         for (const agent of watch.value.sessions || []) {
           out.push({ kind: agent.kind === 'shell' ? 'Terminal' : 'Agent', label: agent.name, detail: basename(agent.repo),
-            run: () => agent.kind === 'shell' ? navigate(`/terminal/${encodeURIComponent(agent.id)}`) : openPanel(`agent:${agent.id}`) });
+            run: () => navigate(`/terminal/${encodeURIComponent(agent.id)}`) });
         }
       }
       if (board.status === 'fulfilled') {
@@ -640,9 +852,9 @@ const pageItem = (p) => ({ kind: 'Page', label: p.label, detail: p.key_hint ? `g
 
 // ---- keyboard (D2) -------------------------------------------------------------
 
-function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, creating }) {
+function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, creating, toggleSidebar, order, termId }) {
   const state = useRef({});
-  state.current = { page, loc, layout, palette, creating };
+  state.current = { page, loc, layout, palette, creating, toggleSidebar, order, termId };
   useEffect(() => {
     let pendingG = 0;
     const down = (event) => {
@@ -654,19 +866,28 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
         where.open === 'notes:view' ? closePanel() : openPanel('notes:view');
         return;
       }
-      if (current === 'terminal') return;
-      if (mod && event.key.toLowerCase() === 'k') {
+      // 2543 G: on a terminal only ⌘ counts, so Ctrl+K and Ctrl+\ still reach the agent.
+      const term = current === 'terminal';
+      const cmd = term ? event.metaKey : mod;
+      if (event.metaKey && event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+        event.preventDefault();
+        const next = stepRow(state.current.order, term ? state.current.termId : null, event.key === 'ArrowUp' ? -1 : 1);
+        if (next && next.id !== state.current.termId) navigate(`/terminal/${encodeURIComponent(next.id)}`);
+        return;
+      }
+      if (cmd && !event.altKey && event.key.toLowerCase() === 'k') {
         event.preventDefault();
         setPalette((open) => !open);
         return;
       }
-      if (mod && event.key === '\\') {
+      if (cmd && event.key === '\\') {
         event.preventDefault();
-        updateLayout({ rail: now.rail === 'folded' ? 'full' : 'folded' });
+        state.current.toggleSidebar();
         return;
       }
+      if (term) return;
       if (mod && event.key === '.') {
-        if (where.open && !bandKind(where.open)) {
+        if (where.open && !inBand(where.open, current)) {
           event.preventDefault();
           updateLayout({ panel_mode: now.panel_mode === 'wide' ? 'side' : 'wide' });
         }
@@ -687,7 +908,7 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
       }
       if (pendingG && Date.now() - pendingG < 1500) {
         pendingG = 0;
-        const target = PAGES.find((p) => p.key_hint === event.key);
+        const target = event.key === 'a' ? HOME : PAGES.find((p) => p.key_hint === event.key);
         if (target) {
           event.preventDefault();
           navigate(target.path);
