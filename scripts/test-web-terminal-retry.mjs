@@ -10,7 +10,8 @@ const source = strip(await web('terminal-route.js')) + strip(await web('terminal
 function fixture(direct = [], { storage, probes } = {}) {
   let minted = 0;
   const states = [], timers = new Map(), sockets = [];
-  let effect, cleanup, timerId = 0;
+  const effects = [], layoutEffects = [];
+  let cleanup, timerId = 0, refIndex = 0;
   class Socket {
     static OPEN = 1;
     constructor(url) { this.url = url; this.readyState = 0; sockets.push(this); }
@@ -38,15 +39,17 @@ function fixture(direct = [], { storage, probes } = {}) {
     installFileLinks(){}, installPageMouse:()=>({dispose(){},copyKey:()=>false}),
     RetireButton:null, AgentMenus:null, ShellCloseButton:null, ShellMenu:null, ShellName:null, ShellAwayPanel:null, HiddenShells:null, setShellHidden(){},
     openPanel(){}, navigate(){}, openInClaude(){}, routeText:()=>'',
-    useRef:()=>({current:{style:{},addEventListener(){},removeEventListener(){}}}), useState:initial=>{const index=states.push(initial)-1;return [initial,value=>{states[index]=value;}];},
-    useEffect:fn=>{effect=fn;}, usePoll:()=>[null], panels:new Map(), html:()=>null, Icon:()=>null, Ring:()=>null, BugButton:()=>null,
+    useRef:initial=>({current:refIndex++ === 0 ? {style:{},addEventListener(){},removeEventListener(){}} : initial}), useState:initial=>{const index=states.push(initial)-1;return [initial,value=>{states[index]=value;}];},
+    useLayoutEffect:fn=>{layoutEffects.push(fn);}, useEffect:fn=>{effects.push(fn);}, usePoll:()=>[null], panels:new Map(), html:()=>null, Icon:()=>null, Ring:()=>null, BugButton:()=>null,
     api:async()=>({ws_url:'/client/terminal',ticket_id:`test-${++minted}`,ticket_secret:'test',server_instance:'inst',direct}),
     fetch:async()=>({ok:true,json:async()=>({instance:probes?probes.shift()??'inst':'inst'})}),AbortController,toast(){},
     setTimeout:fn=>{timers.set(++timerId,fn);return timerId;},clearTimeout:id=>timers.delete(id),
   });
   // The app's poll of GET /watch/state: one live agent, so the page connects.
   vm.runInContext(source+'\nTerminalPage({id:"test",watch:[{sessions:[{id:"test",name:"test",state:"idle",attention:{section:"idle"}}]},null,()=>{}]});',context);
-  cleanup=effect();
+  // Run mount hooks in Preact order and retain every effect's cleanup.
+  const cleanups = [...layoutEffects, ...effects].map(fn => fn()).filter(fn => typeof fn === 'function');
+  cleanup=()=>cleanups.forEach(fn=>fn());
   const settle=async()=>{for(let n=0;n<40;n++)await Promise.resolve();};
   return {minted:()=>minted,states,sockets,timers,cleanup,settle,async tick(){const [id,fn]=timers.entries().next().value;timers.delete(id);fn();await settle();}};
 }

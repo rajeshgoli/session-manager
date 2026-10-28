@@ -254,7 +254,10 @@ test('New agent Terminal requests only folder; Settings save limits and manage d
   try {
     const { page, requests, errors } = await setup(browser);
     await page.goto(`${ORIGIN}/`);
-    await page.getByRole('button', { name: 'New agent', exact: true }).click();
+    // Desktop home redirects after watch loads; use the persistent sidebar action.
+    await page.waitForURL('**/terminal/*');
+    await page.getByRole('navigation', { name: 'Sidebar', exact: true })
+      .getByRole('button', { name: 'New agent', exact: true }).click();
     await page.getByRole('button', { name: /▹ Terminal/ }).click();
     assert.equal(await page.getByText('First message', { exact: true }).count(), 0);
     assert.equal(await page.locator('.pop input').count(), 0);
