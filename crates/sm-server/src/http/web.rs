@@ -65,7 +65,6 @@ const ASSETS: &[Asset] = &[
     asset!("terminal-theme.js", JS),
     asset!("vendor/xterm.js", JS),
     asset!("vendor/addon-fit.js", JS),
-    asset!("vendor/addon-web-links.js", JS),
     asset!("vendor/xterm.css", "text/css; charset=utf-8"),
     asset!("board.js", JS),
     asset!("board-start.js", JS),
@@ -283,7 +282,9 @@ mod tests {
         // Clickable terminal file paths (#2502) add ~3 KiB.
         // Web-page mouse and Copy in the terminal (#2540) add ~5 KiB.
         // One sidebar on every page (#2550) adds ~3 KiB; compact meters (#2551) ~2 KiB.
-        const BUDGET: usize = 508 * 1024;
+        // main at 4483745 had reached 514 KiB unbudgeted; links Claude Code or Codex
+        // split across rows (#2580) add ~3 KiB.
+        const BUDGET: usize = 520 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",

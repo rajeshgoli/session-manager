@@ -13,7 +13,6 @@ import { installPageMouse } from './terminal-mouse.js';
 import { isShell, shellFact, ShellCloseButton, ShellAwayPanel, ShellMenu, ShellName, setShellHidden, hiddenShells, HiddenShells } from './shell.js';
 import './vendor/xterm.js';
 import './vendor/addon-fit.js';
-import './vendor/addon-web-links.js';
 
 const keys = [['Esc', 'escape'], ['Tab', 'tab'], ['Shift+Tab', 'shift-tab'], ['↑', 'up'], ['↓', 'down'], ['Ctrl-C', 'ctrl-c']];
 const back = () => history.length > 1 ? history.back() : navigate('/');
@@ -235,10 +234,13 @@ export function TerminalPage({ id, watch, moon, visible = true, onEnded }) {
     });
     const fit = new window.FitAddon.FitAddon();
     terminal.loadAddon(fit);
-    terminal.loadAddon(new window.WebLinksAddon.WebLinksAddon(openLink));
-    installFileLinks(terminal, id, (event, uri) => {
-      event?.preventDefault?.();
-      openTarget(uri);
+    // URLs and file paths, including ones Claude Code or Codex split across rows (#2580).
+    installFileLinks(terminal, id, {
+      url: openLink,
+      file: (event, uri) => {
+        event?.preventDefault?.();
+        openTarget(uri);
+      },
     });
     terminal.open(host.current);
     // Follow Settings › Appearance and, on System, the OS switching light or dark (#2304).
