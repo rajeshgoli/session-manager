@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useState, useRef } from 'preact/hooks';
 import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, stored, store, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes, toast } from './ui.js';
-import { timelineSegments, limitsInsight, waitingGroups, chartPath, coverageNote, jobAgentId, jobAgentLabel, askJobQuestion, reviewJobText, usageBreakdown, usageText, jobUsage, JOB_COLORS } from './queue-model.js';
+import { timelineSegments, limitsInsight, waitingGroups, chartPath, coverageNote, jobAgentId, jobAgentLabel, askJobQuestion, reviewJobText, reviewRowText, usageBreakdown, usageText, jobUsage, JOB_COLORS } from './queue-model.js';
 
 import { requestStart } from './queue-start.js';
 
@@ -27,6 +27,7 @@ export function QueuePage() {
     <${MacChart} />
     <${LocalModelCard} card=${queue.local_model} />
     ${!insightDismissed ? html`<${HeldBack} stats=${stats} insightOnly=${true} onDismiss=${() => { store('queue-limits-insight-dismissed', true); setInsightDismissed(true); }} />` : null}
+    <${ReviewsCard} reviews=${queue.reviews || []} now=${now} />
     <section class="q-card"><div class="q-heading"><h2>Running</h2><span class="muted">${queue.slots?.running ?? '—'} of ${queue.slots?.max ?? '—'} slots held · Last 3 hours → now</span></div>
       ${queue.running.length ? queue.running.map((job, i) => html`<${JobRow} key=${job.id} job=${job} now=${now} color=${i % JOB_COLORS} />`) : html`<p class="muted">No jobs running.</p>`}
       <h2>Waiting · in start order</h2>
@@ -34,6 +35,44 @@ export function QueuePage() {
       ${!queue.queued.length ? html`<p class="muted">No jobs waiting.</p>` : null}
     </section>
     ${queue.ended.length ? html`<a href="/analytics/queue" onClick=${(e) => { e.preventDefault(); navigate('/analytics/queue'); }}>${queue.ended.length} stopped in the last 24h ›</a>` : null}
+  </div>`;
+}
+
+/** Every review in progress, whoever holds it, with Next reviewer (#2586). */
+function ReviewsCard({ reviews, now }) {
+  if (!reviews.length) return null;
+  return html`<section class="q-card q-reviews"><div class="q-heading"><h2>Reviews</h2><span class="muted">${reviews.length} in progress</span></div>
+    ${reviews.map((review) => html`<${ReviewRow} key=${`${review.request_id}:${review.step}`} review=${review} now=${now} />`)}
+  </section>`;
+}
+
+function ReviewRow({ review, now }) {
+  const [asking, setAsking] = useState(false), [busy, setBusy] = useState(false);
+  const text = reviewRowText(review, now);
+  const next = async () => {
+    setBusy(true);
+    try {
+      await api(`/client/review-requests/${encodeURIComponent(review.request_id)}/next`, { method: 'POST', body: { step: review.step } });
+      toast(text.done);
+    } catch (e) {
+      toast(e.status === 409 ? 'This review has already moved on.' : e.message);
+    } finally {
+      setBusy(false); setAsking(false); bus.emit('queue-changed');
+    }
+  };
+  return html`<div class=${`q-review${asking ? ' asking' : ''}`}>
+    <a class="q-review-pr" href=${`https://github.com/${review.repo}/pull/${review.pr_number}`} target="_blank" rel="noopener">
+      <span class="q-review-title"><b>${text.pr}</b> ${text.title}</span>
+      <small>${text.context}</small>
+    </a>
+    <div class="q-review-who">
+      <span><b>${text.reviewer}</b>${text.model ? html`<small> ${text.model}</small>` : null}</span>
+      <small>${text.status}</small>
+    </div>
+    <div class="q-review-act"><button type="button" class="btn sm" aria-pressed=${asking} onClick=${() => setAsking(!asking)}>Next reviewer</button></div>
+    ${asking ? html`<div class="q-review-ask" role="group" aria-label=${text.ask}><span>${text.ask}${text.askDetail ? html` <small>${text.askDetail}</small>` : null}</span>
+      <button type="button" class="btn sm pri" disabled=${busy} onClick=${next}>${busy ? 'Moving…' : text.confirm}</button>
+      <button type="button" class="btn sm" disabled=${busy} onClick=${() => setAsking(false)}>Keep</button></div>` : null}
   </div>`;
 }
 

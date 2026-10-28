@@ -284,7 +284,8 @@ mod tests {
         // One sidebar on every page (#2550) adds ~3 KiB; compact meters (#2551) ~2 KiB.
         // main at 4483745 had reached 514 KiB unbudgeted; links Claude Code or Codex
         // split across rows (#2580) add ~3 KiB.
-        const BUDGET: usize = 520 * 1024;
+        // Queue review rows with Next reviewer (#2586) add ~4 KiB.
+        const BUDGET: usize = 524 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",
