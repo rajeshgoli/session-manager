@@ -127,6 +127,7 @@ async function open(browser, { viewport, colorScheme = 'light', size = 15, insta
       state.sessions = state.sessions.map((s) => (s.id === id ? { ...s, name } : s));
       return route.fulfill({ json: {} });
     }
+    if (url.pathname === '/client/board') return route.fulfill({ json: { lanes: [], other: [] } });
     if (url.pathname === '/watch/state') return route.fulfill({ json: { sessions: state.sessions, counts: {} } });
     return route.fulfill({ json: {} });
   });
@@ -682,6 +683,108 @@ test('terminal theme: picked in Settings, light or dark from Appearance, switchi
     await page.evaluate(() => { document.documentElement.dataset.theme = 'light'; });
     await page.waitForFunction(() => getComputedStyle(document.querySelector('.term-body')).backgroundColor === 'rgb(253, 246, 227)');
     if (SHOTS) await page.screenshot({ path: `${SHOTS}/terminal-solarized-light.png` });
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('kept terminal stays connected, cannot resize or type hidden, and returns without attaching', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, state, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    await page.goto(`${ORIGIN}/terminal/sm-1776`);
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
+    await page.waitForTimeout(800);
+    assert.equal(await page.title(), 'sm-1776 · sm');
+    const tickets = state.tickets;
+    await page.evaluate(() => { window.keptSocket = window.sockets.at(-1); window.keptNode = document.querySelector('.term-page'); });
+    const go = (path) => page.evaluate(async path => (await import('/assets/ui.js')).navigate(path), path);
+    await go('/board');
+    await page.locator('.term-page').waitFor({ state: 'hidden' });
+    const frames = () => page.evaluate(() => window.keptSocket.sent.filter(f => ['input', 'key', 'resize'].includes(f.type)));
+    const before = await frames();
+    await page.keyboard.type('never send this');
+    await page.setViewportSize({ width: 1200, height: 800 });
+    await page.evaluate(async () => {
+      const { activeTerminal } = await import('/assets/terminal.js');
+      activeTerminal.paste('also blocked'); activeTerminal.focus();
+      window.keptSocket.onmessage({ data: JSON.stringify({ type: 'output', sequence: 2, data: btoa('\r\nhidden output arrived') }) });
+    });
+    await page.waitForTimeout(800);
+    assert.deepEqual(await frames(), before);
+    assert.equal(await page.evaluate(() => document.activeElement?.classList.contains('xterm-helper-textarea')), false);
+    assert.equal(await page.evaluate(() => window.keptSocket.readyState), 1);
+    await go('/terminal/sm-1776');
+    await page.locator('.term-page').waitFor({ state: 'visible' });
+    await page.waitForTimeout(800);
+    assert.equal(state.tickets, tickets);
+    assert.equal(await page.evaluate(() => document.querySelector('.term-page') === window.keptNode), true);
+    assert.equal((await frames()).length, before.length + 1, 'one resize to the changed visible size');
+    assert.ok((await page.locator('.xterm-rows').innerText()).includes('hidden output arrived'));
+    assert.equal(await page.evaluate(() => document.activeElement?.classList.contains('xterm-helper-textarea')), true);
+    await go('/board');
+    await page.locator('.term-page').waitFor({ state: 'hidden' });
+    await go('/terminal/iter8-run');
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
+    assert.equal(await page.evaluate(() => window.keptSocket.readyState), 3);
+    assert.equal(await page.locator('.term-page').count(), 1);
+    assert.equal(state.tickets, tickets + 1);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
+test('kept terminal expires after 15 minutes, resets on return, and drops ended or stopped sessions', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const reason of ['timeout', 'ended', 'stopped']) {
+      const { page, state, errors, context } = await open(browser, { viewport: { width: 1440, height: 900 } });
+      await page.clock.install();
+      await page.goto(`${ORIGIN}/terminal/sm-1776`);
+      await page.locator('.term-page[data-connection="Live"]').waitFor();
+      const go = (path) => page.evaluate(async path => (await import('/assets/ui.js')).navigate(path), path);
+      await go('/board');
+      await page.locator('.term-page').waitFor({ state: 'hidden' });
+      if (reason === 'timeout') {
+        await page.clock.fastForward(14 * 60 * 1000);
+        assert.equal(await page.locator('.term-page').count(), 1);
+        await go('/terminal/sm-1776');
+        await page.locator('.term-page').waitFor({ state: 'visible' });
+        await page.clock.fastForward(2 * 60 * 1000);
+        assert.equal(state.tickets, 1, 'return cancels the original expiry');
+        await go('/board');
+        await page.locator('.term-page').waitFor({ state: 'hidden' });
+        await page.clock.fastForward(14 * 60 * 1000);
+        assert.equal(await page.locator('.term-page').count(), 1);
+        await page.clock.fastForward(61 * 1000);
+      } else if (reason === 'ended') {
+        await page.evaluate(() => window.sockets.at(-1).onmessage({ data: JSON.stringify({ type: 'exit' }) }));
+      } else {
+        state.sessions = state.sessions.filter(s => s.id !== 'sm-1776');
+        await page.clock.fastForward(5000);
+      }
+      await page.waitForFunction(() => !document.querySelector('.term-page'));
+      assert.equal(await page.evaluate(() => window.sockets.every(s => s.readyState === 3)), true, reason);
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+  } finally { await browser.close(); }
+});
+
+
+test('kept terminal applies appearance changes on return without reconnecting', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, state, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    await page.goto(`${ORIGIN}/terminal/sm-1776`);
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
+    const go = (path) => page.evaluate(async path => (await import('/assets/ui.js')).navigate(path), path);
+    await go('/settings#appearance');
+    await page.getByRole('radio', { name: /Solarized/ }).click();
+    await page.locator('#sm-text-size').fill('19');
+    await go('/terminal/sm-1776');
+    await page.locator('.term-page').waitFor({ state: 'visible' });
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('.term-body')).backgroundColor === 'rgb(253, 246, 227)');
+    assert.equal(await page.locator('.xterm-rows').evaluate(el => getComputedStyle(el).fontSize), '18px');
+    assert.equal(state.tickets, 1);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });

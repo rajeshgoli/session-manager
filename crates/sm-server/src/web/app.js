@@ -221,6 +221,22 @@ function App() {
 
   const page = pageFor(loc.path);
   const termId = page === 'terminal' ? decodeURIComponent(loc.path.slice('/terminal/'.length)) : null;
+  // Keep the same keyed component across page navigation, with one expiry per departure.
+  const [kept, setKept] = useState(null);
+  if (termId && (kept?.id !== termId || kept.leftAt !== null)) {
+    setKept({ id: termId, leftAt: null });
+  } else if (!termId && kept && kept.leftAt === null) {
+    setKept({ ...kept, leftAt: Date.now() });
+  }
+  const mountedId = termId || kept?.id;
+  const releaseKept = useCallback((id) => {
+    setKept((current) => current?.id === id && current.leftAt !== null ? null : current);
+  }, []);
+  useEffect(() => {
+    if (!kept || kept.leftAt === null) return;
+    const timer = setTimeout(() => releaseKept(kept.id), Math.max(0, kept.leftAt + 15 * 60 * 1000 - Date.now()));
+    return () => clearTimeout(timer);
+  }, [kept, releaseKept]);
   const kind = viewKind(page);
   const folded = sidebar[kind] !== 'open';
   const [watchDoc] = watch;
@@ -239,8 +255,8 @@ function App() {
 
   useEffect(() => {
     const current = PAGES.find((p) => p.key === page);
-    document.title = page === 'terminal' ? 'sm · Terminal' : `sm · ${current ? current.label : 'Agents'}`;
-  }, [page]);
+    document.title = page === 'terminal' ? `${sessions.find((s) => s.id === termId)?.name || termId} · sm` : `sm · ${current ? current.label : 'Agents'}`;
+  }, [page, termId, sessions]);
   // The landing reopens the last terminal you had open (D.5).
   useEffect(() => { if (termId) store('sm-term-last', termId); }, [termId]);
 
@@ -261,12 +277,15 @@ function App() {
         swap=${() => updateArrangement({ [kind]: arrangement[kind] === 'pages' ? 'agents' : 'pages' })}
         onSearch=${() => setPalette(true)} onNew=${() => setCreating(creating ? null : { prefill: {}, at: 'sidebar' })} />
       <main class="main">
-        ${term ? html`<${TerminalPage} id=${termId} watch=${watch} moon=${html`<${MoonButton} />`} />` : html`
+        ${mountedId ? html`<div key=${mountedId} hidden=${!term} style="display:flex;flex:1;min-height:0;flex-direction:column">
+          <${TerminalPage} id=${mountedId} visible=${term} onEnded=${releaseKept} watch=${watch} moon=${html`<${MoonButton} />`} />
+        </div>` : null}
+        ${!term ? html`
           <${TopBar} page=${page} offline=${offline} stale=${stale} onSearch=${() => setPalette(true)}
             creating=${creating} setCreating=${setCreating} newAgent=${newAgent('bar')} watch=${watch} />
           <${NightBanner} />
           <${HostRestartBanner} />
-          <${Page} page=${page} loc=${loc} watch=${watch} />`}
+          <${Page} page=${page} loc=${loc} watch=${watch} />` : null}
       </main>
       ${panelOpen ? html`<${Panel} openRef=${loc.open} layout=${layout} updateLayout=${updateLayout}
         beside=${term && loc.open === `agent:${termId}` ? 'terminal' : null}
