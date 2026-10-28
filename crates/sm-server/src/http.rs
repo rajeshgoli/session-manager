@@ -2127,6 +2127,10 @@ pub fn router(state: AppState) -> Router {
             "/client/review-requests/{request_id}/dismiss",
             post(client_dismiss_review_request),
         )
+        .route(
+            "/client/review-requests/{request_id}/next",
+            post(client_next_reviewer),
+        )
         .route("/btw-requests/{request_id}", get(get_btw_request))
         .route(
             "/docs",
@@ -6233,16 +6237,32 @@ fn finish_github_review_step(
     reason: &str,
     now: &str,
 ) -> Result<(), String> {
+    advance_review_step(state, db_path, request, "failed", reason, now).map(|_| ())
+}
+
+/// Ends `request`'s current reviewer step, as of the step it was read at: a
+/// request that has since moved on is left alone and `Stale` comes back.
+fn advance_review_step(
+    state: &AppState,
+    db_path: &StdPath,
+    request: &CodexReviewRequestRegistration,
+    outcome: &str,
+    reason: &str,
+    now: &str,
+) -> Result<crate::queue::ReviewStepAdvance, String> {
     let wake = no_reviewer_wake(state, request);
-    if let Some(finished) = RetainedQueueStore::finish_github_review_step_in_path(
+    let advance = RetainedQueueStore::advance_review_step_in_path(
         db_path,
         &request.id,
+        Some(request.step_index),
+        outcome,
         reason,
         now,
         &wake,
     )
-    .map_err(|error| error.to_string())?
-    {
+    .map_err(|error| error.to_string())?;
+    if let crate::queue::ReviewStepAdvance::Exhausted(finished) = &advance {
+        let finished = (**finished).clone();
         deliver_codex_review_wake_now(state, &finished);
         let author = finished
             .requester_session_id
@@ -6280,7 +6300,7 @@ fn finish_github_review_step(
             follows::notice_new_message(state, &message);
         }
     }
-    Ok(())
+    Ok(advance)
 }
 
 fn push_review_notice(state: &AppState, kind: &str, title: &str, body: &str, reader_path: &str) {
@@ -7784,6 +7804,71 @@ async fn client_owner_review_request(
     Ok(Json(codex_review_request_response(&state, assigned)?))
 }
 
+#[derive(Debug, Deserialize)]
+struct NextReviewerBody {
+    /// The step the owner saw; a request that has moved on is left alone.
+    step: i64,
+}
+
+/// Next reviewer on the Queue page (#2586): end the current reviewer step now,
+/// as its timeout would, and clean up after that reviewer. The chain moves to
+/// its next reviewer, or the author hears no reviewer is left.
+async fn client_next_reviewer(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(body): Json<NextReviewerBody>,
+) -> Result<Json<Value>, ApiError> {
+    board::owner_guard(&state, &headers, peer_addr, "POST", &uri, true)?;
+    blocking_http(move || {
+        let db_path = expand_home(&state.config.sm_send.db_path);
+        let request =
+            RetainedQueueStore::get_codex_review_request_from_path(&db_path, &request_id)?
+                .ok_or(ApiError::NotFound("Review request not found"))?;
+        let moved_on = || ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "This review has already moved on.".to_owned(),
+        };
+        if !request.is_active
+            || request.step_index != body.step
+            || request.step_state.as_deref() == Some("owner")
+        {
+            return Err(moved_on());
+        }
+        let step = review_runs::current_step(&request).map_err(|detail| ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail,
+        })?;
+        let reason = format!("skipped by {}", state.config.owner_name);
+        // Advance first: once the request names the next step, a watcher that
+        // sees the skipped run end cannot advance it a second time.
+        let advance = advance_review_step(
+            &state,
+            &db_path,
+            &request,
+            "skipped",
+            &reason,
+            &now_rfc3339(),
+        )
+        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?;
+        if advance == crate::queue::ReviewStepAdvance::Stale {
+            return Err(moved_on());
+        }
+        match step["kind"].as_str() {
+            Some("codex" | "claude") => review_runs::cleanup_step(&state, &request)?,
+            Some("paired") => review_paired::stop(&state, &request, &reason),
+            _ => {}
+        }
+        let current =
+            RetainedQueueStore::get_codex_review_request_from_path(&db_path, &request_id)?
+                .ok_or(ApiError::NotFound("Review request not found"))?;
+        Ok(Json(codex_review_request_response(&state, current)?))
+    })
+    .await
+}
+
 /// Dismiss on a "PR #n has no reviewer" item: the owner has nothing to do
 /// (the PR merged, or another review already landed). The item closes; the
 /// request stays `no_reviewer` and nothing goes to the author.
@@ -8480,6 +8565,7 @@ async fn client_queue(
         "running": running_json,
         "queued": queued_json,
         "ended": ended_json,
+        "reviews": review_runs::active_reviews(&state, &mut context)?,
     })))
     }).await
 }
@@ -25161,6 +25247,121 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn next_reviewer_skips_only_the_step_the_owner_saw() {
+        let mut config = google_auth_config();
+        let bearer = format!(
+            "Bearer {}",
+            issue_device_access_token(&config, "rajeshgoli@gmail.com", "Rajesh")
+                .unwrap()
+                .access_token
+        );
+        let next = |id: &str, step: i64| {
+            let mut request = local_request(
+                Method::POST,
+                &format!("/client/review-requests/{id}/next"),
+                Body::from(json!({ "step": step }).to_string()),
+            );
+            let headers = request.headers_mut();
+            headers.insert(AUTHORIZATION, bearer.parse().unwrap());
+            headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            request
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "sm-review-next-{}-{}",
+            std::process::id(),
+            OsRng.next_u64()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("queue.db");
+        config.usage.db_path = dir.join("usage.db").to_string_lossy().into_owned();
+        config.sm_send.db_path = db.to_string_lossy().into_owned();
+        let request = RetainedQueueStore::create_codex_review_request_in_path(
+            &db,
+            crate::queue::CreateCodexReviewRequest {
+                repo: "example/repo".into(),
+                pr_number: 7,
+                requester_session_id: Some("author".into()),
+                notify_session_id: "author".into(),
+                steer: None,
+                requested_head_sha: "0123456789012345678901234567890123456789".into(),
+                latest_request_comment_id: None,
+                latest_request_comment_url: None,
+                latest_request_posted_at: "2026-10-28T19:00:00Z".into(),
+                poll_interval_seconds: 30,
+                retry_interval_seconds: 120,
+            },
+        )
+        .unwrap();
+        RetainedQueueStore::initialize_review_chain(
+            &db,
+            &request.id,
+            &[
+                json!({"kind":"github_codex"}),
+                json!({"kind":"github_codex"}),
+            ],
+            "default",
+        )
+        .unwrap();
+        let state = AppState::new(config);
+        let rows = |state: &AppState| {
+            review_runs::active_reviews(state, &mut QueueResponseContext::new(state).unwrap())
+                .unwrap()
+        };
+        let listed = rows(&state);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0]["step"], 0);
+        assert_eq!(listed[0]["kind"], "github_codex");
+        assert_eq!(listed[0]["reviewer_label"], "GitHub Codex");
+        assert_eq!(listed[0]["next_label"], "GitHub Codex");
+        let app = router(state.clone());
+        // A step the request has already left is refused, and nothing moves.
+        let (status, _) =
+            response_json(app.clone().oneshot(next(&request.id, 1)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // The step the owner saw moves on once, logged as skipped, not failed.
+        let (status, body) =
+            response_json(app.clone().oneshot(next(&request.id, 0)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let row = RetainedQueueStore::get_codex_review_request_from_path(&db, &request.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.step_index, 1);
+        assert!(row.is_active);
+        let log: Vec<Value> = serde_json::from_str(row.steps_log_json.as_deref().unwrap()).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0]["outcome"], "skipped");
+        assert_eq!(
+            log[0]["reason"],
+            format!("skipped by {}", state.config.owner_name)
+        );
+        // A second tap on the same row, or a timeout for step 0, changes nothing.
+        let (status, _) =
+            response_json(app.clone().oneshot(next(&request.id, 0)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            RetainedQueueStore::advance_review_step_in_path(
+                &db,
+                &request.id,
+                Some(0),
+                "failed",
+                "late timeout",
+                "2026-10-28T20:00:00Z",
+                "wake",
+            )
+            .unwrap(),
+            crate::queue::ReviewStepAdvance::Stale
+        );
+        assert_eq!(rows(&state)[0]["next_label"], Value::Null);
+        // The last reviewer skipped: the request ends and the author is told.
+        let (status, body) =
+            response_json(app.clone().oneshot(next(&request.id, 1)).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "no_reviewer", "{body}");
+        assert!(rows(&state).is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

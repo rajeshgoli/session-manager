@@ -92,6 +92,39 @@ export function reviewJobText(job) {
     why: review.why === 'default' ? null : review.why,
   };
 }
+/**
+ * A Queue review row's words (#2586): which PR, who reviews it and how far
+ * along, and what Next reviewer would do.
+ */
+export function reviewRowText(review, now = Date.now()) {
+  const minutes = Math.max(0, Math.floor((now - Date.parse(review.since)) / 60000));
+  const waited = !Number.isFinite(minutes) ? '' : minutes < 1 ? 'just now' : minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+  const state = review.step_state;
+  const status = review.kind === 'github_codex'
+    ? (state === 'picked_up' ? 'Reviewing' : state === 'error_wait' || state === 'retry_posting' ? 'Retrying after a Codex error' : 'Waiting for Codex to start')
+    : review.kind === 'paired'
+      ? (state === 'waiting_reviewer' ? 'Starting the reviewer' : state === 'nudged' ? 'Reviewing · reminded' : 'Reviewing')
+      : (review.job_id ? 'Reviewing' : 'Starting');
+  const split = (label) => {
+    const match = /^(.*?) \((.*)\)$/.exec(label || '');
+    return match ? [match[1], match[2].replace(', ', ' · ')] : [label || 'Reviewer', null];
+  };
+  const [name, model] = split(review.reviewer_label);
+  const [nextName, nextModel] = review.next_label ? split(review.next_label) : [null, null];
+  return {
+    pr: `#${review.pr_number}`,
+    title: review.title || `Pull request #${review.pr_number}`,
+    context: [review.repo.split('/').pop(), `for ${review.author_name}`, review.round > 1 ? `round ${review.round}` : null].filter(Boolean).join(' · '),
+    reviewer: name,
+    model,
+    status: waited ? `${status} · ${waited}` : status,
+    ask: nextName ? `Hand to ${nextName}?` : `No one is left to review. End it and tell ${review.author_name}?`,
+    askDetail: nextModel,
+    confirm: nextName ? 'Hand over' : 'End review',
+    done: nextName ? `PR #${review.pr_number} handed to ${nextName}` : `Review of PR #${review.pr_number} ended; ${review.author_name} knows`,
+  };
+}
+
 /** Distinct job colours, in order; each is a CSS token in queue.css. */
 export const JOB_COLORS = 6;
 const GIB = 2 ** 30;

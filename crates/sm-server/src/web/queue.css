@@ -109,3 +109,21 @@ button.q-now-key { cursor:pointer; } button.q-now-key:hover, button.q-now-key:fo
 .q-pin-note.on { color:var(--ink-2); }
 @media (max-width:600px) { .q-now .q-heading .muted { display:none; } .q-now-row { grid-template-columns:3.6rem minmax(0,1fr); gap:4px 10px; } .q-now-val { grid-column:2; text-align:left; font-size:.867rem; } .q-now-val small { display:inline; margin-left:6px; } .q-now-legend { grid-template-columns:minmax(0,1fr); } .q-now-key { flex-wrap:wrap; row-gap:1px; } .q-now-nums { flex-basis:100%; padding-left:18px; font-size:.8rem; } }
 @media (prefers-reduced-motion: reduce) { .q-stack i, .q-now-key { transition:none; } }
+
+/* Reviews in progress (#2586): the PR on the left, who holds it, then Next reviewer. */
+.q-review { display:grid; grid-template-columns:minmax(0,1fr) 13rem auto; align-items:center; gap:4px 18px; padding:11px 0; border-bottom:1px solid var(--line); }
+.q-review:last-child { border-bottom:0; padding-bottom:2px; }
+.q-review small { display:block; color:var(--ink-3); font-size:.867rem; margin-top:2px; }
+.q-review-pr { min-width:0; color:inherit; text-decoration:none; }
+.q-review-pr:hover .q-review-title { text-decoration:underline; }
+.q-review-title { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.q-review-title b { font-weight:650; margin-right:4px; }
+.q-review-who b { font-weight:600; }
+.q-review-who small { display:inline; margin:0; }
+.q-review-who > small { display:block; margin-top:2px; }
+.q-review-act { justify-self:end; }
+.q-review-ask { grid-column:1/-1; display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; font-size:.933rem; margin-top:4px; }
+.q-review-act .btn[aria-pressed="true"] { background:var(--panel-2); border-color:var(--ink-3); }
+.q-review-ask > span { color:var(--ink-2); }
+.q-review-ask small { display:inline; margin:0; }
+@media(max-width:600px) { .q-review { grid-template-columns:minmax(0,1fr) auto; } .q-review-pr { grid-column:1/-1; } .q-review-title { white-space:normal; } .q-review-ask { justify-content:flex-start; } .q-review-ask > span { flex-basis:100%; } }

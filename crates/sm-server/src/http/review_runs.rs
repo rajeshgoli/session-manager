@@ -80,6 +80,53 @@ pub(super) fn job_fields_with_context(
     let Some(r) = crate::queue::get_codex_review_request_conn(messages, id)? else {
         return Ok(None);
     };
+    request_fields(state, &r, index, context).map(Some)
+}
+
+/// The Queue page's review rows (#2586): every active request on a reviewer
+/// chain, whatever kind of reviewer holds it, with what Next reviewer would do.
+/// A request the owner took personally is the owner's own work, not listed.
+pub(super) fn active_reviews(
+    state: &AppState,
+    context: &mut QueueResponseContext,
+) -> Result<Vec<Value>> {
+    let db = expand_home(&state.config.sm_send.db_path);
+    let mut rows = Vec::new();
+    for r in RetainedQueueStore::list_codex_review_requests_from_path(&db, Default::default())? {
+        if !r.is_active || r.chain_json.is_none() || r.step_state.as_deref() == Some("owner") {
+            continue;
+        }
+        let index = r.step_index.max(0) as usize;
+        let chain: Vec<Value> =
+            serde_json::from_str(r.chain_json.as_deref().unwrap_or("[]")).unwrap_or_default();
+        let mut row = request_fields(state, &r, index, context)?;
+        row["step"] = json!(r.step_index);
+        row["kind"] = chain
+            .get(index)
+            .map_or(Value::Null, |step| step["kind"].clone());
+        row["step_state"] = json!(r.step_state);
+        row["since"] = json!(r.step_started_at.as_deref().unwrap_or(&r.requested_at));
+        row["job_id"] = json!(r.run_job_id);
+        row["next_label"] = chain
+            .get(index + 1)
+            .map_or(Value::Null, |step| json!(review::label(step)));
+        row["title"] = json!(super::claims::work_claim_store(state)
+            .item(&crate::work_claims::canonical_repo(&r.repo), r.pr_number)
+            .ok()
+            .flatten()
+            .map(|item| item.title)
+            .filter(|title| !title.is_empty()));
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn request_fields(
+    state: &AppState,
+    r: &CodexReviewRequestRegistration,
+    index: usize,
+    context: &mut QueueResponseContext,
+) -> Result<Value> {
     let chain: Vec<Value> =
         serde_json::from_str(r.chain_json.as_deref().unwrap_or("[]")).unwrap_or_default();
     let log: Vec<Value> =
@@ -116,11 +163,11 @@ pub(super) fn job_fields_with_context(
         context.review_authors.insert(author, name.clone());
         name
     };
-    Ok(Some(json!({
+    Ok(json!({
         "request_id": r.id, "repo": r.repo, "pr_number": r.pr_number, "round": r.round,
-        "reviewer_label": chain.get(index).map(review::label).or(r.reviewer_label),
+        "reviewer_label": chain.get(index).map(review::label).or_else(|| r.reviewer_label.clone()),
         "policy_source": r.policy_source, "why": why, "author_name": author_name,
-    })))
+    }))
 }
 
 pub(super) async fn start_github(
@@ -795,7 +842,7 @@ fn posting_still_current(
     Ok(true)
 }
 
-fn cleanup_step(state: &AppState, r: &CodexReviewRequestRegistration) -> Result<()> {
+pub(super) fn cleanup_step(state: &AppState, r: &CodexReviewRequestRegistration) -> Result<()> {
     if let Some(job) = RetainedQueueStore::owned_queue_job(&queue_dir(state), &owner(r))? {
         if matches!(job.state.as_str(), "running" | "pending") {
             RetainedQueueStore::cancel_queue_job_in_state_dir(
