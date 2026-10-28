@@ -47,6 +47,7 @@ const ASSETS: &[Asset] = &[
     asset!("artifacts-model.js", JS),
     asset!("artifacts.css", "text/css; charset=utf-8"),
     asset!("queue-model.js", JS),
+    asset!("meters.js", JS),
     asset!("queue-start.js", JS),
     asset!("analytics.js", JS),
     asset!("queue.css", "text/css; charset=utf-8"),
@@ -281,7 +282,8 @@ mod tests {
         // Overnight mode's moon, banner and settings (#2494) add ~4 KiB.
         // Clickable terminal file paths (#2502) add ~3 KiB.
         // Web-page mouse and Copy in the terminal (#2540) add ~5 KiB.
-        const BUDGET: usize = 500 * 1024;
+        // One sidebar on every page (#2550) adds ~3 KiB; compact meters (#2551) ~2 KiB.
+        const BUDGET: usize = 508 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",

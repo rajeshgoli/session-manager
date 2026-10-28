@@ -6,7 +6,7 @@ import { render } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   html, api, bus, build, network, clientNav, screenFor, pageData, usePoll, useShared, setShared, shared, stored, store, panels, config,
-  openPanel, closePanel, navigate, openItem, toast, typingIn, Icon, gigabytes, basename, meterBand,
+  openPanel, closePanel, navigate, openItem, toast, typingIn, Icon, basename,
 } from './ui.js';
 import { BoardPage } from './board.js';
 import { InboxPage } from './inbox.js';
@@ -14,6 +14,7 @@ import { HistoryPage } from './history.js';
 import { GuestbookPage } from './guestbook.js';
 import { AgentCard, HostRestartBanner, SECTION_TONE } from './agents.js';
 import { QueuePage } from './queue.js';
+import { Dash } from './meters.js';
 import { ArtifactsPage } from './artifacts.js';
 import { AnalyticsPage } from './analytics.js';
 import { SettingsPage } from './settings.js';
@@ -603,93 +604,6 @@ function Home({ watch }) {
   return html`<div class="content home-list"><${Switcher} groups=${groups} currentId=${null} idleOpen=${idleOpen}
     toggleIdle=${() => { store(IDLE_KEY, !idleOpen); setIdleOpen(!idleOpen); }}
     pick=${(agent) => navigate(`/terminal/${encodeURIComponent(agent.id)}`)} reload=${reload} /></div>`;
-}
-
-// ---- usage dash (sm#1881) ------------------------------------------------------
-
-// Claude always shows its two windows; Codex shows what it reports.
-const ALWAYS = {
-  claude: [
-    { window: 'five_hour', idle: 'Starts on next use' },
-    { window: 'week', idle: 'No reading' },
-  ],
-  codex: [],
-};
-const WINDOW_LABEL = { five_hour: ['5-hour', '5h'], week: ['This week', 'Wk'] };
-
-/** Today: the time; within a week: weekday and time; else the date. */
-function when(iso) {
-  const at = Date.parse(iso || '');
-  if (!Number.isFinite(at)) return '';
-  const date = new Date(at);
-  const time = date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }).toLowerCase();
-  if (new Date().toDateString() === date.toDateString()) return time;
-  if (at - Date.now() < 6 * 86400000) return `${date.toLocaleDateString([], { weekday: 'short' })} ${time}`;
-  return `${date.toLocaleDateString([], { day: 'numeric', month: 'short' })} ${time}`;
-}
-
-function DashMeter({ label, short, total, queue, text, brief = text, lines = [], kind = '', title = '' }) {
-  const width = (value) => `width:${Math.max(0, Math.min(100, value || 0))}%`;
-  const color = meterBand((total || 0) / 100, kind);
-  return html`<div class="dm" style=${`--meter-color:var(--${color})`} title=${title || `${label} ${text}`}>
-    <span class="dl"><span class="lb">${label}</span><span class="sh">${short}</span><b class="full">${text}</b><b class="brief">${brief}</b></span>
-    <i><s style=${`${width(total)};opacity:${typeof queue === 'number' ? '.4' : '1'}`}></s>${typeof queue === 'number' ? html`<s class="q" style=${width(Math.min(total || 0, queue))}></s>` : null}</i>
-    ${lines.map(([line, tone]) => html`<small class=${tone || ''}>${line}</small>`)}
-  </div>`;
-}
-
-function usageMeter(spec, meter) {
-  const [windowLabel, windowShort] = WINDOW_LABEL[spec.window];
-  const [label, short] = spec.scope
-    ? [`${spec.scope} ${spec.window === 'five_hour' ? '5-hour' : 'week'}`, spec.scope.slice(0, 2)] : [windowLabel, windowShort];
-  spec = { ...spec, label: spec.account ? `${label} · ${spec.account}` : label, short };
-  if (!meter) return { ...spec, total: 0, text: '–', lines: [[spec.idle]] };
-  const pct = Math.round(meter.percent);
-  const lines = [[`Resets ${when(meter.resets_at)}`]];
-  if (meter.pace?.kind === 'runs_out') lines.push([`Out ${when(meter.pace.at)}`, pct >= 85 ? 'red' : 'amber']);
-  const pace = meter.pace?.kind === 'runs_out' ? ` · runs out ${when(meter.pace.at)}`
-    : meter.pace?.kind === 'on_pace' ? ` · on pace for ${Math.round(meter.pace.percent)}% at reset` : '';
-  return {
-    ...spec, total: meter.percent, text: `${pct}%`, lines,
-    title: `${spec.label}${meter.label ? ` (${meter.label})` : ''}: ${pct}% used · resets ${when(meter.resets_at)}${pace} · read ${when(meter.observed_at)}`,
-  };
-}
-
-function Dash() {
-  // The rail's meters are the shell's own reads, never the owner's (spec 2170 A.5).
-  const [host] = usePoll(() => api('/client/host-status'), 10000, [], { background: true });
-  const [usage] = usePoll(() => api('/client/usage/meters'), 30000, [], { background: true });
-  const mac = host && host.available !== false ? host : null;
-  const memTotal = mac && mac.memory_total_bytes;
-  const memPct = (bytes) => (memTotal ? (100 * bytes) / memTotal : 0);
-  const sections = usage ? ['claude', 'codex'].map((provider) => {
-    const mine = (usage.meters || []).filter((m) => m.provider === provider);
-    // Several accounts with current windows each name theirs.
-    const several = new Set(mine.map((m) => m.account_key)).size > 1;
-    const rows = ALWAYS[provider]
-      .filter((spec) => !mine.some((m) => m.window === spec.window && !m.scope))
-      .map((spec) => usageMeter(spec));
-    for (const m of mine) {
-      rows.push(usageMeter({ window: m.window, scope: m.scope, account: several ? (m.label || m.account_key).split('@')[0] : '' }, m));
-    }
-    const order = (m) => (m.window === 'five_hour' ? 0 : m.scope ? 2 : 1);
-    rows.sort((a, b) => order(a) - order(b));
-    return { provider, rows: rows.length ? rows : [usageMeter({ window: 'week', idle: 'No reading' })] };
-  }) : [];
-  return html`<div class="dash" aria-label="Usage">
-    ${sections.map(({ provider, rows }) => html`<a class="dh" href="/analytics/spend" title=${`${provider === 'claude' ? 'Claude' : 'Codex'} usage · open Analytics`}
-        onClick=${(e) => { e.preventDefault(); navigate('/analytics/spend'); }}>${provider === 'claude' ? 'Claude' : 'Codex'}</a>
-      ${rows.map((m) => html`<${DashMeter} key=${`${provider}:${m.label}`} ...${m} />`)}`)}
-    ${mac ? html`<span class="dh">Mac</span>
-      <${DashMeter} label="Memory" short="Mem" kind="memory" total=${memPct(mac.memory_used_bytes)}
-        queue=${typeof mac.queue_memory_bytes === 'number' ? memPct(mac.queue_memory_bytes) : undefined}
-        text=${`${gigabytes(mac.memory_used_bytes)}/${gigabytes(memTotal)}G`} brief=${`${Math.round(memPct(mac.memory_used_bytes))}%`}
-        title=${`Memory ${gigabytes(mac.memory_used_bytes)}/${gigabytes(memTotal)}G${typeof mac.queue_memory_bytes === 'number' ? ` · queue ${gigabytes(mac.queue_memory_bytes)}G` : ''}`} />
-      <${DashMeter} label="CPU" short="CPU" kind="cpu" total=${mac.cpu_percent} queue=${mac.queue_cpu_percent}
-        text=${`${Math.round(mac.cpu_percent || 0)}%`} />
-      <${DashMeter} label="GPU" short="GPU" kind="gpu" total=${mac.gpu_percent} queue=${mac.queue_gpu_percent}
-        text=${typeof mac.gpu_percent === 'number' ? `${Math.round(mac.gpu_percent)}%` : '–'} />` : null}
-  </div>`;
 }
 
 // ---- top bar ----------------------------------------------------------------
