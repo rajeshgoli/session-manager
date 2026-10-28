@@ -644,7 +644,10 @@ test('links: URLs, OSC 8 and local file paths open in a new tab, sm documents in
         + '\x1b]8;;https://sm.example.com/docs/memo\x07the memo\x1b]8;;\x07\r\n'
         + '\x1b]8;;javascript:alert(1)\x07bad\x1b]8;;\x07\r\n'
         + '/Users/rajesh/memo.html\r\n'
-        + 'src/main.rs:42\r\n';
+        + 'src/main.rs:42\r\n'
+        // Claude Code links a file path with OSC 8 file://, wrapped onto a second row (#2597).
+        + '\x1b]8;id=f1;file://studio.local/private/tmp/shots/needs%20you.png\x07[image]/private/tmp/shots/\x1b]8;;\x07\r\n'
+        + '\x1b]8;id=f1;file://studio.local/private/tmp/shots/needs%20you.png\x07   needs you.png\x1b]8;;\x07\r\n';
       window.opened = [];
       window.open = (url, target, features) => { window.opened.push([url, target, features]); return null; };
     });
@@ -679,10 +682,12 @@ test('links: URLs, OSC 8 and local file paths open in a new tab, sm documents in
     await click(1, 2);
     await click(3, 3);
     await click(3, 4);
+    await click(5, 6);
     assert.deepEqual(await page.evaluate(() => window.opened), [
       ['https://github.com/rajeshgoli/session-manager/pull/2177', '_blank', 'noopener,noreferrer'],
       ['/client/terminal/file?session=iter8-run&path=%2FUsers%2Frajesh%2Fmemo.html', '_blank', 'noopener,noreferrer'],
       ['/client/terminal/file?session=iter8-run&path=src%2Fmain.rs', '_blank', 'noopener,noreferrer'],
+      ['/client/terminal/file?session=iter8-run&path=%2Fprivate%2Ftmp%2Fshots%2Fneeds%20you.png', '_blank', 'noopener,noreferrer'],
     ]);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
