@@ -107,7 +107,7 @@
 </style>
 
 <h1>2594 — Open sm doc links in the phone app</h1>
-<p class="sans"><small>Author: fit-and-finish agent <code>e7838871</code> · Ticket #2594 · Revision 2</small></p>
+<p class="sans"><small>Author: fit-and-finish agent <code>e7838871</code> · Ticket #2594 · Revision 3</small></p>
 
 <h2>Memo</h2>
 
@@ -181,6 +181,7 @@ After the change, a fixed list of curl probes (Appendix B) must show the login r
 
 <h3>FAQ — what changed since the last revision</h3>
 <p><b>Is the public exception exact now?</b> Yes. Revision 1 relied on sm-server alone for paths beneath the file. Cloudflare's rule covers those paths too, so a second Cloudflare rule now puts them back behind login. The probes accept nothing but the login redirect for them.</p>
+<p><b>Can a half-finished Cloudflare change leave paths open?</b> No. The login rule for the paths beneath the file is installed and checked first, and the public rule is installed last, so any failure stops with nothing new made public.</p>
 <p><b>Does the file grant anything besides opening links?</b> Android also uses this association for passkeys. sm has none, so nothing changes today. It is the reason to revisit the signing key if sm ever adds passkey login on this host.</p>
 
 <hr class="appendix-divider">
@@ -203,9 +204,9 @@ Fingerprints are accepted as 64 hex digits, with or without colons, and served a
 <h3>B. Cloudflare change, probes and rollback</h3>
 <p>The change uses account <code>cloudflare_access.account_id</code> and token <code>cloudflare_access.api_token</code> from the live config. The existing login application (<code>cloudflare_access.browser.app_id</code>) is not modified.</p>
 <ol>
-<li>Create a reusable policy: <code>POST /accounts/{account}/access/policies</code> with <code>{"name":"sm assetlinks: public (Android App Links)","decision":"bypass","include":[{"everyone":{}}]}</code>. Record the returned id.</li>
-<li>Create the public application: <code>POST /accounts/{account}/access/apps</code> with <code>{"name":"sm assetlinks (public)","type":"self_hosted","domain":"sm.rajeshgo.li/.well-known/assetlinks.json","policies":[{"id":"&lt;policy id&gt;","precedence":1}]}</code>. Cloudflare applies the most specific application to a path, and a path application also covers the paths beneath it.</li>
-<li>Close the paths beneath it: <code>GET /accounts/{account}/access/apps/{browser app id}</code>. Then create <code>{"name":"sm assetlinks (below: login)","type":"self_hosted","domain":"sm.rajeshgo.li/.well-known/assetlinks.json/*"}</code>, with <code>policies</code> set to the browser application's policy ids in the same order (<code>[{"id":…,"precedence":n}]</code>). A wildcard path does not cover its parent, so the exact file stays public. If any browser-application policy has no reusable id, stop and report rather than inventing a policy. This application does not receive later device-policy changes (<code>mobile_devices.rs</code> updates only the browser application). It guards only paths sm-server answers with "not found", so being stricter there is harmless.</li>
+<li>Close the paths beneath the file first: <code>GET /accounts/{account}/access/apps/{browser app id}</code>. If any of its policies has no reusable id, stop and report; nothing has changed yet. Otherwise create <code>{"name":"sm assetlinks (below: login)","type":"self_hosted","domain":"sm.rajeshgo.li/.well-known/assetlinks.json/*"}</code>, with <code>policies</code> set to the browser application's policy ids in the same order (<code>[{"id":…,"precedence":n}]</code>). Confirm with <code>curl</code> that <code>/.well-known/assetlinks.json/x</code> still answers <code>302</code> to login. A wildcard path does not cover its parent, so this application leaves the exact file as it was (behind login). It does not receive later device-policy changes (<code>mobile_devices.rs</code> updates only the browser application). It guards only paths sm-server answers with "not found", so being stricter there is harmless.</li>
+<li>Create the Bypass policy: <code>POST /accounts/{account}/access/policies</code> with <code>{"name":"sm assetlinks: public (Android App Links)","decision":"bypass","include":[{"everyone":{}}]}</code>. On failure, stop. The "below" application alone changes nothing visible.</li>
+<li>Last, create the public application: <code>POST /accounts/{account}/access/apps</code> with <code>{"name":"sm assetlinks (public)","type":"self_hosted","domain":"sm.rajeshgo.li/.well-known/assetlinks.json","policies":[{"id":"&lt;bypass policy id&gt;","precedence":1}]}</code>. Cloudflare applies the most specific application to a path. A path application also covers the paths beneath it, but those are already claimed by the more specific "below" application. If this call fails or its response is unclear, list the account's applications and delete any "sm assetlinks (public)" before stopping.</li>
 <li>Record both application ids and the Bypass policy id on ticket #2594.</li>
 <li>Probes, run from a machine with no Cloudflare login cookie (<code>curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n'</code>):
 <table>
