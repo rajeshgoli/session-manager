@@ -1251,11 +1251,34 @@ impl TmuxRuntime {
         // sm names the agent in its own chrome and gives it one window, so tmux's
         // status line only repeats ids and costs a row (#2577).
         let _ = self.run_tmux(["set-option", "-g", "status", "off"]);
+        // Claude Code and Codex label links with OSC 8; tmux forwards those only to
+        // clients whose terminal has the hyperlinks feature, and the web terminal does (#2592).
+        if !self
+            .server_option("terminal-features")
+            .contains("hyperlinks")
+        {
+            let _ = self.run_tmux(["set-option", "-as", "terminal-features", ",*:hyperlinks"]);
+        }
         if !self.tmux_native_scrollback {
             return;
         }
-        let current = self
-            .tmux_command(["show-options", "-gqv", "terminal-overrides"])
+        if self
+            .server_option("terminal-overrides")
+            .contains("smcup@:rmcup@")
+        {
+            return;
+        }
+        let _ = self.run_tmux([
+            "set-option",
+            "-as",
+            "terminal-overrides",
+            ",*:smcup@:rmcup@",
+        ]);
+    }
+
+    /// A global server option's value, or empty when tmux cannot say.
+    fn server_option(&self, name: &str) -> String {
+        self.tmux_command(["show-options", "-gqv", name])
             .ok()
             .and_then(|mut command| {
                 command
@@ -1266,16 +1289,7 @@ impl TmuxRuntime {
             })
             .filter(|output| output.status.success())
             .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
-            .unwrap_or_default();
-        if current.contains("smcup@:rmcup@") {
-            return;
-        }
-        let _ = self.run_tmux([
-            "set-option",
-            "-as",
-            "terminal-overrides",
-            ",*:smcup@:rmcup@",
-        ]);
+            .unwrap_or_default()
     }
 
     fn pane_in_mode(&self, tmux_session: &str) -> Option<i32> {
@@ -4983,10 +4997,15 @@ esac
             "-L session-manager set-option -g status off",
             focus_events + 1,
         );
+        let hyperlinks = position_after(
+            &lines,
+            "-L session-manager set-option -as terminal-features ,*:hyperlinks",
+            status_off + 1,
+        );
         let terminal_overrides = position_after(
             &lines,
             "-L session-manager set-option -as terminal-overrides ,*:smcup@:rmcup@",
-            status_off + 1,
+            hyperlinks + 1,
         );
         let history_limit = position_after(
             &lines,
@@ -5106,6 +5125,7 @@ esac
         assert!(log.contains("new-session -d -s sm-test"));
         assert!(!log.contains("set-option -g focus-events on"));
         assert!(!log.contains("set-option -g status off"));
+        assert!(!log.contains("terminal-features ,*:hyperlinks"));
         assert!(!log.contains("terminal-overrides ,*:smcup@:rmcup@"));
         assert!(!log.contains("-L session-manager"));
         assert!(!log.contains(SERVER_ANCHOR_SESSION));
