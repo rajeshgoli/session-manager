@@ -13,6 +13,14 @@ export function fileMatches(text) {
   return matches;
 }
 
+/** The local path of an OSC 8 `file://` link, which Claude Code uses for file paths; else null. */
+export function oscFilePath(uri) {
+  try {
+    const url = new URL(uri);
+    return url.protocol === 'file:' && url.pathname.length > 1 ? decodeURIComponent(url.pathname) : null;
+  } catch (_) { return null; }
+}
+
 export const fileHref = (id, path) => `/client/terminal/file?session=${encodeURIComponent(id)}&path=${encodeURIComponent(path)}`;
 
 // Web links: xterm's web-links pattern, kept to http(s) URLs that parse.

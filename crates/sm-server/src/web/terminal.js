@@ -8,7 +8,7 @@ import { chooseRoute, shellBrowserAllowed, relayRoute, rememberRoute, routeText,
 import { NotesView } from './notes.js';
 import { CONTRAST_FLOOR, THEME_KEY, isLight, terminalTheme } from './terminal-theme.js';
 import { installImagePaste } from './terminal-images.js';
-import { installFileLinks } from './terminal-files.js';
+import { installFileLinks, oscFilePath, fileHref } from './terminal-files.js';
 import { installPageMouse } from './terminal-mouse.js';
 import { isShell, shellFact, ShellCloseButton, ShellAwayPanel, ShellMenu, ShellName, setShellHidden, hiddenShells, HiddenShells } from './shell.js';
 import './vendor/xterm.js';
@@ -259,8 +259,14 @@ export function TerminalPage({ id, watch, moon, open, visible = true, onEnded })
     const terminal = new window.Terminal({
       fontFamily: '"SF Mono", Menlo, monospace', fontSize: parseFloat(getComputedStyle(document.documentElement).fontSize) - 1, cursorBlink: true,
       lineHeight: 1.12, scrollback: 10000, minimumContrastRatio: CONTRAST_FLOOR,
-      // OSC 8 links, without xterm's confirm dialog.
-      linkHandler: { activate: openLink, allowNonHttpProtocols: false },
+      // OSC 8 links, without xterm's confirm dialog. Claude Code links file paths as
+      // file://, which open in the file view like a plain path does (#2597); other schemes do nothing.
+      linkHandler: { allowNonHttpProtocols: true, activate: (event, uri) => {
+        const path = oscFilePath(uri);
+        if (!path) { openLink(event, uri); return; }
+        event?.preventDefault?.();
+        openTarget(fileHref(id, path));
+      } },
     });
     const fit = new window.FitAddon.FitAddon();
     terminal.loadAddon(fit);
