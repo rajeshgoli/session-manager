@@ -530,6 +530,67 @@ test('the bar keeps the last ticket after release and opens tickets and PRs on G
   } finally { await browser.close(); }
 });
 
+test('the needs-you pill and ⌘. open the thread or the doc, and ⌘. comes back to the terminal (#2591)', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+      const { page, state, errors } = await open(browser, { viewport });
+      const ticket = { kind: 'ticket', repo: 'owner/repo', number: 2200, title: 'Everyone just got promoted to exec' };
+      state.sessions = state.sessions.map((agent) => agent.id === 'sm-1726-engineer' ? { ...agent, claims: [ticket] }
+        : agent.id === 'sm-1776' ? { ...agent, claims: [ticket], attention: { ...agent.attention, section: 'you' },
+          docs: [{ id: 'd1', title: 'Everyone just got promoted to exec', reader_path: '/docs/repo/essay.md?version=1f2be8f70691' }],
+          facts: { ...agent.facts, you: { kind: 'doc_review', since: ago(4), text: 'Review: Everyone just got promoted to exec', more: 0, doc_id: 'd1', dismissible: true } } }
+        : agent);
+      // A message opens its thread beside the terminal; ⌘. closes it and the terminal has the keys again.
+      await page.goto(`${ORIGIN}/terminal/sm-1726-engineer`);
+      await page.locator('.term-page[data-connection="Live"]').waitFor();
+      const pill = page.locator('.term-bar .term-you');
+      await pill.waitFor();
+      assert.match(await pill.innerText(), viewport.width > 900 ? /Read message\s*7m\s*⌘\./ : /^Read message$/);
+      assert.match(await pill.getAttribute('title'), /one manual Chrome check/);
+      if (SHOTS) await page.screenshot({ path: `${SHOTS}/terminal-needs-you-${viewport.width}.png` });
+      await pill.click();
+      await page.waitForFunction(() => new URLSearchParams(location.search).get('open') === 'thread:sm-1726-engineer');
+      assert.equal(new URL(page.url()).pathname, '/terminal/sm-1726-engineer');
+      assert.equal(await pill.getAttribute('aria-pressed'), 'true');
+      if (SHOTS) await page.screenshot({ path: `${SHOTS}/terminal-needs-you-thread-${viewport.width}.png` });
+      if (viewport.width > 900) {
+        await page.keyboard.press('Meta+Period');
+        await page.waitForFunction(() => !new URLSearchParams(location.search).get('open'));
+        await page.waitForFunction(() => document.activeElement?.classList.contains('xterm-helper-textarea'));
+        await page.keyboard.press('Meta+Period');
+        await page.waitForFunction(() => new URLSearchParams(location.search).get('open') === 'thread:sm-1726-engineer');
+      }
+      // A doc out for review opens in the document view; ⌘. there returns to the terminal it came from.
+      await page.goto(`${ORIGIN}/terminal/sm-1776`);
+      await page.locator('.term-page[data-connection="Live"]').waitFor();
+      await pill.waitFor();
+      assert.match(await pill.innerText(), /^Review doc/);
+      if (viewport.width > 900) {
+        if (SHOTS) await page.screenshot({ path: `${SHOTS}/terminal-needs-you-doc-${viewport.width}.png` });
+        await page.locator('.term-body').click();
+        await page.keyboard.press('Meta+Period');
+        await page.waitForFunction(() => location.pathname === '/read/docs/repo/essay.md');
+        assert.equal(new URL(page.url()).searchParams.get('version'), '1f2be8f70691');
+        await page.keyboard.press('Meta+Period');
+        await page.waitForFunction(() => location.pathname === '/terminal/sm-1776');
+      } else {
+        await pill.click();
+        await page.waitForFunction(() => location.pathname === '/read/docs/repo/essay.md');
+      }
+      // Answered: the pill goes away. A permission prompt is on screen already, so it gets none.
+      state.sessions = state.sessions.map((agent) => agent.id === 'sm-1776'
+        ? { ...agent, facts: { ...agent.facts, you: { kind: 'prompt', since: ago(1), text: 'Allow prompt in its terminal', more: 0 } } } : agent);
+      await page.goto(`${ORIGIN}/terminal/sm-1776`);
+      await page.locator('.term-page[data-connection="Live"]').waitFor();
+      // Live means the watch poll has loaded this agent, so its bar is drawn.
+      assert.equal(await pill.count(), 0);
+      assert.deepEqual(errors, []);
+      await page.context().close();
+    }
+  } finally { await browser.close(); }
+});
+
 test('Report a bug: typing goes to the dialog, not the terminal', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {

@@ -285,7 +285,8 @@ mod tests {
         // main at 4483745 had reached 514 KiB unbudgeted; links Claude Code or Codex
         // split across rows (#2580) add ~3 KiB.
         // Queue review rows with Next reviewer (#2586) add ~4 KiB.
-        const BUDGET: usize = 524 * 1024;
+        // main had since reached 524 KiB; the terminal's needs-you pill (#2591) adds ~2 KiB.
+        const BUDGET: usize = 528 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",

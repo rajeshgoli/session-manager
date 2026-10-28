@@ -385,15 +385,39 @@ button.sw-sec { cursor: pointer; }
 .term-bar .icon-btn.on { color: var(--accent); }
 .term-bar.wide .sp { flex: 1; }
 .term-who { display: flex; align-items: center; gap: 8px; min-width: 0; flex: none; }
+.term-who .t { min-width: 4em; }
+.term-who .ring, .term-who .sw-dot { flex: none; }
 /* The agent's ticket in the bar's middle (2543 C): it alone shrinks, with an ellipsis. */
 .term-ticket { flex: 0 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 7px; overflow: hidden; white-space: nowrap; font-size: .933rem; }
 .term-ticket .tk { color: var(--ink); font-weight: 600; flex: none; }
 .term-ticket .ttl { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .term-ticket .repo { color: var(--ink-3); flex: none; }
 a.term-ticket { text-decoration: none; color: inherit; }
+/* What the agent needs from you (#2591): one pink pill, the bar's only filled control. */
+.term-you { flex: none; display: inline-flex; align-items: center; gap: 7px; height: 26px; padding: 0 6px 0 10px; border: 0; border-radius: 13px;
+  font: inherit; font-size: .9rem; font-weight: 600; line-height: 1; white-space: nowrap; cursor: pointer;
+  color: var(--magenta); background: color-mix(in srgb, var(--magenta) 13%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--magenta) 30%, transparent);
+  transition: background .15s ease, box-shadow .15s ease, transform .1s ease; }
+.term-you:hover { background: color-mix(in srgb, var(--magenta) 20%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--magenta) 50%, transparent); }
+.term-you:active { transform: scale(.97); }
+.term-you:focus-visible { outline: 2px solid var(--magenta); outline-offset: 2px; }
+.term-you.on { background: color-mix(in srgb, var(--magenta) 26%, transparent); box-shadow: inset 0 0 0 1.5px var(--magenta); }
+/* With a panel open the bar is narrower: the label stays, the age and key hint go to the tooltip. */
+.app.with-panel .term-you .age, .app.with-panel .term-you kbd { display: none; }
+.app.with-panel .term-bar.wide .term-you { padding-right: 10px; }
+.term-you .pulse { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; animation: term-you-pulse 2.4s ease-out infinite; }
+.term-you.on .pulse { animation: none; }
+.term-you .age { font-weight: 500; opacity: .75; font-variant-numeric: tabular-nums; }
+.term-you kbd { font: inherit; font-size: .8rem; font-weight: 500; padding: 3px 6px; border-radius: 9px; background: color-mix(in srgb, currentColor 12%, transparent); }
+.term-bar:not(.wide) .term-you { padding-right: 10px; }
+@keyframes term-you-pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--magenta) 55%, transparent); } 70%, 100% { box-shadow: 0 0 0 6px transparent; } }
+@media (prefers-reduced-motion: reduce) { .term-you .pulse { animation: none; } }
 a.term-ticket:hover .tk, a.term-ticket:hover .ttl { text-decoration: underline; }
 .term-bar.wide > * { flex: none; }
 .term-bar.wide > .term-ticket { flex: 0 1 auto; }
+/* When the ticket has given all its room, the name shortens rather than push actions under a panel. */
+.term-bar.wide > .term-who { flex: 0 .05 auto; min-width: 8.5rem; }
 .term-icons { display: flex; align-items: center; gap: 2px; }
 .term-bar.wide .term-connection { color: var(--amber); }
 .term-bar .t { max-width: 20vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
