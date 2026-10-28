@@ -1248,6 +1248,9 @@ impl TmuxRuntime {
             return;
         }
         let _ = self.run_tmux(["set-option", "-g", "focus-events", "on"]);
+        // sm names the agent in its own chrome and gives it one window, so tmux's
+        // status line only repeats ids and costs a row (#2577).
+        let _ = self.run_tmux(["set-option", "-g", "status", "off"]);
         if !self.tmux_native_scrollback {
             return;
         }
@@ -4975,10 +4978,15 @@ esac
             "-L session-manager set-option -g focus-events on",
             bootstrap + 1,
         );
+        let status_off = position_after(
+            &lines,
+            "-L session-manager set-option -g status off",
+            focus_events + 1,
+        );
         let terminal_overrides = position_after(
             &lines,
             "-L session-manager set-option -as terminal-overrides ,*:smcup@:rmcup@",
-            focus_events + 1,
+            status_off + 1,
         );
         let history_limit = position_after(
             &lines,
@@ -5097,6 +5105,7 @@ esac
 
         assert!(log.contains("new-session -d -s sm-test"));
         assert!(!log.contains("set-option -g focus-events on"));
+        assert!(!log.contains("set-option -g status off"));
         assert!(!log.contains("terminal-overrides ,*:smcup@:rmcup@"));
         assert!(!log.contains("-L session-manager"));
         assert!(!log.contains(SERVER_ANCHOR_SESSION));
