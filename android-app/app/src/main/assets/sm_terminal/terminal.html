@@ -832,20 +832,25 @@
       return scrollTerminalByLines(parsed, Number(clientX), Number(clientY));
     };
 
-    window.smCopySelection = function() {
-      let text = term.getSelection() || "";
-      if (!text) {
-        const buffer = term.buffer.active;
-        const lines = [];
-        for (let i = 0; i < buffer.length; i += 1) {
-          const line = buffer.getLine(i);
-          if (line) {
-            lines.push(line.translateToString(true));
-          }
+    function bufferText(from, to) {
+      const buffer = term.buffer.active;
+      const lines = [];
+      for (let i = from; i < to; i += 1) {
+        const line = buffer.getLine(i);
+        if (line) {
+          lines.push(line.translateToString(true));
         }
-        text = lines.join("\n").trimEnd();
       }
-      bridgeCall("copy", text);
+      return lines.join("\n").trimEnd();
+    }
+
+    // The copy dialog shows what is on screen now: the rows in view, wherever the
+    // terminal is scrolled, or the selection. The whole buffer goes too, for Copy
+    // all history (#2549).
+    window.smCopySelection = function() {
+      const buffer = term.buffer.active;
+      const screen = term.getSelection() || bufferText(buffer.viewportY, buffer.viewportY + term.rows);
+      bridgeCall("copy", screen, bufferText(0, buffer.length));
     };
 
     window.requestAnimationFrame(() => {
