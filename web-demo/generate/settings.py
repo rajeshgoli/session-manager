@@ -125,6 +125,10 @@ def artifacts(now):
          "error": None, "id": 2, "kind": "freezing", "names": ["cart-v1-load-test"], "phase": "done",
          "root": ROOT, "seconds": 171.0, "set_id": "cart-v1-load-test", "state": "done"},
     ], "operations": []}
+    frozen = [r for r in rows if r["state"] == "frozen"]
+    totals = {"folders": len(frozen), "data_bytes": sum(r["data_bytes"] for r in frozen),
+              "frozen_bytes": sum(r["frozen_bytes"] for r in frozen), "saved_bytes": sum(r["saved_bytes"] for r in frozen)}
+    activity["savings"] = {**totals, "roots": [{"root": ROOT, "cold_store": COLD, **totals}]}
     return {
         "/client/autopm": {
             "enabled": True, "paused_at": None, "skipped": False, "skip_window_starting": None,
