@@ -190,6 +190,9 @@ test('sidebar on every page (2543 B, D): pages first, agents first, hover card, 
           await page.locator('.sb-head .sb-live').click();
           await page.locator('.sidebar .term-switch .sw-row').first().waitFor();
           assert.equal(await page.locator('.sidebar .sb-icons .item.icon').count(), 8);
+          // Icon-only pages must be told apart by their icon alone (#2575).
+          const glyphs = await page.locator('.sidebar .sb-icons .item.icon svg').evaluateAll(svgs => svgs.map(s => s.innerHTML));
+          assert.equal(new Set(glyphs).size, glyphs.length, 'every sidebar page icon is distinct');
           assert.equal(await page.locator('.sidebar .sb-icons .item.on').getAttribute('aria-label'), 'Board');
           assert.equal((await page.locator('.sb-head .sb-live').innerText()).trim(), '14 live ⌄');
           assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('sm-sidebar-arrangement'))), { pages: 'agents', terminal: 'agents' });
