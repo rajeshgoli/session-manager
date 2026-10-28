@@ -6,7 +6,7 @@ import { render } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   html, api, bus, build, network, clientNav, screenFor, pageData, usePoll, useShared, setShared, shared, stored, store, panels, config,
-  openPanel, closePanel, navigate, openItem, openReader, toast, typingIn, Icon, basename,
+  openPanel, closePanel, navigate, openItem, openReader, readHref, toast, typingIn, Icon, basename,
 } from './ui.js';
 import { BoardPage } from './board.js';
 import { InboxPage } from './inbox.js';
@@ -18,7 +18,7 @@ import { Dash } from './meters.js';
 import { ArtifactsPage } from './artifacts.js';
 import { AnalyticsPage } from './analytics.js';
 import { SettingsPage } from './settings.js';
-import { TerminalPage, Switcher, switcherGroups, shortFact, stepRow, landingFor, activeTerminal, retiredIds, IDLE_KEY } from './terminal.js';
+import { TerminalPage, pillReturn, Switcher, switcherGroups, shortFact, stepRow, landingFor, activeTerminal, retiredIds, IDLE_KEY } from './terminal.js';
 import { NotesView } from './notes.js';
 import { Reader, docPathFrom } from './reader.js';
 import { NewAgentPopover } from './start.js';
@@ -290,7 +290,7 @@ function App() {
         onSearch=${() => setPalette(true)} onNew=${() => setCreating(creating ? null : { prefill: {}, at: 'sidebar' })} />
       <main class="main">
         ${mountedId ? html`<div key=${mountedId} hidden=${!term} style="display:flex;flex:1;min-height:0;flex-direction:column">
-          <${TerminalPage} id=${mountedId} visible=${term} onEnded=${releaseKept} watch=${watch} moon=${html`<${MoonButton} />`} />
+          <${TerminalPage} id=${mountedId} open=${term ? loc.open : null} visible=${term} onEnded=${releaseKept} watch=${watch} moon=${html`<${MoonButton} />`} />
         </div>` : null}
         ${page === 'doc' ? html`<${Reader} key=${docPath} id=${docPath + location.hash} watch=${watch} moon=${html`<${MoonButton} />`} />` : null}
         ${!term && page !== 'doc' ? html`
@@ -830,6 +830,19 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
       if (cmd && event.key === '\\') {
         event.preventDefault();
         state.current.toggleSidebar();
+        return;
+      }
+      // ⌘. opens what the agent needs from you, and closes it again; from a document
+      // its pill opened, it returns to that terminal (#2591).
+      if (term && event.metaKey && !event.altKey && event.key === '.') {
+        event.preventDefault();
+        bus.emit('needs-you');
+        return;
+      }
+      if (current === 'doc' && mod && event.key === '.' && !where.open && pillReturn.id
+        && location.pathname + location.search === readHref(pillReturn.path)) {
+        event.preventDefault();
+        navigate(`/terminal/${encodeURIComponent(pillReturn.id)}`);
         return;
       }
       if (term) return;

@@ -1,7 +1,7 @@
 // Terminal page (spec 1710; 1782 G1-G4; 2543 C, E.1): session rows, phone keys, route and round-trip time.
 // It renders inside the app frame; the app's sidebar lists the sessions and its side panel holds Details.
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { html, api, openPanel, navigate, Icon, Ring, stored, toast, age, basename, readerPath, openReader } from './ui.js';
+import { html, api, bus, openPanel, closePanel, navigate, Icon, Ring, stored, toast, age, basename, readerPath, openReader } from './ui.js';
 import { AgentMenus, RetireButton, openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
 import { BugButton } from './bug.js';
 import { chooseRoute, shellBrowserAllowed, relayRoute, rememberRoute, routeText, findDirect, markDirect, recentlyDirect, DIRECT_RETRY_MS } from './terminal-route.js';
@@ -26,6 +26,24 @@ const REDRAW_SETTLE_MS = 400;
 const REDRAW_NUDGE_MS = 120;
 /** Sessions retired from this page, which an older poll may still list as live. */
 export const retiredIds = new Set();
+
+/**
+ * What the agent needs from you, for the top bar's pill (#2591): a doc out for
+ * review opens in the document view, a question or blocking message opens its
+ * thread beside the terminal. A permission prompt is already on screen, so no pill.
+ */
+export function needsYou(agent, now = Date.now()) {
+  const you = agent?.facts?.you;
+  if (!you || !['message', 'blocked', 'doc_review'].includes(you.kind)) return null;
+  const since = age(you.since, now) || 'now';
+  const doc = you.kind === 'doc_review' ? (agent.docs || []).find((d) => d.id === you.doc_id) : null;
+  if (doc?.reader_path) return { kind: 'doc', label: 'Review doc', since, title: doc.title || you.text, reader: doc.reader_path, more: you.more || 0 };
+  return { kind: 'thread', label: you.kind === 'blocked' ? 'Blocked on you' : you.kind === 'doc_review' ? 'Review doc' : 'Read message',
+    since, title: you.text, more: you.more || 0 };
+}
+
+/** The terminal a document was opened from by its pill, so ⌘. in the document view comes back. */
+export const pillReturn = { id: null, path: null };
 
 /** The open terminal, for the app's Notes pane ("Type into terminal") and focus after the palette closes. */
 export const activeTerminal = { id: null, paste: () => false, focus: () => {} };
@@ -165,7 +183,7 @@ export function Switcher({ groups, currentId, idleOpen, toggleIdle, pick, reload
 // ---- page --------------------------------------------------------------------
 
 /** `watch` is the app's poll of GET /watch/state: `[doc, error, reload]`. `moon` is the app's overnight button. */
-export function TerminalPage({ id, watch, moon, visible = true, onEnded }) {
+export function TerminalPage({ id, watch, moon, open, visible = true, onEnded }) {
   const host = useRef(null);
   const control = useRef(null);
   const shown = useRef(visible);
@@ -196,6 +214,18 @@ export function TerminalPage({ id, watch, moon, visible = true, onEnded }) {
   useEffect(() => {
     if (!visible && connection === 'Ended') onEnded?.(id);
   }, [visible, connection, id, onEnded]);
+  // The pill and ⌘. open what the agent needs from you; a second press closes the thread again.
+  const ask = !shell ? needsYou(agent) : null;
+  const thread = `thread:${id}`;
+  const openAsk = () => {
+    if (open === thread) { closePanel(); setTimeout(() => control.current?.focus(), 0); return; }
+    if (!ask) return;
+    if (ask.kind === 'doc') { Object.assign(pillReturn, { id, path: ask.reader }); openReader(ask.reader); }
+    else openPanel(thread);
+  };
+  const askRef = useRef(openAsk);
+  askRef.current = openAsk;
+  useEffect(() => visible ? bus.on('needs-you', () => askRef.current()) : undefined, [visible]);
   // The sidebar's order, for Retire's next row.
   const { order } = switcherGroups((doc && doc.sessions) || [], id, stored(IDLE_KEY, false));
   const hidden = hiddenShells(doc?.sessions);
@@ -480,9 +510,9 @@ export function TerminalPage({ id, watch, moon, visible = true, onEnded }) {
       // Let the browser deliver Ctrl+V as a clipboard event, including images,
       // on Windows/Linux. On macOS the capture handler reads it explicitly.
       if (event.ctrlKey && !event.altKey && event.key.toLowerCase() === 'v') return false;
-      // The app handles ⌘J, ⌘K, ⌘\ and ⌘⌥↑/↓ (2543 G); Ctrl+K and Ctrl+\ still reach the terminal.
+      // The app handles ⌘J, ⌘K, ⌘., ⌘\ and ⌘⌥↑/↓ (2543 G); Ctrl+K and Ctrl+\ still reach the terminal.
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'j') return false;
-      if (event.metaKey && (event.key.toLowerCase() === 'k' || event.key === '\\' || (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')))) return false;
+      if (event.metaKey && (event.key.toLowerCase() === 'k' || event.key === '\\' || event.key === '.' || (event.altKey && (event.key === 'ArrowUp' || event.key === 'ArrowDown')))) return false;
       return true;
     });
     const observer = new ResizeObserver(resize);
@@ -521,6 +551,11 @@ export function TerminalPage({ id, watch, moon, visible = true, onEnded }) {
   const hide = shell && targetKind === 'shell' ? html`<button type="button" class="btn sm" title=${agent.hidden ? 'Put this shell back in the lists' : 'Hide this shell from the lists; it keeps running'}
     onClick=${() => hideShell(!agent.hidden)}>${agent.hidden ? 'Unhide' : 'Hide'}</button>` : null;
   const notes = html`<button type="button" class="btn sm" onClick=${() => openPanel('notes:view')}>Notes ⌘J</button>`;
+  const pill = ask ? html`<button type="button" class=${`term-you${open === thread ? ' on' : ''}`} aria-pressed=${ask.kind === 'thread' ? open === thread : null}
+      title=${`${ask.title}${ask.more ? ` (+${ask.more} more)` : ''} · ⌘.`}
+      onClick=${(event) => { event.stopPropagation(); openAsk(); }}>
+      <i class="pulse" aria-hidden="true"></i><span class="lbl">${ask.label}</span>
+      ${wide ? html`<span class="age">${ask.since}</span><kbd>⌘.</kbd>` : null}</button>` : null;
   // The agent's ticket fills the bar's empty middle (2543 C): number, title, repo. After the agent
   // releases it, the last ticket stays, marked released (#2579). Number and title open it on GitHub.
   const held = !shell && agent ? ((agent.claims || []).find((c) => c.kind === 'ticket') || (agent.claims || [])[0]) : null;
@@ -541,6 +576,7 @@ export function TerminalPage({ id, watch, moon, visible = true, onEnded }) {
         ${agent && !shell ? html`<${Ring} percent=${agent.context_percent} />` : null}
       </span>
       ${live || shellAway ? null : html`<span class="term-connection" role="status">${connection}</span>`}
+      ${pill}
       ${ticket}
       <span class="sp"></span>
       ${notes}${details}${hide}${menus(false)}
@@ -560,9 +596,10 @@ export function TerminalPage({ id, watch, moon, visible = true, onEnded }) {
     ${wide ? desktopBar() : html`<div class="term-bar" onClick=${refocus}>
       <a class="term-home" href="/" title="Home" onClick=${(e) => { e.preventDefault(); navigate('/'); }}>sm</a>
       <button type="button" class="icon-btn" title="Back (⌘[)" onClick=${back}><${Icon} name="back" /></button>
+      ${pill}
       ${notes}
       ${agent && !shell ? html`<${Ring} percent=${agent.context_percent} />` : null}
-      ${shell ? html`<span class="muted">▹</span>` : null}${name}${shell ? null : html`<span class="sub term-state">${agent ? agent.state : ''}</span>`}
+      ${shell ? html`<span class="muted">▹</span>` : null}${name}${shell || pill ? null : html`<span class="sub term-state">${agent ? agent.state : ''}</span>`}
       ${shellAway ? null : html`<span class=${`term-connection ${connection === 'Live' ? 'green' : ''}`} role="status">${connection}</span>`}
       ${connection === 'Live' && route.label
         ? html`<span class="term-route" title="Route and round-trip time">${routeText(route.label, route.samples)}</span>` : null}
