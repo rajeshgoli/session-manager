@@ -107,7 +107,7 @@
 </style>
 
 <h1>2594 — Open sm doc links in the phone app</h1>
-<p class="sans"><small>Author: fit-and-finish agent <code>e7838871</code> · Ticket #2594 · Revision 3</small></p>
+<p class="sans"><small>Author: fit-and-finish agent <code>e7838871</code> · Ticket #2594 · Revision 4</small></p>
 
 <h2>Memo</h2>
 
@@ -181,7 +181,7 @@ After the change, a fixed list of curl probes (Appendix B) must show the login r
 
 <h3>FAQ — what changed since the last revision</h3>
 <p><b>Is the public exception exact now?</b> Yes. Revision 1 relied on sm-server alone for paths beneath the file. Cloudflare's rule covers those paths too, so a second Cloudflare rule now puts them back behind login. The probes accept nothing but the login redirect for them.</p>
-<p><b>Can a half-finished Cloudflare change leave paths open?</b> No. The login rule for the paths beneath the file is installed and checked first, and the public rule is installed last, so any failure stops with nothing new made public.</p>
+<p><b>Can a half-finished Cloudflare change leave paths open?</b> No. The login rule for the paths beneath the file is installed and checked first, and the public rule is installed last, so any failure stops with nothing new made public. Undoing it runs in the reverse order, and the login rule is removed only after the public rule is confirmed gone.</p>
 <p><b>Does the file grant anything besides opening links?</b> Android also uses this association for passkeys. sm has none, so nothing changes today. It is the reason to revisit the signing key if sm ever adds passkey login on this host.</p>
 
 <hr class="appendix-divider">
@@ -220,7 +220,13 @@ Fingerprints are accepted as 64 hex digits, with or without colons, and served a
 </table>
 Any other answer on a neighbouring row, including <code>404</code> from sm-server, means a request reached the origin without login, so the Cloudflare guard failed: roll back both applications, then report.</li>
 <li>Google's own check: <code>https://digitalassetlinks.googleapis.com/v1/statements:list?source.web.site=https://sm.rajeshgo.li&amp;relation=delegate_permission/common.handle_all_urls</code> lists the statement.</li>
-<li>Rollback: <code>DELETE /accounts/{account}/access/apps/{public app id}</code> first (that alone restores login on the file), then the "below" application, then <code>DELETE /accounts/{account}/access/policies/{bypass policy id}</code>.</li>
+<li>Rollback, in this order, stopping at the first failure or uncertain answer:
+<ol type="a">
+<li><code>DELETE /accounts/{account}/access/apps/{public app id}</code>. This alone puts the file back behind login.</li>
+<li>Confirm the public application is gone: <code>GET</code> on its id returns not found, no application named "sm assetlinks (public)" remains in the account's list, and an unauthenticated <code>curl</code> of <code>/.well-known/assetlinks.json</code> and <code>/.well-known/assetlinks.json/x</code> both answer <code>302</code> to login.</li>
+<li>Only then delete the "below" application and the Bypass policy. Keeping the "below" application is also harmless, because it only requires login.</li>
+</ol>
+If step a or b fails or is unclear, keep the "below" application, which keeps the paths beneath the file behind login, and report the incomplete rollback on ticket #2594 and to Rajesh.</li>
 </ol>
 
 <h3>C. Android side</h3>
