@@ -877,6 +877,13 @@ def capture_tick(w, index, t, chapter, out_dir):
         if url == "/client/queue" or url.startswith("/client/queue?"):
             doc = json.loads(body)
             doc["host"] = synthetic("/client/host-status", t, w)
+            # The runtime is off, so nothing measures the jobs; give each running
+            # job the share of the host load synthetic() added for it (Right now).
+            for job in doc.get("running", []):
+                seed = int(hashlib.sha256(job["id"].encode()).hexdigest()[:4], 16)
+                job["usage"] = {"memory_bytes": (7 + seed % 3) * 1024 ** 3 + seed * 4096,
+                                "cpu_percent": float(9 + seed % 5),
+                                "gpu_percent": round(seed % 7 * 1.5, 1)}
             body = json.dumps(doc).encode()
         save(url, status, content_type, body)
         if final != url:

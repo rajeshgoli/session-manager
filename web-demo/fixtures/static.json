@@ -1,9 +1,21 @@
 {
  "responses": {
   "/apps/session-manager-android/meta.json": {
-   "captured_at": "2026-10-07T21:03:07Z",
+   "captured_at": "2026-10-28T23:41:39Z",
    "content_type": "application/json",
    "file": "static/settings_apps_session_manager_android_meta_json.json",
+   "status": 200
+  },
+  "/artifact-activity": {
+   "captured_at": "2026-10-28T23:41:39Z",
+   "content_type": "application/json",
+   "file": "static/settings_artifact_activity.json",
+   "status": 200
+  },
+  "/artifacts": {
+   "captured_at": "2026-10-28T23:41:39Z",
+   "content_type": "application/json",
+   "file": "static/settings_artifacts.json",
    "status": 200
   },
   "/client/analytics/spend?range=4w": {
@@ -78,14 +90,20 @@
    "file": "static/client_analytics_time_range_7d.json",
    "status": 200
   },
+  "/client/autopm": {
+   "captured_at": "2026-10-28T23:41:39Z",
+   "content_type": "application/json",
+   "file": "static/settings_client_autopm.json",
+   "status": 200
+  },
   "/client/devices": {
-   "captured_at": "2026-10-07T21:03:07Z",
+   "captured_at": "2026-10-28T23:41:39Z",
    "content_type": "application/json",
    "file": "static/settings_client_devices.json",
    "status": 200
   },
   "/client/push/status": {
-   "captured_at": "2026-10-07T21:03:07Z",
+   "captured_at": "2026-10-28T23:41:39Z",
    "content_type": "application/json",
    "file": "static/settings_client_push_status.json",
    "status": 200
@@ -109,7 +127,7 @@
    "status": 200
   },
   "/client/reviews/status": {
-   "captured_at": "2026-10-07T21:03:07Z",
+   "captured_at": "2026-10-28T23:41:39Z",
    "content_type": "application/json",
    "file": "static/settings_client_reviews_status.json",
    "status": 200
@@ -139,7 +157,7 @@
    "status": 200
   },
   "/worktrees/leftover": {
-   "captured_at": "2026-10-07T21:03:07Z",
+   "captured_at": "2026-10-28T23:41:39Z",
    "content_type": "application/json",
    "file": "static/settings_worktrees_leftover.json",
    "status": 200

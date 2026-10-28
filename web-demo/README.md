@@ -95,6 +95,8 @@ The responses come from a real `sm-server` on fresh state, except where noted.
   `/client/host-status` and the `host` field of `/client/queue` start from the real host's load
   in `static/host_status.json` and add the storyline's running jobs; `/client/usage/meters`
   starts from the real meters in `static/usage_meters.json` and rises a little over the loop.
+  Each running job in `/client/queue` gets an invented `usage` (memory, CPU, GPU) so the
+  Queue page's *Right now* card has jobs to attribute.
   `/client/utilization/series` and `/client/queue/stats` are not recorded; they come from the
   static layer.
 - **Fake tools on the server's PATH** (`generate/fake-bin/`): `gh` answers from the recorder's
@@ -150,6 +152,10 @@ host and meter snapshots):
 - **Settings.** `generate/settings.py` writes invented responses for Notifications, Devices,
   Reviews, Worktrees and About (phone app 0.5.46). Worktrees works for the visit: Delete build
   output, Delete and Keep change the list as the server would.
+- **Artifacts and Auto PM.** `generate/settings.py` also writes the Artifacts page
+  (`/artifacts`, `/artifact-activity`: seven acme/shop folders, one waiting on a delete
+  decision, two frozen on a cold disk, a nightly backup) and Settings › Auto PM
+  (`/client/autopm`: on, nothing shipped yet).
 - **Notes.** `fixtures/static/notes.json` holds four invented notes with revisions. The worker
   serves them and lets a visitor create, edit, search, preview and restore notes for the
   length of the visit; each save shows "Nothing is saved in the demo". Notes and Worktrees
@@ -178,7 +184,7 @@ python3 web-demo/build.py --serve    # builds, then previews at http://localhost
 |---|---|
 | `index.html`, `board/index.html`, … , `404.html` | the app shell (`http/web.rs` `shell_response`), with the demo banner and worker boot in place of the module load |
 | `sw.js` | the service worker (source `site/sw.js`); it must sit at the root to control every path |
-| `assets/` | a copy of `crates/sm-server/src/web/`, with `build.py`'s `PATCHES`: "Mac" reads "Dev machine", and Settings has no Studio SSH |
+| `assets/` | a copy of `crates/sm-server/src/web/`, with `build.py`'s `PATCHES`: "Mac" reads "Dev machine", "the machine" or "Host", and Settings has no Studio SSH |
 | `demo/` | `demo.js` (banner, read-only notice, worker boot), `demo.css`, `terminal.js` and `terminals.json` (agent terminals) |
 | `fixtures/` | a copy of `fixtures/` |
 
