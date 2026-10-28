@@ -32,7 +32,7 @@ VENDOR_IMPORTS = {
 }
 # The app's page paths (app.js PAGES, plus History's tabs). Each gets a copy
 # of the shell so a first visit by deep link works before the worker runs.
-PAGE_PATHS = ["board", "queue", "inbox", "notes", "analytics", "history", "history/agents",
+PAGE_PATHS = ["board", "queue", "inbox", "artifacts", "notes", "analytics", "history", "history/agents",
               "history/tickets", "guestbook", "settings", "watch"]
 # Words the demo's copy of the app changes: the visitor's machine is not
 # necessarily a Mac, and Studio SSH is the owner's own setup. Each must match
@@ -41,9 +41,12 @@ PAGE_PATHS = ["board", "queue", "inbox", "notes", "analytics", "history", "histo
 PATCHES = [
     ("queue.js", "<h2>Mac usage</h2>", "<h2>Dev machine usage</h2>", 1),
     ("queue.js", "The Mac had room to run", "The machine had room to run", 1),
+    # Right now's legend, its bar labels, and the job panel's "Using now".
+    ("queue.js", re.compile(r"(?<=[Rr]est )of the Mac|(?<=\)\} )of the Mac"), "of the machine", 5),
     # The sidebar meters' row label: one for the readings rows, one for "Quiet".
     # Its column is 48px wide, so the label stays one short word.
     ("meters.js", '<span class="dk">Mac</span>', '<span class="dk">Host</span>', 2),
+    ("artifacts-model.js", "'Mac storage'", "'Local disk'", 1),
     ("settings.js", re.compile(r"<h3>Studio SSH</h3><\$\{Resource\} state=\$\{ssh\}.*?</\$\{Resource\}>", re.S), "", 1),
 ]
 
@@ -61,10 +64,16 @@ def build_id():
         digest.update(rel.encode() + b"\0")
         with open(path, "rb") as f:
             digest.update(f.read() + b"\0")
-    with open(os.path.join(FIXTURES, "timeline.json"), "rb") as f:
-        digest.update(f.read())
-    for name in sorted(os.listdir(SITE)):
-        with open(os.path.join(SITE, name), "rb") as f:
+    # Every fixture and this script's PATCHES change what visitors see, so each
+    # one must move the id the worker and the assets are cached under.
+    for root, _, names in sorted(os.walk(FIXTURES)):
+        for name in sorted(names):
+            path = os.path.join(root, name)
+            digest.update(os.path.relpath(path, FIXTURES).encode() + b"\0")
+            with open(path, "rb") as f:
+                digest.update(f.read() + b"\0")
+    for path in [os.path.abspath(__file__)] + [os.path.join(SITE, n) for n in sorted(os.listdir(SITE))]:
+        with open(path, "rb") as f:
             digest.update(f.read())
     return digest.hexdigest()[:12]
 
