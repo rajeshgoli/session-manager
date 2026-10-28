@@ -63,6 +63,21 @@ test('other tickets sit under their repo top lane; lane-less repos go last', () 
   assert.deepEqual(order, ['lane 1', 'other o/far', 'lane 2', 'other o/sm', 'lane 3', 'other o/new']);
   assert.deepEqual(boardSections([], [{ repo: 'o/far' }]).map((s) => s.other.repo), ['o/far']);
 });
+test('Your move lists what waits on the owner across lanes once each, then startable tickets', () => {
+  const { attentionItems, readyItems, shortGoal } = board.namespace;
+  const t = (number, state, extra = {}) => ({ repo: 'o/r', number, title: `T${number}`, state, warnings: [], ...extra });
+  const lane1 = { id: 1, rank: 1, tickets: [t(1, 'ready'), t(2, 'in_progress', { holder: {}, clock: { ball: 'stalled', text: 'Stalled 9m' } }), t(3, 'needs_you', { needs_you: { text: 'Review PR', url: 'u' } })] };
+  const lane2 = { id: 2, rank: 2, tickets: [t(3, 'needs_you', { needs_you: { text: 'Review PR', url: 'u' } }), t(4, 'close_ready'), t(5, 'ready', { warnings: ['merged_not_closed'] }), t(6, 'done', { needs_you: { text: 'old' } })] };
+  const other = [{ repo: 'o/r', tickets: [t(7, 'blocked', { auto_start: { state: 'failed', last_error: 'no seat' } }), t(8, 'ready', { holder: {} })] }];
+  const items = attentionItems([lane1, lane2], other);
+  assert.deepEqual(items.map((i) => [i.ticket.number, i.lane?.id ?? null]), [[3, 1], [4, 2], [5, 2], [7, null], [2, 1]]);
+  assert.equal(items[0].url, 'u');
+  assert.equal(items[1].close, true);
+  assert.match(items[3].text, /no seat/);
+  assert.deepEqual(readyItems([lane1, lane2], other).map((i) => i.ticket.number), [1]);
+  assert.equal(shortGoal('Iteration 12 build (goal): compact chains'), 'Iteration 12 build');
+  assert.equal(shortGoal('Bugs'), 'Bugs');
+});
 test('clock clips at the chosen window and preserves gaps and quiet segments', () => {
   const end = '2026-09-30T03:00:00Z';
   const segments = [
