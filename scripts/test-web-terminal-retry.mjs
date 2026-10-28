@@ -27,7 +27,7 @@ function fixture(direct = [], { storage, probes } = {}) {
   }
   const context = vm.createContext({
     URL, WebSocket:Socket, location:{href:'https://sm.example.com/terminal/test',protocol:'https:',hostname:'sm.example.com'},
-    window:{Terminal,FitAddon:{FitAddon:class {proposeDimensions(){return null;}}},WebLinksAddon:{WebLinksAddon:class {}},addEventListener(){},removeEventListener(){},
+    window:{Terminal,FitAddon:{FitAddon:class {proposeDimensions(){return null;}}},addEventListener(){},removeEventListener(){},
       innerWidth:1440,matchMedia:()=>({matches:false}),sessionStorage:storage},
     getComputedStyle:()=>({fontSize:'15px'}),document:{documentElement:{}},performance:{now:()=>0},
     CONTRAST_FLOOR:4.5, THEME_KEY:'theme', isLight:()=>false, terminalTheme:()=>({background:'#000'}),

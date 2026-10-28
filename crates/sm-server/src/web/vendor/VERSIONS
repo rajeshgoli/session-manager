@@ -2,6 +2,5 @@ preact 10.29.8 (dist/preact.module.js, hooks/dist/hooks.module.js) and htm 3.1.1
 (dist/htm.module.js) from unpkg.com, with the sourceMappingURL comment removed.
 html-to-image 1.11.13 (es/index.js from the npm package, bundled into one ES
 module with `esbuild --bundle --format=esm`).
-@xterm/xterm 6.0.0 (lib/xterm.js, css/xterm.css), @xterm/addon-fit 0.11.0
-(lib/addon-fit.js) and @xterm/addon-web-links 0.12.0 (lib/addon-web-links.js)
-from unpkg.com.
+@xterm/xterm 6.0.0 (lib/xterm.js, css/xterm.css) and @xterm/addon-fit 0.11.0
+(lib/addon-fit.js) from unpkg.com.
