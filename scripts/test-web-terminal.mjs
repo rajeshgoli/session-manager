@@ -768,3 +768,23 @@ test('kept terminal expires after 15 minutes, resets on return, and drops ended 
     }
   } finally { await browser.close(); }
 });
+
+
+test('kept terminal applies appearance changes on return without reconnecting', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, state, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    await page.goto(`${ORIGIN}/terminal/sm-1776`);
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
+    const go = (path) => page.evaluate(async path => (await import('/assets/ui.js')).navigate(path), path);
+    await go('/settings#appearance');
+    await page.getByRole('radio', { name: /Solarized/ }).click();
+    await page.locator('#sm-text-size').fill('19');
+    await go('/terminal/sm-1776');
+    await page.locator('.term-page').waitFor({ state: 'visible' });
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('.term-body')).backgroundColor === 'rgb(253, 246, 227)');
+    assert.equal(await page.locator('.xterm-rows').evaluate(el => getComputedStyle(el).fontSize), '18px');
+    assert.equal(state.tickets, 1);
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});

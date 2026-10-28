@@ -303,7 +303,10 @@ export function TerminalPage({ id, watch, moon, visible = true, onEnded }) {
     control.current = {
       visibility: () => {
         clearTimeout(resizeTimer); clearTimeout(nudgeTimer);
-        if (shown.current) { fitNow(); focus(); }
+        if (shown.current) {
+          terminal.options.fontSize = parseFloat(getComputedStyle(document.documentElement).fontSize) - 1;
+          retheme(); fitNow(); focus();
+        }
         else terminal.blur();
       },
       key: (key) => { if (live) send({ type: 'key', key }); focus(); },
