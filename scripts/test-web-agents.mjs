@@ -174,6 +174,9 @@ test('sidebar on every page (2543 B, D): pages first, agents first, hover card, 
           await page.locator('.sb-head').getByRole('button', { name: 'New agent' }).click();
           const start = page.locator('.new-agent-host.side .pop').getByRole('button', { name: 'Start' });
           await start.waitFor();
+          // Pinned over the page at the top, not laid out below it (#2583).
+          const sheet = await page.locator('.new-agent-host.side .pop').boundingBox();
+          assert.ok(sheet.y < 80 && sheet.y + sheet.height <= page.viewportSize().height, `sheet at ${JSON.stringify(sheet)}`);
           // Not clipped by the sidebar and reachable in the window: the button is what sits under its own centre.
           await start.scrollIntoViewIfNeeded();
           assert.ok(await start.evaluate((b) => { const r = b.getBoundingClientRect(); return document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) === b; }));
