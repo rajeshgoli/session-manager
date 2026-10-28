@@ -16,7 +16,7 @@ function load(path) {
 const agents = load(`${root}/agents.js`);
 await agents.link((name, parent) => load(name === 'preact' ? `${root}/vendor/preact.module.js` : name === 'preact/hooks' ? `${root}/vendor/hooks.module.js` : name === 'htm' ? `${root}/vendor/htm.module.js` : resolve(dirname(parent.identifier), name)));
 await agents.evaluate();
-const { sectionAgents, foldIdle, foldText, summaryCounts, agentFact, jobsFact, youFact, edgeTone, groupAgents, canRetireImmediately, ticketTitle } = agents.namespace;
+const { sectionAgents, agentFact, jobsFact, youFact, edgeTone, canRetireImmediately, ticketTitle } = agents.namespace;
 
 // Spec 1782 appendix B's worked examples, as GET /watch/state draws them at 19:47 UTC.
 const now = Date.parse('2026-09-30T19:47:00Z');
@@ -98,43 +98,10 @@ test('card edges use the section colour, red for stalled or quiet, the line colo
   assert.equal(edgeTone(fixtures.idle), 'line');
 });
 
-test('only idle agents without a ticket beyond the fourth fold', () => {
-  const loose = Array.from({ length: 6 }, (_, i) => agent(`idle-${i}`, 'idle', `1${i}`, { agent: { state: 'idle', since: '2026-09-30T19:36:00Z' } }));
-  const ticketed = agent('holds-ticket', 'idle', '0', {}, { claims: [{ kind: 'ticket', number: 1 }] });
-  const { shown, folded } = foldIdle([ticketed, ...loose]);
-  assert.deepEqual(shown.map((a) => a.name), ['holds-ticket', 'idle-0', 'idle-1', 'idle-2', 'idle-3']);
-  assert.deepEqual(folded.map((a) => a.name), ['idle-4', 'idle-5']);
-  assert.equal(foldText(folded, now), '+ 2 more idle: idle-4 (11m), idle-5 (11m)');
-  assert.equal(foldIdle(loose.slice(0, 4)).folded.length, 0);
-  // A pull request alone is not a ticket; the open agent stays out of the fold, and only it.
-  const prOnly = agent('pr-only', 'idle', '2', {}, { claims: [{ kind: 'pr', number: 9 }] });
-  assert.deepEqual(foldIdle([...loose, prOnly]).folded.map((a) => a.name), ['idle-4', 'idle-5', 'pr-only']);
-  assert.deepEqual(foldIdle(loose, 'idle-5').folded.map((a) => a.name), ['idle-4']);
-});
-
-test('the summary strip drops zero counts except needs you', () => {
-  assert.deepEqual(summaryCounts({ needs_you: 0, finished: 1, waiting_long: 0, moving: 3, waiting: 0, idle: 5 }).map((c) => `${c.n} ${c.label}`),
-    ['0 needs you', '1 finished', '3 moving', '5 idle']);
-  assert.deepEqual(summaryCounts({ needs_you: 2, waiting_long: 1, waiting: 4 }).map((c) => c.section), ['you', 'waiting_long', 'waiting']);
-});
-
-test('shells stay out of agent sections, repo groups and summary counts', () => {
+test('shells stay out of agent sections', () => {
   const idle = agent('terminal', 'idle', '1', {}, { kind: 'shell' });
   const busy = agent('busy-terminal', 'moving', '2', {}, { kind: 'shell', state: 'working' });
   assert.deepEqual(sectionAgents([fixtures.idle, idle, busy]).map(group => group.agents.map(a => a.name)), [[fixtures.idle.name]]);
-  assert.deepEqual(groupAgents([fixtures.idle, idle, busy]).flatMap(group => group.agents.map(a => a.agent.name)), [fixtures.idle.name]);
-  const counts = { idle: 2, moving: 1, live: 3, needs_you: 0 };
-  assert.deepEqual(agents.namespace.agentCounts(counts, [fixtures.idle, idle, busy]), { idle: 1, moving: 0, live: 1, needs_you: 0 });
-  assert.equal(counts.idle, 2, 'the shared watch response stays unchanged');
-});
-
-test('By repo puts busy repos first and children after their parent', () => {
-  const parent = agent('parent', 'idle', '1', {}, { repo: '/r/b' });
-  const child = agent('child', 'moving', '1', {}, { repo: '/r/b', parent_session_id: 'parent' });
-  const other = agent('other', 'idle', '1', {}, { repo: '/r/a' });
-  const groups = groupAgents([other, child, parent]);
-  assert.deepEqual(groups.map((g) => g.repo), ['/r/b', '/r/a']);
-  assert.deepEqual(groups[0].agents.map((e) => [e.agent.name, e.depth]), [['parent', 0], ['child', 1]]);
 });
 
 test('only a finished idle agent retires without confirmation', () => {
@@ -171,9 +138,7 @@ test('agent details retain completed tickets and PRs without duplicate claim lin
   assert.deepEqual(agents.namespace.detailClaims(), []);
 });
 
-test('a blocked agent leads the strip and its You line is red (sm#2494)', () => {
-  assert.deepEqual(summaryCounts({ needs_you: 3, blocked: 1, moving: 2 }).map((c) => `${c.n} ${c.label}`),
-    ['1 blocked on you', '2 needs you', '2 moving']);
+test("a blocked agent's You line is red (sm#2494)", () => {
   const fact = youFact({ facts: { you: { kind: 'blocked', since: new Date(Date.now() - 5 * 60000).toISOString(), text: 'Log in to GitHub', more: 0, dismissible: true } } });
   assert.equal(fact.tone, 'red');
   assert.match(fact.text, /^◆ Blocked · 5m: Log in to GitHub$/);

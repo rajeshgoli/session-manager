@@ -58,6 +58,7 @@ async function setup(browser, { width = 1440, home = false, failDirect = false, 
       return state.home ? route.fulfill({ json: { instance: 'one' }, headers: { 'access-control-allow-origin': ORIGIN } }) : route.abort();
     }
     if (req.method() !== 'GET') requests.push({ path, method: req.method(), body: req.postData() ? req.postDataJSON() : null });
+    if (path === '/client/board') return json({ lanes: [], other: [] });
     if (path === '/watch/state') {
       if (state.watchWait) await state.watchWait;
       if (state.watchError) return json({ detail: 'watch unavailable' }, 503);
@@ -102,7 +103,7 @@ async function setup(browser, { width = 1440, home = false, failDirect = false, 
   return { page, requests, state, errors };
 }
 
-for (const width of [390, 1440]) test(`Stale terminal links explain the ended state and return to Agents at ${width}px`, async () => {
+for (const width of [390, 1440]) test(`Stale terminal links explain the ended state and open another agent at ${width}px`, async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
     for (const id of ['retired-agent', 'term-retired', 'missing', 'stopped-agent', 'term-stopped']) {
@@ -114,8 +115,9 @@ for (const width of [390, 1440]) test(`Stale terminal links explain the ended st
       assert.equal(await page.getByRole('button', { name: 'Reconnect', exact: true }).count(), 0);
       assert.equal(await page.evaluate(() => window.sockets.length), 0);
       assert.equal(requests.filter(r => /browser-attach-ticket$/.test(r.path)).length, 0);
-      await page.getByRole('link', { name: 'Back to Agents', exact: true }).click();
-      await page.waitForURL(`${ORIGIN}/`);
+      await page.getByRole('link', { name: 'Open another agent', exact: true }).click();
+      // `/` lands on the top sidebar row (here the first shell) on a computer and stays the agents list on a phone (2543 D.5).
+      await page.waitForURL(width > 720 ? `${ORIGIN}/terminal/term-abcd` : `${ORIGIN}/`);
       assert.deepEqual(errors, []);
       await page.close();
     }
@@ -162,7 +164,7 @@ test('A stopped shell replaces its SSH instructions with an actionable ended sta
     state.sessions = state.sessions.map(s => s.id === 'term-abcd' ? { ...s, state: 'stopped' } : s);
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await page.waitForSelector('[data-connection="Ended"]');
-    await page.getByRole('link', { name: 'Back to Agents', exact: true }).waitFor();
+    await page.getByRole('link', { name: 'Open another agent', exact: true }).waitFor();
     assert.equal(await page.getByRole('heading', { name: 'Connect to your shell' }).count(), 0);
     assert.equal(await page.evaluate(() => window.sockets.length), 0);
     assert.deepEqual(errors, []);
@@ -179,9 +181,9 @@ for (const colorScheme of ['light', 'dark']) for (const width of [390, 1440]) te
     assert.equal(await page.evaluate(() => window.copied), `ssh -t studio-away tmux -L 'session-manager' attach-session -t term-abcd`);
     assert.equal(await page.evaluate(() => window.sockets.length), 0);
     assert.equal(requests.filter(r => r.body?.where === 'away').length, 0);
-    // The shell bar is the agent bar: sm home, Notes, Details, Hide and ⋯; Close sits where Retire does, in red.
+    // The shell bar is the agent bar: Notes, Details, Hide and ⋯ (the phone bar adds sm home); Close sits where Retire does, in red.
     assert.equal(await page.getByText('Hand off…', { exact: true }).count(), 0);
-    await page.locator('.term-bar .term-home').waitFor();
+    assert.equal(await page.locator('.term-bar .term-home').count(), width < 900 ? 1 : 0);
     for (const name of ['Details', 'Hide', 'More', 'Close shell']) assert.equal(await page.locator('.term-bar').getByRole('button', { name, exact: true }).count(), 1, name);
     assert.equal(await page.locator('.term-bar .ring').count(), 0);
     assert.match(await page.locator('.term-bar').getByRole('button', { name: 'Close shell', exact: true }).getAttribute('class'), /\bdanger\b/);
@@ -296,7 +298,6 @@ test('Studio shell ignores remembered Cloudflare route and uses localhost', asyn
     await page.waitForSelector('[data-connection="Live"]');
     assert.ok(state.probes > 0);
     assert.deepEqual(await page.evaluate(() => window.sockets.map(s => s.url)), ['ws://localhost:8420/client/terminal']);
-    await page.locator('.term-bar .term-home').waitFor();
     await page.locator('.term-bar').getByRole('button', { name: 'Close shell', exact: true }).waitFor();
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
@@ -320,31 +321,31 @@ for (const failDirect of [false, true]) test(`Shell can retry a local connection
   } finally { await browser.close(); }
 });
 
-for (const colorScheme of ['light', 'dark']) for (const width of [390, 1440]) test(`Terminals use distinct tiles and a dedicated switcher group at ${width}px in ${colorScheme}`, async () => {
+for (const colorScheme of ['light', 'dark']) for (const width of [390, 1440]) test(`Shells are sidebar rows and a dedicated switcher group at ${width}px in ${colorScheme}`, async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
     const { page, state, errors } = await setup(browser, { width, colorScheme });
     state.counts = { idle: 2, moving: 1, live: 3, needs_you: 0 };
     state.sessions = state.sessions.map(s => s.kind === 'shell' ? { ...s, claims: [{ title: 'Should never be a shell ticket', kind: 'ticket', number: 99 }] } : s);
-    await page.goto(`${ORIGIN}/`);
-    const terminals = page.getByRole('region', { name: 'Terminals', exact: true });
-    await terminals.getByText('2 open', { exact: true }).waitFor();
-    assert.equal(await terminals.locator('.terminal-tile').count(), 2);
-    assert.equal(await page.locator('.acard').count(), 1);
-    assert.equal(await terminals.locator('.ring, .prov, .tk, .ttl').count(), 0);
-    assert.equal(await terminals.getByText('Should never be a shell ticket', { exact: true }).count(), 0);
-    assert.equal((await page.locator('.sum').innerText()).replace(/\s+/g, ' ').trim(), '0 needs you · 1 idle');
+    // A computer lists sessions in the sidebar on every page; a phone's `/` is the agents list (2543 B.10, D.5).
+    await page.goto(width > 720 ? `${ORIGIN}/board` : `${ORIGIN}/`);
+    const shells = width > 720 ? page.locator('.sidebar .sb-line', { has: page.locator('.sw-shell') }) : page.locator('.home-list .sw-row', { has: page.locator('.sw-shell') });
+    await shells.first().waitFor();
+    assert.equal(await shells.count(), 2);
+    if (width > 720) {
+      assert.deepEqual(await shells.locator('.sb-fact').allTextContents(), ['shell', 'shell']);
+      assert.equal((await page.locator('.sb-head .sb-live').innerText()).trim(), '1 live ›', 'shells are not counted as agents');
+    }
+    assert.equal(await page.getByText('Should never be a shell ticket', { exact: true }).count(), 0);
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     if (process.env.SHOTS_DIR) {
       await mkdir(process.env.SHOTS_DIR, { recursive: true });
-      await page.screenshot({ path: `${process.env.SHOTS_DIR}/terminal-tiles-${width}-${colorScheme}.png`, fullPage: true });
+      await page.screenshot({ path: `${process.env.SHOTS_DIR}/shell-rows-${width}-${colorScheme}.png`, fullPage: true });
     }
-    await page.getByRole('radio', { name: 'By repo', exact: true }).click();
-    assert.equal(await terminals.locator('.terminal-tile').count(), 2);
-    assert.equal(await page.locator('.acard').count(), 1);
-    await terminals.locator('a[href="/terminal/term-abcd"]').click();
+    await shells.filter({ hasText: 'zsh · session-manager' }).first().click();
+    await page.waitForURL('**/terminal/term-abcd');
     await page.getByRole('heading', { name: 'Connect to your shell' }).waitFor();
-    if (width < 900) await page.getByRole('button', { name: 'Unfold session list', exact: true }).click();
+    if (width < 900) await page.getByRole('button', { name: 'Unfold sidebar', exact: true }).click();
     await page.getByText('Terminals', { exact: true }).waitFor();
     const sections = (await page.locator('.term-switch .sw-sec').allTextContents()).map(text => text.trim());
     assert.ok(sections.includes('Terminals'));
@@ -407,7 +408,7 @@ for (const width of [390, 1440]) test(`Hide sends a shell to the tray and Undo b
     assert.deepEqual(requests.filter(r => r.method === 'PATCH').at(-1).body, { hidden: true });
     assert.equal(state.sessions.find(s => s.id === 'term-abcd').hidden, true);
     // The shell leaves the switcher; an eye with a count appears in the top bar.
-    if (width < 900) await page.getByRole('button', { name: 'Unfold session list', exact: true }).click();
+    if (width < 900) await page.getByRole('button', { name: 'Unfold sidebar', exact: true }).click();
     await page.locator('.sw-row').filter({ hasText: 'cargo bench' }).waitFor();
     assert.equal(await page.locator('.sw-row').filter({ hasText: 'last input' }).count(), 0);
     const eye = page.locator('.term-bar').getByRole('button', { name: '1 hidden terminal', exact: true });
@@ -434,24 +435,25 @@ for (const width of [390, 1440]) test(`Hide sends a shell to the tray and Undo b
   } finally { await browser.close(); }
 });
 
-test('Agents page shows the eye only while a shell is hidden; its menu opens and unhides', async () => {
+test('A list page shows the eye only while a shell is hidden; its menu opens and unhides', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
     const { page, state, requests, errors } = await setup(browser);
-    await page.goto(`${ORIGIN}/`);
-    const terminals = page.getByRole('region', { name: 'Terminals', exact: true });
-    await terminals.getByText('2 open', { exact: true }).waitFor();
+    await page.goto(`${ORIGIN}/board`);
+    const shells = page.locator('.sidebar .sb-line', { has: page.locator('.sw-shell') });
+    await shells.first().waitFor();
+    assert.equal(await shells.count(), 2);
     assert.equal(await page.locator('.hidden-shells-btn').count(), 0);
     state.sessions = state.sessions.map(s => s.id === 'term-abcd' ? { ...s, hidden: true }
       : s.id === 'term-busy' ? { ...s, name: 'bench runner', named: true } : s);
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
-    await terminals.getByText('1 open', { exact: true }).waitFor();
-    assert.deepEqual(await terminals.locator('.terminal-tile strong').allTextContents(), ['bench runner']);
+    await page.waitForFunction(() => document.querySelectorAll('.sidebar .sb-line .sw-shell').length === 1);
+    assert.deepEqual(await shells.locator('.sw-nm').allTextContents(), ['bench runner']);
     await page.locator('header.bar').getByRole('button', { name: '1 hidden terminal', exact: true }).click();
     await page.locator('.hidden-shell').getByText('last input 12m').waitFor();
-    if (process.env.SHOTS_DIR) { await mkdir(process.env.SHOTS_DIR, { recursive: true }); await page.screenshot({ path: `${process.env.SHOTS_DIR}/agents-eye.png` }); }
+    if (process.env.SHOTS_DIR) { await mkdir(process.env.SHOTS_DIR, { recursive: true }); await page.screenshot({ path: `${process.env.SHOTS_DIR}/board-eye.png` }); }
     await page.locator('.hidden-shell').getByRole('button', { name: 'Unhide', exact: true }).click();
-    await terminals.getByText('2 open', { exact: true }).waitFor();
+    await page.waitForFunction(() => document.querySelectorAll('.sidebar .sb-line .sw-shell').length === 2);
     await page.locator('.hidden-shells-btn').waitFor({ state: 'detached' });
     assert.deepEqual(requests.filter(r => r.method === 'PATCH').at(-1).body, { hidden: false });
     // Hiding another shell later shows the eye closed.

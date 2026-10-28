@@ -646,7 +646,7 @@ test('Back and Forward keep their entries, and New clears an active search', asy
     await page.locator('.panel').waitFor({ state: 'hidden' });
     await page.getByRole('searchbox', { name: 'Search notes' }).fill('no such note');
     await page.getByText('No matching notes.').waitFor();
-    await page.getByRole('button', { name: '+ New' }).click();
+    await page.getByRole('button', { name: 'New note' }).click();
     await page.locator('.notes-editor textarea').waitFor();
     assert.equal(await page.getByRole('searchbox', { name: 'Search notes' }).inputValue(), '');
     await context.close();

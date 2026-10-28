@@ -1,4 +1,4 @@
-// Agents page in a browser (spec 1782 F): sections, three facts, ✓, both icons, keys.
+// The sidebar, hover card and landing in a browser (spec 2543 B-D, G; 1782 F); agent details and handoff.
 // Run with node --test; install playwright or set PLAYWRIGHT_MODULE to its entry point.
 // Set SHOTS_DIR to also save the 1440/390 px, light/dark, 15/19 px screenshots there.
 import { test } from 'node:test';
@@ -67,217 +67,223 @@ function fixture() {
   return sessions;
 }
 
-test('Agents page: sections, facts, icons, ✓ and keys at desktop and phone sizes', async () => {
+// A stand-in for every route these tests read; `state.sessions` is what GET /watch/state returns.
+async function open(browser, { viewport, colorScheme = 'light', size = 15, sessions = fixture(), storage = {} }) {
+  const context = await browser.newContext({ viewport, colorScheme });
+  const page = await context.newPage();
+  await page.addInitScript(([value, saved]) => {
+    localStorage.setItem('sm-text-size', String(value));
+    for (const [key, item] of Object.entries(saved)) localStorage.setItem(key, JSON.stringify(item));
+  }, [size, storage]);
+  const errors = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  const state = { sessions, opened: [], answered: [] };
+  await page.clock.setFixedTime(new Date(NOW));
+  await page.exposeFunction('recordOpen', (url) => state.opened.push(url));
+  await page.addInitScript(() => { window.open = (url) => { window.recordOpen(url); return null; }; });
+  await page.route('http://localhost/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.pathname.startsWith('/assets/')) {
+      const file = url.pathname.slice('/assets/'.length);
+      return route.fulfill({ body: await readFile(new URL(file, assets)), contentType: file.endsWith('.css') ? 'text/css' : 'text/javascript' });
+    }
+    if (request.isNavigationRequest()) return route.fulfill({
+      body: shell.replace('<html>', `<html data-theme="${colorScheme}">`), contentType: 'text/html',
+    });
+    const answer = /^\/sessions\/([^/]+)\/needs-you\/answered$/.exec(url.pathname);
+    if (answer && request.method() === 'POST') {
+      const id = decodeURIComponent(answer[1]);
+      state.answered.push(id);
+      state.sessions = state.sessions.map((s) => (s.id === id ? { ...s, facts: { ...s.facts, you: null }, attention: { section: 'idle', reason: null, order_key: '0' } } : s));
+      return route.fulfill({ json: { facts: null } });
+    }
+    if (url.pathname === '/client/board') return route.fulfill({ json: { lanes: [], other: [] } });
+    if (url.pathname === '/watch/state') return route.fulfill({ json: { generated_at: NOW, sessions: state.sessions, counts: {} } });
+    if (url.pathname === '/client/settings') return route.fulfill({ json: { new_agent: { provider: 'claude', claude: {}, codex: {}, agent_types: [], workspaces: ['/tmp/repo'] } } });
+    if (url.pathname === '/client/queue') return route.fulfill({ json: { running: [{ id: 'j1' }], queued: [{ id: 'j2', queued_at: NOW }] } });
+    if (url.pathname === '/inbox') return route.fulfill({ json: { needs_you_count: 1, rows: [] } });
+    if (url.pathname.endsWith('/last-turn')) return route.fulfill({ status: 404, json: { detail: 'none' } });
+    return route.fulfill({ json: {} });
+  });
+  return { context, page, errors, state };
+}
+
+const shell1 = { id: 'studio-zsh', name: 'studio-zsh', kind: 'shell', state: 'idle', repo: SM, working_dir: SM, claims: [],
+  attention: { section: 'idle', reason: null, order_key: '0' }, facts: { agent: { state: 'idle', since: NOW } } };
+const sideRows = (page) => page.locator('.sidebar .sb-line:not(.sb-idle)').evaluateAll((rows) => rows.map((row) =>
+  `${row.querySelector('.sw-nm').textContent} ${row.querySelector('.sb-fact').textContent}`));
+
+test('sidebar on every page (2543 B, D): pages first, agents first, hover card, + and folding', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
-  const shots = SHOTS;
-  if (shots) await mkdir(shots, { recursive: true });
+  if (SHOTS) await mkdir(SHOTS, { recursive: true });
   try {
-    for (const viewport of [{ width: 1440, height: 1000 }, { width: 390, height: 844 }]) {
-      for (const colorScheme of ['light', 'dark']) {
-        for (const size of [15, 19]) {
-          const context = await browser.newContext({ viewport, colorScheme });
-          const page = await context.newPage();
-          await page.addInitScript((value) => localStorage.setItem('sm-text-size', String(value)), size);
-          const errors = [];
-          page.on('pageerror', (error) => errors.push(error.message));
-          let sessions = fixture();
-          const answered = [];
-          const opened = [];
-          const retired = [];
-          const retireBodies = [];
-          const handoffs = [];
-          let rejectConditionalRetire = false;
-          await page.clock.install({ time: new Date(NOW) });
-          await page.exposeFunction('recordOpen', (url) => opened.push(url));
-          await page.addInitScript(() => { window.open = (url) => { window.recordOpen(url); return null; }; });
-          await page.route('http://localhost/**', async (route) => {
-            const request = route.request();
-            const url = new URL(request.url());
-            if (url.pathname.startsWith('/assets/')) {
-              const file = url.pathname.slice('/assets/'.length);
-              return route.fulfill({ body: await readFile(new URL(file, assets)), contentType: file.endsWith('.css') ? 'text/css' : 'text/javascript' });
-            }
-            if (request.isNavigationRequest()) return route.fulfill({
-              body: shell.replace('<html>', `<html data-theme="${colorScheme}">`), contentType: 'text/html',
-            });
-            const answer = /^\/sessions\/([^/]+)\/needs-you\/answered$/.exec(url.pathname);
-            if (answer && request.method() === 'POST') {
-              const id = decodeURIComponent(answer[1]);
-              answered.push(id);
-              sessions = sessions.map((s) => (s.id === id ? { ...s, facts: { ...s.facts, you: null }, attention: { section: 'idle', reason: null, order_key: '0' } } : s));
-              return route.fulfill({ json: { facts: null } });
-            }
-            const retire = /^\/sessions\/([^/]+)\/retire$/.exec(url.pathname);
-            if (retire && request.method() === 'POST') {
-              const body = JSON.parse(request.postData());
-              retireBodies.push(body);
-              if (body.if_finished_idle && rejectConditionalRetire) {
-                return route.fulfill({ status: 409, json: { detail: 'Agent is no longer finished and idle' } });
-              }
-              retired.push(decodeURIComponent(retire[1]));
-              if (decodeURIComponent(retire[1]) === 'sm-1776') sessions = sessions.filter((s) => s.id !== 'sm-1776');
-              return route.fulfill({ json: {} });
-            }
-            if (url.pathname.endsWith('/handoff-policy') && request.method() === 'PUT') {
-              handoffs.push(JSON.parse(request.postData()));
-              return route.fulfill({ json: {} });
-            }
-            if (url.pathname.endsWith('/last-turn')) return route.fulfill({ status: 404, json: { detail: 'none' } });
-            if (url.pathname.startsWith('/inbox/agent/')) return route.fulfill({ json: { title: 'Thread', can_send: false, items: [] } });
-            if (url.pathname === '/watch/state') {
-              const only = url.searchParams.get('session');
-              const list = only ? sessions.filter((s) => s.id === only) : sessions;
-              const counts = { live: sessions.length };
-              for (const s of sessions) counts[s.attention.section === 'you' ? 'needs_you' : s.attention.section] = (counts[s.attention.section === 'you' ? 'needs_you' : s.attention.section] || 0) + 1;
-              return route.fulfill({ json: { generated_at: NOW, sessions: list, counts } });
-            }
-            if (url.pathname === '/client/host-status') {
-              return route.fulfill({ json: { memory_used_bytes: 115e9, memory_total_bytes: 256e9, cpu_percent: 21, gpu_percent: 0 } });
-            }
-            return route.fulfill({ json: {} });
-          });
-          await page.goto('http://localhost/');
-          await page.waitForFunction(() => document.querySelectorAll('.acard').length > 5);
-          assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()),
-            colorScheme === 'dark' ? '#09090D' : '#F5F5F2');
+    for (const colorScheme of ['light', 'dark']) {
+      for (const size of [15, 19]) {
+        const { context, page, errors, state } = await open(browser, { viewport: { width: 1440, height: 1000 }, colorScheme, size, sessions: [...fixture(), shell1] });
+        await page.goto('http://localhost/board');
+        await page.locator('.sidebar .sb-line').first().waitFor();
+        // One left column: search, every page link, the Agents heading, rows, meters, Settings.
+        assert.equal(await page.locator('nav.sidebar').count(), 1);
+        assert.equal(await page.locator('.rail').count(), 0, 'no second left column');
+        assert.equal(await page.locator('.sidebar .sb-top .search').count(), 1);
+        assert.deepEqual(await page.locator('.sidebar .sb-pages .item .lb').allInnerTexts(),
+          ['Inbox', 'Board', 'Queue', 'Artifacts', 'Notes', 'Analytics', 'History', 'Guestbook']);
+        assert.equal(await page.locator('.sidebar .sb-pages .item.on .lb').innerText(), 'Board');
+        assert.equal(await page.locator('.sidebar .item', { hasText: 'Queue' }).locator('b').innerText(), '1 · 1');
+        assert.equal(await page.locator('.sidebar > .item .lb').innerText(), 'Settings');
+        assert.equal(await page.locator('.sidebar .dash').count(), 1);
+        assert.equal(await page.locator('.tabbar').isVisible(), false);
+        // The heading: 14 live agents, 2 need you; the shell is not an agent.
+        assert.equal((await page.locator('.sb-head .sb-live').innerText()).trim(), '14 live ›');
+        assert.equal(await page.locator('.sb-head b.magenta').innerText(), '2');
+        // Pages first: one-line rows with the short fact, in attention order; Idle folded to one row.
+        assert.deepEqual(await sideRows(page), [
+          'sm-1790-reviewer 12m', 'sm-1726-engineer 6m', 'far-1855 done', 'waits-in-line ⏸ queue', 'sm-1776 1m', 'sm-1782 ⏸ queue',
+          'iter8-run ▶ 2h', 'waits-review ⏸ review', 'studio-zsh shell']);
+        assert.equal((await page.locator('.sidebar .sb-idle').innerText()).trim(), 'Idle · 6 ›');
+        // The top bar: page name; Moon, Bug, then New agent in the corner; search lives in the sidebar.
+        assert.equal(await page.locator('.bar h1').innerText(), 'Board');
+        assert.deepEqual(await page.locator('.bar > button, .bar > .anchor > button').evaluateAll((b) => b.filter((x) => x.offsetParent)
+          .map((x) => x.getAttribute('aria-label') || x.textContent.trim())), ['Overnight mode', 'Report a bug', 'New agent']);
+        const width = await page.evaluate(() => document.documentElement.scrollWidth);
+        assert.ok(width <= 1440, `no horizontal scroll (got ${width})`);
+        assert.ok(Math.abs((await page.locator('.sidebar').boundingBox()).width - 15.5 * size) <= 1, 'the sidebar is 15.5 rem');
+        if (SHOTS) await page.screenshot({ path: `${SHOTS}/sidebar-board-${colorScheme}-${size}.png` });
 
-          const headers = await page.locator('.grp.sec').allInnerTexts();
-          assert.deepEqual(headers.map((t) => t.trim().toLowerCase()), ['needs you', 'finished', 'waiting long', 'moving', 'waiting', 'idle · 6']);
-          const strip = (await page.locator('.sum').innerText()).replace(/\s+/g, ' ').trim();
-          assert.equal(strip, '2 needs you · 1 finished · 1 waiting long · 3 moving · 1 waiting · 6 idle');
-          // Facts: the overlaps show side by side, and the You line only when present.
-          const card = (name) => page.locator('.acard', { has: page.locator('.nm', { hasText: new RegExp(`^${name}$`) }) });
-          assert.equal((await card('sm-1726-engineer').locator('.you').innerText()).startsWith('◆ 6m: one manual Chrome check'), true);
-          assert.equal(await card('sm-1790-reviewer').locator('.facts .fa').first().innerText(), '● Working 3m');
-          assert.equal(await card('sm-1790-reviewer').locator('.ok').count(), 0, 'a doc review has no ✓');
-          assert.ok((await card('far-1855').locator('.you').innerText()).startsWith('✔ 1855 done and closed: 68 views built, all checks pass, PR merged and the ticket closed.'));
-          assert.equal(await card('iter8-run').locator('.facts .fa').nth(1).innerText(), '▶ 2 running · 2h 56m');
-          assert.equal(await card('sm-1782').locator('.facts .fa').nth(1).innerText(), '⏸ Waiting 8m · 1st in line');
-          assert.equal(await card('iter8-run').locator('.you').count(), 0);
-          // Both icons on a Claude agent with a claude.ai session; Terminal only on Codex.
-          assert.equal(await card('iter8-run').locator('.icons button').count(), 2);
-          assert.equal(await card('sm-1726-engineer').locator('.icons button').count(), 1);
-          // Idle agents without a ticket fold beyond the fourth.
-          assert.equal(await page.locator('.fold-more').innerText(), '+ 2 more idle: iter8-dedicated-reviewer (2h 11m), sm-scout (2h 41m)');
-          const pageWidth = await page.evaluate(() => document.documentElement.scrollWidth);
-          assert.ok(pageWidth <= viewport.width, `no horizontal scroll at ${viewport.width} px (got ${pageWidth})`);
-          const name = `agents-${viewport.width}-${colorScheme}-${size}`;
-          if (shots) await page.screenshot({ path: `${shots}/${name}.png`, fullPage: true });
-          assert.deepEqual(errors, []);
-
-          if (size === 15) {
-            // The finished card retires directly without opening the details band.
-            if (shots) await page.screenshot({ path: `${shots}/retire-card-${viewport.width}-${colorScheme}.png`, fullPage: true });
-            await card('far-1855').getByRole('button', { name: 'Retire' }).click();
-            assert.deepEqual(retired, ['far-1855']);
-            assert.deepEqual(retireBodies, [{ if_finished_idle: true }]);
-            assert.equal(new URL(page.url()).searchParams.get('open'), null);
-            await card('far-1855').click();
-            await page.locator('.details-band').waitFor();
-            if (viewport.width === 390) await page.locator('.details-band').scrollIntoViewIfNeeded();
-            const actions = page.locator('.details-band .acts');
-            await actions.waitFor();
-            assert.deepEqual(await actions.locator(':scope > button, :scope > .anchor > button, :scope > .retire-action > button').allInnerTexts(),
-              ['Open in Claude ↗', '⌨ Terminal', 'Retire', 'Hand off…', '⋯']);
-            if (shots) await page.screenshot({ path: `${shots}/retire-band-${viewport.width}-${colorScheme}.png`, fullPage: true });
-            rejectConditionalRetire = true;
-            const farRetire = actions.locator('.retire-action > button');
-            const farPosition = await farRetire.boundingBox();
-            await farRetire.click();
-            await actions.locator('.retire-confirm').waitFor();
-            assert.deepEqual(retired, ['far-1855']);
-            const farConfirmedPosition = await farRetire.boundingBox();
-            assert.deepEqual([farConfirmedPosition.x, farConfirmedPosition.y], [farPosition.x, farPosition.y],
-              'conditional confirmation keeps Retire in place');
-            await actions.locator('.retire-confirm').getByRole('button', { name: 'Cancel' }).click();
-            rejectConditionalRetire = false;
-            await actions.getByRole('button', { name: 'More' }).click();
-            const menu = actions.locator('.pop.menu');
-            assert.deepEqual(await menu.locator(':scope > button').allInnerTexts(),
-              ['Hand off now', 'Clone', 'New shell here', 'Follow', 'Copy attach command', 'Rename…', 'Pin a note…']);
-            const menuBox = await menu.boundingBox();
-            const bandBox = await page.locator('.details-band').boundingBox();
-            assert.ok(menuBox.x >= bandBox.x && menuBox.x + menuBox.width <= bandBox.x + bandBox.width,
-              `menu fits inside the details band at ${viewport.width} px`);
-            if (shots) await page.screenshot({ path: `${shots}/retire-menu-${viewport.width}-${colorScheme}.png`, fullPage: true });
-            await menu.getByRole('button', { name: 'Hand off now' }).click();
-            await menu.getByRole('button', { name: 'Confirm handoff' }).click();
-            assert.deepEqual(handoffs, [{ ask_now: true }]);
-            await card('sm-1776').click();
-            await page.waitForFunction(() => document.querySelector('.details-band .phd .t')?.textContent === 'sm-1776');
-            if (viewport.width === 390) await page.locator('.details-band').scrollIntoViewIfNeeded();
-            const retire = page.locator('.details-band .acts .retire-action > button');
-            const position = await retire.boundingBox();
-            await retire.click();
-            assert.equal((await page.locator('.details-band .retire-confirm').innerText()).replace(/\s+/g, ' '), 'Retire sm-1776? Cancel');
-            assert.deepEqual(retired, ['far-1855']);
-            const confirmedPosition = await retire.boundingBox();
-            assert.deepEqual([confirmedPosition.x, confirmedPosition.y], [position.x, position.y],
-              'confirmation keeps Retire in place');
-            const prompt = await page.locator('.details-band .retire-confirm').boundingBox();
-            assert.ok(prompt.x >= 0 && prompt.x + prompt.width <= viewport.width,
-              `confirmation fits inside ${viewport.width} px`);
-            if (shots) await page.screenshot({ path: `${shots}/retire-confirm-${viewport.width}-${colorScheme}.png`, fullPage: true });
-            await retire.click();
-            await page.waitForFunction(() => !new URL(location.href).searchParams.has('open'));
-            assert.deepEqual(retired, ['far-1855', 'sm-1776']);
-            await page.locator('.details-band').waitFor({ state: 'hidden' });
-            assert.equal(new URL(page.url()).searchParams.get('open'), null);
-            await card('sm-1776').waitFor({ state: 'hidden' });
-            if (viewport.width === 1440 && colorScheme === 'light') {
-              sessions = fixture();
-              await page.reload();
-              await page.waitForFunction(() => document.querySelectorAll('.acard').length > 5);
-            }
-          }
-
-          if (viewport.width === 1440 && colorScheme === 'light' && size === 15) {
-            // Clicking an icon does not open the band.
-            await card('iter8-run').getByRole('button', { name: 'Open in Claude (c)' }).click();
-            assert.deepEqual(opened, ['https://claude.ai/code/session_run']);
-            assert.equal(new URL(page.url()).searchParams.get('open'), null);
-            // j and k move the ring in display order; x presses ✓ on the selected card.
-            await page.locator('body').click({ position: { x: 5, y: 900 } });
-            await page.keyboard.press('j');
-            assert.equal(await page.locator('.card.kb .nm').innerText(), 'sm-1790-reviewer');
-            await page.keyboard.press('j');
-            await page.keyboard.press('k');
-            await page.keyboard.press('j');
-            assert.equal(await page.locator('.card.kb .nm').innerText(), 'sm-1726-engineer');
-            await page.keyboard.press('x');
-            await page.getByText('Marked answered').waitFor();
-            assert.deepEqual(answered, ['sm-1726-engineer']);
-            await page.waitForFunction(() => document.querySelectorAll('.grp.sec')[0].textContent.trim() === 'Needs you'
-              && document.querySelectorAll('#sec-you + .cards .acard').length === 1);
-            // The answered agent moved to Idle with the ring; k stops at the first card.
-            for (let i = 0; i < 10; i++) await page.keyboard.press('k');
-            assert.equal(await page.locator('.card.kb .nm').innerText(), 'sm-1790-reviewer');
-            // c opens Claude for the selected card, Enter opens its details band.
-            await page.keyboard.press('c');
-            assert.deepEqual(opened.at(-1), 'https://claude.ai/code/session_rev');
-            await page.keyboard.press('Enter');
-            await page.waitForFunction(() => new URLSearchParams(location.search).get('open') === 'agent:sm-1790-reviewer');
-            await page.locator('.details-band').waitFor();
-            if (shots) await page.screenshot({ path: `${shots}/agents-band-1440-light-15.png`, fullPage: true });
-            // The fold opens on click; By repo is today's grouping and is remembered.
-            await page.locator('.fold-more').click();
-            assert.equal(await page.locator('#sec-idle + .cards .acard').count(), 7);
-            await page.getByRole('radio', { name: 'By repo' }).click();
-            assert.deepEqual(await page.locator('.grp:not(.sec)').allTextContents(), ['fractal-algo-rust', 'session-manager']);
-            assert.equal(await page.evaluate(() => localStorage.getItem('sm-agents-view')), '"repo"');
-            // t opens the selected agent's terminal.
-            await page.keyboard.press('t');
-            await page.waitForFunction(() => location.pathname === '/terminal/sm-1790-reviewer');
-            assert.deepEqual(errors, []);
-          }
-          await context.close();
+        if (colorScheme === 'light' && size === 15) {
+          // The hover card: today's agent card after 400 ms; none on a shell row; a click opens the terminal.
+          await page.locator('.sb-line', { hasText: 'studio-zsh' }).hover();
+          await page.waitForTimeout(600);
+          assert.equal(await page.locator('.sb-card').count(), 0, 'no card on a shell row');
+          await page.locator('.sb-line', { hasText: 'iter8-run' }).hover();
+          assert.equal(await page.locator('.sb-card').count(), 0, 'not before 400 ms');
+          const card = page.locator('.sb-card .acard');
+          await card.waitFor();
+          assert.equal(await card.locator('.nm').innerText(), 'iter8-run');
+          assert.equal(await card.locator('.facts .fa').nth(1).innerText(), '▶ 2 running · 2h 56m');
+          assert.equal(await card.locator('.icons button').count(), 2, 'Terminal and Open in Claude');
+          await card.getByRole('button', { name: 'Open in Claude' }).click();
+          assert.deepEqual(state.opened, ['https://claude.ai/code/session_run']);
+          if (SHOTS) await page.screenshot({ path: `${SHOTS}/sidebar-hover-card.png` });
+          // ✓ in the card clears the question, as on the Agents page.
+          await page.locator('.sb-line', { hasText: 'sm-1726-engineer' }).hover();
+          await page.locator('.sb-card .acard', { hasText: 'sm-1726-engineer' }).getByRole('button', { name: 'Mark answered' }).click();
+          assert.deepEqual(state.answered, ['sm-1726-engineer']);
+          // + opens the New session sheet in the sidebar.
+          await page.locator('.sb-head').getByRole('button', { name: 'New agent' }).click();
+          const start = page.locator('.new-agent-host.side .pop').getByRole('button', { name: 'Start' });
+          await start.waitFor();
+          // Not clipped by the sidebar and reachable in the window: the button is what sits under its own centre.
+          await start.scrollIntoViewIfNeeded();
+          assert.ok(await start.evaluate((b) => { const r = b.getBoundingClientRect(); return document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) === b; }));
+          // The fixed test clock slows effect flushes; give the sheet's listeners a moment to attach.
+          await page.waitForTimeout(300);
+          await page.mouse.click(900, 600);
+          await page.locator('.new-agent-host .pop').waitFor({ state: 'detached' });
+          // ⌘K searches from any page.
+          await page.keyboard.press('Meta+k');
+          await page.locator('.palette').waitFor();
+          await page.locator('.scrim').click({ position: { x: 5, y: 5 } });
+          await page.locator('.palette').waitFor({ state: 'detached' });
+          // The chevron swaps to agents first: icons for pages, today's two-line rows; remembered for pages.
+          await page.locator('.sb-head .sb-live').click();
+          await page.locator('.sidebar .term-switch .sw-row').first().waitFor();
+          assert.equal(await page.locator('.sidebar .sb-icons .item.icon').count(), 8);
+          assert.equal(await page.locator('.sidebar .sb-icons .item.on').getAttribute('aria-label'), 'Board');
+          assert.equal((await page.locator('.sb-head .sb-live').innerText()).trim(), '14 live ⌄');
+          assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('sm-sidebar-arrangement'))), { pages: 'agents', terminal: 'agents' });
+          if (SHOTS) await page.screenshot({ path: `${SHOTS}/sidebar-agents-first-board.png` });
+          await page.locator('.sb-head .sb-live').click();
+          // ⌘\ folds to the strip, with a magenta dot while something needs you; remembered per view kind.
+          await page.keyboard.press('Meta+Backslash');
+          await page.locator('.sidebar').waitFor({ state: 'detached' });
+          assert.equal(await page.locator('.sb-edge .sb-signal.magenta').count(), 1);
+          assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('sm-sidebar'))), { pages: 'folded', terminal: 'open', doc: 'folded' });
+          assert.ok((await page.locator('.sb-edge').boundingBox()).width <= 15);
+          await page.getByRole('button', { name: 'Unfold sidebar' }).click();
+          await page.locator('.sidebar').waitFor();
+          // A row opens its terminal, where the sidebar puts agents first with that row current.
+          await page.locator('.sb-line', { hasText: 'iter8-run' }).click();
+          await page.waitForFunction(() => location.pathname === '/terminal/iter8-run');
+          await page.locator('.sidebar .term-switch .sw-row.cur', { hasText: 'iter8-run' }).waitFor();
+          assert.equal(await page.locator('.sidebar .sb-icons .item.on').count(), 0);
+          // ⌘⌥↓ steps to the next row's terminal; from Board it opens the first row's.
+          await page.keyboard.press('Meta+Alt+ArrowDown');
+          await page.waitForFunction(() => location.pathname === '/terminal/waits-review');
+          await page.locator('.sidebar .sb-icons .item[aria-label="Inbox"]').click();
+          await page.waitForFunction(() => location.pathname === '/inbox');
+          await page.keyboard.press('Meta+Alt+ArrowDown');
+          await page.waitForFunction(() => location.pathname === '/terminal/sm-1790-reviewer');
+          // Notes' main action is New note.
+          await page.locator('.sidebar .sb-icons .item[aria-label="Notes"]').click();
+          await page.waitForFunction(() => location.pathname === '/notes');
+          assert.equal(await page.locator('.bar > button.pri').innerText(), 'New note');
+          assert.equal(await page.locator('.notes-page .notes-tools .btn.pri').count(), 0, "the page's own + New moved to the bar");
         }
+        assert.deepEqual(errors, []);
+        await context.close();
       }
     }
   } finally { await browser.close(); }
 });
 
-test('long agent name keeps the Agents confirmation and Cancel in a phone viewport', async () => {
+test('landing at / (2543 D.5): last live terminal, else the top row, else an empty page; the list on a phone', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const cases = [
+      [{}, fixture(), '/terminal/sm-1790-reviewer'],
+      [{ 'sm-term-last': 'iter8-run' }, fixture(), '/terminal/iter8-run'],
+      [{ 'sm-term-last': 'retired-long-ago' }, fixture(), '/terminal/sm-1790-reviewer'],
+      // Only idle agents: the top idle row.
+      [{}, fixture().filter((s) => s.attention.section === 'idle'), '/terminal/sm-1768'],
+    ];
+    for (const [storage, sessions, path] of cases) {
+      const { context, page, errors } = await open(browser, { viewport: { width: 1440, height: 900 }, sessions, storage });
+      await page.goto('http://localhost/');
+      await page.waitForFunction((want) => location.pathname === want, path);
+      await page.locator('.term-page').waitFor();
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+    {
+      const { context, page } = await open(browser, { viewport: { width: 1440, height: 900 }, sessions: [] });
+      await page.goto('http://localhost/');
+      await page.locator('.home-empty', { hasText: 'No live agents' }).getByRole('button', { name: 'New agent' }).waitFor();
+      assert.equal(new URL(page.url()).pathname, '/');
+      await context.close();
+    }
+    {
+      // A link to an agent's details lands on its terminal with Details open.
+      const { context, page } = await open(browser, { viewport: { width: 1440, height: 900 } });
+      await page.goto('http://localhost/?open=agent:sm-1776');
+      await page.waitForFunction(() => location.pathname === '/terminal/sm-1776' && new URLSearchParams(location.search).get('open') === 'agent:sm-1776');
+      await page.locator('.term-panel .phd .t', { hasText: 'sm-1776' }).waitFor();
+      await context.close();
+    }
+    {
+      // Phone: `/` is the agents list; list pages have the tab bar and no sidebar.
+      const { context, page, errors } = await open(browser, { viewport: { width: 390, height: 844 } });
+      await page.goto('http://localhost/');
+      await page.locator('.home-list .sw-row').first().waitFor();
+      assert.equal(new URL(page.url()).pathname, '/');
+      assert.equal(await page.locator('.tabbar').isVisible(), true);
+      assert.deepEqual(await page.locator('.tabbar .item').evaluateAll((items) => items.filter((x) => x.offsetParent).map((x) => x.textContent.trim())),
+        ['Agents', 'Board', 'Inbox1', 'Queue1', 'Artifacts', 'Notes', 'Settings']);
+      assert.equal(await page.locator('.sb-wrap').isVisible(), false);
+      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth) <= 390);
+      if (SHOTS) await page.screenshot({ path: `${SHOTS}/home-390.png` });
+      await page.goto('http://localhost/board');
+      await page.locator('.bar h1', { hasText: 'Board' }).waitFor();
+      assert.equal(await page.locator('.sb-wrap').isVisible(), false);
+      assert.equal(await page.locator('.bar > .search').isVisible(), true, 'search stays in the bar on a phone');
+      assert.deepEqual(errors, []);
+      await context.close();
+    }
+  } finally { await browser.close(); }
+});
+
+test('long agent name keeps the details Retire confirmation and Cancel in a phone viewport', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
@@ -291,12 +297,13 @@ test('long agent name keeps the Agents confirmation and Cancel in a phone viewpo
         return route.fulfill({ body: await readFile(new URL(file, assets)), contentType: file.endsWith('.css') ? 'text/css' : 'text/javascript' });
       }
       if (route.request().isNavigationRequest()) return route.fulfill({ body: shell, contentType: 'text/html' });
+      if (url.pathname === '/client/board') return route.fulfill({ json: { lanes: [], other: [] } });
       if (url.pathname === '/watch/state') return route.fulfill({ json: { generated_at: NOW, sessions, counts: {} } });
       return route.fulfill({ json: {} });
     });
-    await page.goto('http://localhost/?open=agent:sm-1776');
-    await page.locator('.details-band .acts .retire-action > button').click();
-    const prompt = page.locator('.details-band .retire-confirm');
+    await page.goto('http://localhost/board?open=agent:sm-1776');
+    await page.locator('.panel .acts .retire-action > button').click();
+    const prompt = page.locator('.panel .retire-confirm');
     const cancel = prompt.getByRole('button', { name: 'Cancel' });
     const box = await prompt.boundingBox();
     const cancelBox = await cancel.boundingBox();
@@ -321,6 +328,7 @@ test('agent details are one view (#2280): status, then the thread with its docs,
         return route.fulfill({ body: await readFile(new URL(file, assets)), contentType: file.endsWith('.css') ? 'text/css' : 'text/javascript' });
       }
       if (request.isNavigationRequest()) return route.fulfill({ body: shell, contentType: 'text/html' });
+      if (url.pathname === '/client/board') return route.fulfill({ json: { lanes: [], other: [] } });
       if (url.pathname === '/watch/state') {
         const only = url.searchParams.get('session');
         const all = fixture().map((s) => s.id === 'sm-1776' ? { ...s, facts: { ...s.facts, you: { kind: 'prompt', since: NOW, text: 'Allow prompt in its terminal', more: 0, dismissible: false } } } : s);
@@ -344,12 +352,12 @@ test('agent details are one view (#2280): status, then the thread with its docs,
       return route.fulfill({ json: {} });
     });
     // No tabs: the status block sits above the thread, and the question shows in the thread.
-    await page.goto('http://localhost/?open=agent:sm-1726-engineer');
-    await page.locator('.details-band .agent-status').waitFor();
-    assert.equal(await page.locator('.details-band .tabs').count(), 0);
-    await page.locator('.details-band .thread-items', { hasText: 'Can you run one manual Chrome check?' }).waitFor();
-    assert.equal(await page.locator('.details-band .thread-doc-card strong').innerText(), '1726 memo');
-    assert.equal(await page.locator('.details-band .msgbox').count(), 0, 'one compose box, the thread\'s');
+    await page.goto('http://localhost/board?open=agent:sm-1726-engineer');
+    await page.locator('.panel .agent-status').waitFor();
+    assert.equal(await page.locator('.panel .tabs').count(), 0);
+    await page.locator('.panel .thread-items', { hasText: 'Can you run one manual Chrome check?' }).waitFor();
+    assert.equal(await page.locator('.panel .thread-doc-card strong').innerText(), '1726 memo');
+    assert.equal(await page.locator('.panel .msgbox').count(), 0, 'one compose box, the thread\'s');
     // A ticket's work thread sends through its own route, so the chosen recipient is the one that gets it.
     await page.getByRole('combobox', { name: 'Reply to' }).selectOption('sm-1726-helper');
     await page.getByRole('textbox', { name: 'Reply' }).fill('Ran it, passes');
@@ -359,9 +367,9 @@ test('agent details are one view (#2280): status, then the thread with its docs,
     assert.equal(sent[0].to, 'sm-1726-helper');
     if (SHOTS) await page.screenshot({ path: `${SHOTS}/agent-details-one-view.png`, fullPage: true });
     // An agent with no thread yet shows its last turn and the plain message box.
-    await page.goto('http://localhost/?open=agent:sm-1776');
-    await page.locator('.details-band .last-turn', { hasText: 'Done; one question left.' }).waitFor();
-    assert.equal(await page.locator('.details-band .msgbox').count(), 1);
+    await page.goto('http://localhost/board?open=agent:sm-1776');
+    await page.locator('.panel .last-turn', { hasText: 'Done; one question left.' }).waitFor();
+    assert.equal(await page.locator('.panel .msgbox').count(), 1);
     assert.deepEqual(errors, []);
   } finally { await browser.close(); }
 });
@@ -382,6 +390,7 @@ test('Hand off…: a cleared field takes a typed percent; presets; per-agent rev
         return route.fulfill({ body: await readFile(new URL(file, assets)), contentType: file.endsWith('.css') ? 'text/css' : 'text/javascript' });
       }
       if (request.isNavigationRequest()) return route.fulfill({ body: shell, contentType: 'text/html' });
+      if (url.pathname === '/client/board') return route.fulfill({ json: { lanes: [], other: [] } });
       if (url.pathname === '/watch/state') return route.fulfill({ json: { generated_at: NOW, sessions: fixture(), counts: {} } });
       if (url.pathname === '/sessions/sm-1776/handoff-policy') {
         if (request.method() === 'PUT') {
@@ -394,8 +403,8 @@ test('Hand off…: a cleared field takes a typed percent; presets; per-agent rev
       if (url.pathname === '/inbox/agent/sm-1776') return route.fulfill({ status: 404, json: { detail: 'Thread not found' } });
       return route.fulfill({ json: {} });
     });
-    await page.goto('http://localhost/?open=agent:sm-1776');
-    await page.locator('.details-band .acts').getByRole('button', { name: 'Hand off…' }).click();
+    await page.goto('http://localhost/board?open=agent:sm-1776');
+    await page.locator('.panel .acts').getByRole('button', { name: 'Hand off…' }).click();
     const pop = page.locator('.handoff-pop');
     const field = pop.getByRole('spinbutton', { name: 'Hand off at, percent of context' });
     await field.waitFor();
@@ -449,6 +458,7 @@ test('Settings › Context handoff (#2294): defaults grid, review switches, Set 
         }
         if (url.pathname === '/handoff-defaults') return route.fulfill({ json: defaults });
         if (url.pathname === '/handoff-overrides') return route.fulfill({ json: { items } });
+        if (url.pathname === '/client/board') return route.fulfill({ json: { lanes: [], other: [] } });
         if (url.pathname === '/watch/state') return route.fulfill({ json: { generated_at: NOW, sessions: [], counts: {} } });
         return route.fulfill({ json: {} });
       });

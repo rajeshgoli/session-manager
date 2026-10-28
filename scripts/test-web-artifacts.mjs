@@ -87,7 +87,7 @@ test('investigate opens the New agent launcher with the brief, and the page scro
     assert.equal(await message.inputValue(),'The artifact folder research-data in /artifacts needs a look.');
     assert.equal(await page.getByPlaceholder('sm picks one').inputValue(),'artifact-research-data');
     assert.deepEqual(posts,[{root:'/artifacts',action:'brief'}],'nothing is started until the owner starts it');
-    assert.ok(await page.locator('.rail').isVisible());
+    assert.ok(await page.locator('.sb-wrap').isVisible());
     assert.deepEqual(errors,[]);
   } finally {await browser.close();}
 });

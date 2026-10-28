@@ -1,13 +1,13 @@
-// Agents page and agent panel (spec 1710 D6.1, D6.2; 1782 F). Data: GET /watch/state.
-import { useEffect, useRef, useState } from 'preact/hooks';
+// Agent facts, the hover card and the agent panel (spec 1710 D6.2; 1782 F; 2543 D). Data: GET /watch/state.
+import { useEffect, useState } from 'preact/hooks';
 import { safeThreadHtml, Thread } from './inbox.js';
 import {
   html, api, inboxWrite, usePoll, useNow, config, age, clock,
-  basename, homeRelative, providerLabel, Ring, Icon, Popover, Seg, Toggle, Links,
-  openPanel, closePanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store, typingIn, setShared,
+  basename, homeRelative, providerLabel, Ring, Icon, Popover, Links,
+  closePanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored,
 } from './ui.js';
 import { HandoffPopover } from './handoff.js';
-import { isShell, shellFact, ShellMenu, ShellTiles, createShell, shellError, hiddenShells } from './shell.js';
+import { isShell, shellFact, ShellMenu, createShell, shellError } from './shell.js';
 
 // ---- facts and attention (1782 B: the server computes both) ------------------
 
@@ -16,10 +16,6 @@ export const SECTIONS = ['blocked', 'you', 'finished', 'waiting_long', 'moving',
 export const SECTION_LABEL = {
   blocked: 'Blocked on you', you: 'Needs you', finished: 'Finished', waiting_long: 'Waiting long', moving: 'Moving',
   waiting: 'Waiting', idle: 'Idle', stopped: 'Stopped',
-};
-/** The summary strip's words for each count. */
-const COUNT_LABEL = {
-  blocked: 'blocked on you', you: 'needs you', finished: 'finished', waiting_long: 'waiting long', moving: 'moving', waiting: 'waiting', idle: 'idle',
 };
 /** Section colours (1782 A3). */
 export const SECTION_TONE = {
@@ -56,48 +52,6 @@ export function sectionAgents(sessions) {
   return SECTIONS
     .map((section) => ({ section, agents: sorted.filter((agent) => sectionOf(agent) === section) }))
     .filter((group) => group.agents.length);
-}
-
-/**
- * Idle agents without a ticket beyond the fourth fold away (1782 F); nothing
- * else folds, and the open agent (`keepId`) stays out of the fold.
- */
-export function foldIdle(agents, keepId = null, keep = 4) {
-  const shown = [];
-  const folded = [];
-  let loose = 0;
-  for (const agent of agents) {
-    if (hasTicket(agent) || agent.id === keepId || loose++ < keep) shown.push(agent);
-    else folded.push(agent);
-  }
-  return { shown, folded };
-}
-
-/** "+ 3 more idle: sm-1768 (11m), …" */
-export function foldText(folded, now = Date.now()) {
-  const names = folded.map((agent) => `${agent.name} (${age(agent.facts && agent.facts.agent && agent.facts.agent.since, now) || '–'})`);
-  return `+ ${folded.length} more idle: ${names.join(', ')}`;
-}
-
-/** The summary strip: zero counts drop out, except needs you. */
-export function summaryCounts(counts) {
-  const c = counts || {};
-  return Object.keys(COUNT_LABEL)
-    // needs_you counts blocked agents too; the strip shows them apart.
-    .map((section) => ({ section, n: section === 'you' ? Math.max(0, (c.needs_you || 0) - (c.blocked || 0)) : c[section] || 0, label: COUNT_LABEL[section] }))
-    .filter(({ section, n }) => n > 0 || section === 'you');
-}
-
-/** Watch counts also include shells; the Agents summary describes agents only. */
-export function agentCounts(counts, sessions) {
-  const result = { ...counts };
-  for (const shell of sessions.filter(isShell)) {
-    if (shell.state === 'stopped' || shell.attention?.section === 'stopped') continue;
-    const key = shell.attention?.section === 'you' ? 'needs_you' : shell.attention?.section;
-    if (key) result[key] = Math.max(0, (result[key] || 0) - 1);
-    result.live = Math.max(0, (result.live || 0) - 1);
-  }
-  return result;
 }
 
 /** "● Working 3m" or "○ Idle 7m". */
@@ -365,15 +319,13 @@ function RenameEditor({ agent, onSaved, onClose }) {
   </div>`;
 }
 
-// ---- page -------------------------------------------------------------------
-
-const refreshMs = () => Math.max(1, config.refresh_seconds || 3) * 1000;
+// ---- host restart ---------------------------------------------------------------
 
 /**
  * After a host restart (sm#2054): who it interrupted, why, and one button
  * that restores them all. Each row restores or retires one agent.
  */
-function HostRestartBanner() {
+export function HostRestartBanner() {
   const [doc, , reload] = usePoll(() => api('/host-restarts/latest'), 60000);
   const [busy, setBusy] = useState(false);
   const restart = doc && doc.restart;
@@ -408,204 +360,34 @@ function HostRestartBanner() {
   </div>`;
 }
 
-export function AgentsPage({ openRef }) {
-  const [filter, setFilter] = useState(() => stored('sm-agents-filter', 'live'));
-  const [view, setView] = useState(() => (stored('sm-agents-view', 'attention') === 'repo' ? 'repo' : 'attention'));
-  const [unfold, setUnfold] = useState(false);
-  const [cursor, setCursor] = useState(null);
-  const [jump, setJump] = useState(null);
-  const [doc, error, reload] = usePoll(
-    () => api(`/watch/state${filter === 'stopped' ? '?stopped=1' : ''}`),
-    // Stopped agents make the state large and slow, so that view polls less.
-    filter === 'stopped' ? 30000 : refreshMs(),
-    [filter],
-  );
-  const now = useNow(15000);
-  // The top bar's eye lists hidden shells while this page is open.
-  useEffect(() => { setShared('hidden_shells', { shells: hiddenShells(doc?.sessions), reload }); }, [doc]);
-  useEffect(() => () => setShared('hidden_shells', null), []);
-  const selected = openRef && openRef.startsWith('agent:') ? openRef.slice(6) : null;
-  const keys = useRef({ order: [], cursor: null });
-  const choose = (value) => {
-    setFilter(value);
-    store('sm-agents-filter', value);
-  };
-  const chooseView = (value) => {
-    setView(value);
-    store('sm-agents-view', value);
-  };
-  useEffect(() => { if (selected) setCursor(selected); }, [selected]);
-  useAgentKeys(keys, setCursor, reload);
-  useEffect(() => {
-    if (!jump || view !== 'attention') return;
-    const target = document.getElementById(`sec-${jump}`);
-    if (target) target.scrollIntoView({ block: 'start', behavior: 'smooth' });
-    setJump(null);
-  }, [jump, view]);
-  useEffect(() => {
-    const node = cursor && document.querySelector('.card.kb');
-    if (node) node.scrollIntoView({ block: 'nearest' });
-  }, [cursor]);
+// ---- hover card (2543 D.3) ----------------------------------------------------
 
-  if (!doc) {
-    return html`<div class="content">${error ? html`<p class="err">${error.message}</p>` : html`<p class="muted">Loading…</p>`}</div>`;
-  }
-  const sessions = (doc.sessions || []).filter(session => !isShell(session));
-  const shells = (doc.sessions || []).filter(session => isShell(session) && session.state !== 'stopped');
-  const titles = stored(TITLES_KEY, true) !== false;
-  const order = [];
-  const card = (agent, depth = 0) => {
-    order.push(agent);
-    return html`<${AgentCard} key=${agent.id} agent=${agent} depth=${depth} now=${now} showRepo=${view === 'attention'}
-      titles=${titles} selected=${agent.id === selected} cursor=${agent.id === cursor} onAnswered=${reload}
-      onRetired=${(done) => { if (done && selected === agent.id) closePanel(); reload(); }} />`;
-  };
-  const sections = view === 'attention' ? sectionAgents(sessions) : [];
-  const groups = view === 'repo' ? groupAgents(sessions) : [];
-  const body = view === 'attention'
-    ? sections.map(({ section, agents }) => {
-      let shown = agents;
-      let folded = [];
-      if (section === 'idle' && !unfold) ({ shown, folded } = foldIdle(agents, selected));
-      return html`<div class=${`grp sec ${SECTION_TONE[section]}`} id=${`sec-${section}`}>
-          ${SECTION_LABEL[section]}${['idle', 'stopped'].includes(section) ? ` · ${agents.length}` : ''}</div>
-        <div class="cards">
-          ${shown.map((agent) => card(agent))}
-          ${folded.length
-            ? html`<button type="button" class="fold-more" onClick=${() => setUnfold(true)}>${foldText(folded, now)}</button>`
-            : null}
-        </div>`;
-    })
-    : groups.map((group) => html`<div class="grp">${basename(group.repo)}</div>
-        <div class="cards">${group.agents.map(({ agent, depth }) => card(agent, depth))}</div>`);
-  keys.current = { order, cursor };
+const refreshMs = () => Math.max(1, config.refresh_seconds || 3) * 1000;
 
-  return html`<div class="content">
-    <${HostRestartBanner} />
-    <div class="toolbar">
-      <div class="sum">
-        ${summaryCounts(agentCounts(doc.counts, doc.sessions || [])).map(({ section, n, label }, index) => html`${index ? html`<span class="dot">·</span>` : null}
-          <button type="button" class=${`plain-btn ${n ? SECTION_TONE[section] : ''}`}
-            onClick=${() => { chooseView('attention'); setJump(section); }}><b>${n}</b> ${label}</button>`)}
-      </div>
-      <span style="flex:1"></span>
-      <${Seg} label="Order" value=${view} onChange=${chooseView}
-        options=${[{ value: 'attention', label: 'By attention' }, { value: 'repo', label: 'By repo' }]} />
-      <${Seg} label="Show" value=${filter} onChange=${choose}
-        options=${[{ value: 'live', label: 'Live' }, { value: 'stopped', label: 'With stopped' }]} />
-    </div>
-    ${!shells.length && !sessions.some((agent) => agent.state !== 'stopped')
-      ? html`<p class="empty">No live agents. Start one with New agent.</p>`
-      : null}
-    ${body}
-    <${ShellTiles} shells=${shells} now=${now} />
-  </div>`;
-}
-
-/**
- * The page's keys, when not typing (1782 F): j and k move the selection ring,
- * Enter opens the details band, t the terminal, c Claude, x presses ✓.
- */
-function useAgentKeys(keys, setCursor, reload) {
-  useEffect(() => {
-    let lastG = 0;
-    const down = (event) => {
-      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || typingIn(event)) return;
-      // "g a" and friends belong to the shell's page jumps.
-      if (event.key === 'g') { lastG = Date.now(); return; }
-      if (lastG && Date.now() - lastG < 1500) { lastG = 0; return; }
-      const { order, cursor } = keys.current;
-      const index = order.findIndex((agent) => agent.id === cursor);
-      const agent = index >= 0 ? order[index] : null;
-      if (event.key === 'j' || event.key === 'k') {
-        if (!order.length) return;
-        event.preventDefault();
-        const next = index < 0 ? 0 : Math.min(order.length - 1, Math.max(0, index + (event.key === 'j' ? 1 : -1)));
-        setCursor(order[next].id);
-        return;
-      }
-      if (!agent) return;
-      if (event.key === 'Enter') {
-        // A focused button or card handles its own Enter.
-        const target = event.composedPath?.()[0] || event.target;
-        if (target?.closest?.('button,a,[role=button]')) return;
-        event.preventDefault();
-        openPanel(`agent:${agent.id}`);
-      } else if (event.key === 't' && agent.state !== 'stopped') {
-        event.preventDefault();
-        openTerminal(agent);
-      } else if (event.key === 'c' && claudeLink(agent)) {
-        event.preventDefault();
-        openInClaude(agent);
-      } else if (event.key === 'x' && agent.facts && agent.facts.you && agent.facts.you.dismissible) {
-        event.preventDefault();
-        markAnswered(agent, reload);
-      }
-    };
-    document.addEventListener('keydown', down);
-    return () => document.removeEventListener('keydown', down);
-  }, [keys, setCursor, reload]);
-}
-
-/**
- * By repo: repos with any agent not idle or stopped first, then by name;
- * within a repo, top-level agents in attention order; children follow their
- * parent one step in (D6.1).
- */
-export function groupAgents(sessions) {
-  sessions = sessions.filter(session => !isShell(session));
-  const byId = new Map(sessions.map((agent) => [agent.id, agent]));
-  const children = new Map();
-  const roots = [];
-  for (const agent of sessions) {
-    const parent = agent.parent_session_id && byId.get(agent.parent_session_id);
-    if (parent) (children.get(parent.id) || children.set(parent.id, []).get(parent.id)).push(agent);
-    else roots.push(agent);
-  }
-  const repos = new Map();
-  for (const agent of roots) (repos.get(agent.repo) || repos.set(agent.repo, []).get(agent.repo)).push(agent);
-  const busy = (agents) => agents.some((agent) => !['idle', 'stopped'].includes(sectionOf(agent)));
-  const walk = (agent, depth, out, seen) => {
-    if (seen.has(agent.id)) return;
-    seen.add(agent.id);
-    out.push({ agent, depth });
-    for (const child of (children.get(agent.id) || []).sort(attentionOrder)) walk(child, depth + 1, out, seen);
-  };
-  return [...repos.entries()]
-    .map(([repo, agents]) => {
-      const out = [];
-      const seen = new Set();
-      for (const agent of agents.sort(attentionOrder)) walk(agent, 0, out, seen);
-      return { repo, agents: out, busy: busy(out.map((entry) => entry.agent)) };
-    })
-    .sort((a, b) => Number(b.busy) - Number(a.busy) || basename(a.repo).localeCompare(basename(b.repo)));
-}
-
-function AgentCard({ agent, depth, now, showRepo, titles, selected, cursor, onAnswered, onRetired }) {
+/** The card the Agents page showed for one agent; a click or its terminal icon opens the terminal. */
+export function AgentCard({ agent, now, onAnswered, onRetired, onOpen = () => openTerminal(agent) }) {
   const codex = (agent.provider || '').startsWith('codex');
   const section = sectionOf(agent);
   const faded = ['idle', 'stopped'].includes(section) && !hasTicket(agent);
   const linked = claudeLink(agent);
   const live = agent.state !== 'stopped';
   const tall = !!youFact(agent, now);
-  const title = titles ? ticketTitle(agent) : '';
-  const cls = ['card', 'acard', `edge-${edgeTone(agent)}`, tall && 'tall', title && 'titled', selected && 'sel', cursor && 'kb',
-    faded && 'faded', depth && 'child'].filter(Boolean).join(' ');
+  const title = stored(TITLES_KEY, true) !== false ? ticketTitle(agent) : '';
+  const cls = ['card', 'acard', `edge-${edgeTone(agent)}`, tall && 'tall', title && 'titled', faded && 'faded'].filter(Boolean).join(' ');
   const iconButton = (title, name, action) => html`<button type="button" class="icon-btn" title=${title} aria-label=${title}
     onClick=${(event) => { event.stopPropagation(); action(); }}><${Icon} name=${name} /></button>`;
-  return html`<div class=${cls} data-open-ref=${`agent:${agent.id}`} style=${depth > 1 ? `margin-left:${depth * 18}px` : ''} role="button" tabindex="0"
-    onClick=${() => openPanel(`agent:${agent.id}`)}
-    onKeyDown=${(event) => event.key === 'Enter' && event.target === event.currentTarget && openPanel(`agent:${agent.id}`)}>
+  return html`<div class=${cls} role="button" tabindex="0" onClick=${onOpen}
+    onKeyDown=${(event) => event.key === 'Enter' && event.target === event.currentTarget && onOpen()}>
     ${isShell(agent) ? html`<span class="ring none">▹</span>` : html`<${Ring} percent=${agent.context_percent} />`}
     <span class="nm" title=${agent.name}>${agent.name}</span>
     <span class="icons">
-      ${live ? iconButton('Terminal (t)', 'terminal', () => openTerminal(agent)) : null}
-      ${linked ? iconButton('Open in Claude (c)', 'external', () => openInClaude(agent)) : null}
+      ${live ? iconButton('Terminal', 'terminal', onOpen) : null}
+      ${linked ? iconButton('Open in Claude', 'external', () => openInClaude(agent)) : null}
     </span>
     ${title ? html`<span class="ttl" title=${title}>${title}</span>` : null}
     <span class="ln"><span class=${`prov ${isShell(agent) ? 'muted' : agent.provider === 'opencode' ? 'local' : codex ? 'codex' : 'claude'}`}>${isShell(agent) ? 'TERMINAL' : providerLabel(agent.provider).toUpperCase()}</span>
       ${isShell(agent) ? null : html`<span class="tk"> ${ticketText(agent)}</span>`}
-      ${showRepo && agent.repo ? html`<span class="repo"> ${basename(agent.repo)}</span>` : null}</span>
+      ${agent.repo ? html`<span class="repo"> ${basename(agent.repo)}</span>` : null}</span>
     <${Facts} agent=${agent} now=${now} onAnswered=${onAnswered} onRetired=${onRetired} cardSection=${section} />
   </div>`;
 }

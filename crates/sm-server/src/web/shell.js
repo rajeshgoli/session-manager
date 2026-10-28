@@ -1,6 +1,6 @@
 // Plain shell presentation and owner actions (plain_terminal_memo, appendix C).
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, age, basename, homeRelative, navigate, Popover, Icon, toast } from './ui.js';
+import { html, api, age, basename, navigate, Popover, Icon, toast } from './ui.js';
 
 export const isShell = row => row?.kind === 'shell';
 // The server allows this many characters in a shell name.
@@ -11,29 +11,6 @@ export function shellFact(shell, now = Date.now()) {
   const fact = shell.facts?.agent;
   const text = shell.facts?.text || fact?.text;
   return { text: text || `last input ${age(fact?.since || shell.last_activity, now) || 'now'}`, tone: 'muted' };
-}
-function ShellTile({ shell, now }) {
-  const folder = shell.working_dir || shell.repo;
-  const fact = shellFact(shell, now).text;
-  const detail = fact.startsWith('running') ? fact.replace(/^running/, 'Running') : fact.replace(/^last input/, 'Last used');
-  const href = `/terminal/${encodeURIComponent(shell.id)}`;
-  return html`<a class="terminal-tile" href=${href}
-    onClick=${event => { if (!event.metaKey && !event.ctrlKey && !event.shiftKey) { event.preventDefault(); navigate(href); } }}>
-    <span class="terminal-tile-icon"><${Icon} name="terminal" size="22" /></span>
-    <span class="terminal-tile-content"><strong>${shellTitle(shell)}</strong>
-      <span class="terminal-tile-path" title=${folder}>${homeRelative(folder)}</span>
-      <span class="terminal-tile-fact">${detail}</span></span>
-    <${Icon} name="unfold" size="16" />
-  </a>`;
-}
-/** Open shells as tiles. Hidden ones live behind the top bar's eye (HiddenShells). */
-export function ShellTiles({ shells, now }) {
-  const shown = shells.filter(shell => !shell.hidden);
-  if (!shown.length) return null;
-  return html`<section class="terminal-section" aria-label="Terminals">
-    <div class="terminal-section-heading"><h2>Terminals</h2><span>${shown.length} open</span></div>
-    <div class="terminal-tiles">${shown.map(shell => html`<${ShellTile} key=${shell.id} shell=${shell} now=${now} />`)}</div>
-  </section>`;
 }
 /** Live hidden shells, by name. */
 export const hiddenShells = sessions => (sessions || [])

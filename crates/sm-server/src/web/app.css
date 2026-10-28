@@ -10,7 +10,7 @@
   --night: #6D28D9; --night-bg: #EFEAFD; --night-bg-2: #F7F5FE; --night-line: #D9CFFB;
   --term: #FCFCFA; --term-ink: #16171B;
   --shadow: 0 10px 30px rgba(0, 0, 0, .14);
-  --rail-w: 9rem; --panel-w: 28rem;
+  --sidebar-w: 15.5rem; --edge-w: 14px; --rail-w: calc(var(--sidebar-w) + var(--edge-w)); --panel-w: 28rem;
   --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   --mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   color-scheme: light;
@@ -49,26 +49,78 @@ code, .mono { font-family: var(--mono); font-size: .9rem; }
 [hidden] { display: none !important; }
 
 /* ---- layout ---------------------------------------------------------------- */
-.app { display: grid; grid-template-columns: var(--rail-w) minmax(0, 1fr) auto; height: 100vh; height: 100dvh; }
-.app.folded { --rail-w: 3.2rem; }
-.main { min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+/* One frame on every page (2543 B.1): sidebar | main | side panel; the phone's tab bar under main. */
+.app { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; grid-template-rows: minmax(0, 1fr); height: 100vh; height: 100dvh; }
+.app.folded { --rail-w: var(--edge-w); }
+.sb-wrap { grid-column: 1; grid-row: 1; display: flex; min-height: 0; position: relative; }
+.main { grid-column: 2; grid-row: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
+.app > .panel { grid-column: 3; grid-row: 1; }
+.tabbar { display: none; }
 .content { flex: 1; overflow: auto; padding: 14px 16px 24px; display: flex; flex-direction: column; gap: 12px; }
 
-/* ---- rail ------------------------------------------------------------------ */
-.rail { background: var(--panel); border-right: 1px solid var(--line); padding: 10px 7px; display: flex; flex-direction: column; gap: 2px; min-width: 0; overflow: hidden auto; scrollbar-width: none; }
-.rail .brand { display: flex; align-items: center; justify-content: space-between; padding: 0 7px 10px; }
-.rail .brand a { font: 700 1.133rem var(--mono); color: var(--accent); }
-.rail .fold { border: 0; background: none; color: var(--ink-3); cursor: pointer; padding: 2px 4px; border-radius: 5px; }
-.rail .fold:hover { background: var(--panel-2); }
-.rail .item { display: flex; align-items: center; gap: 8px; padding: 5px 7px; border-radius: 6px; color: var(--ink-2); text-decoration: none; white-space: nowrap; position: relative; }
-.rail .item:hover { background: var(--panel-2); text-decoration: none; }
-.rail .item.on { background: var(--sel); color: var(--ink); font-weight: 600; }
-.rail .item svg { flex: none; width: 16px; height: 16px; }
-.rail .item .lb { flex: 1; overflow: hidden; text-overflow: ellipsis; }
-.rail .item b { font-weight: 600; font-size: .867rem; color: var(--ink-3); font-variant-numeric: tabular-nums; }
-.rail .item b.amber { color: var(--amber); }
-.rail .item b.magenta { color: var(--magenta); } .rail .item b.red { color: var(--red); }
-.rail .grow { flex: 1; }
+/* ---- sidebar (2543 B) ------------------------------------------------------------ */
+.sidebar { width: var(--sidebar-w); background: var(--panel); padding: 0 7px 6px; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; color: var(--ink); }
+.sb-top { flex: none; height: 40px; display: flex; align-items: center; gap: 10px; padding: 0 0 0 7px; }
+.sb-brand { font: 700 1.133rem var(--mono); color: var(--accent); }
+.sb-brand:hover { text-decoration: none; }
+.sb-top .search { flex: 1; min-width: 0; }
+.sb-pages, .sb-icons { flex: none; display: flex; flex-direction: column; gap: 2px; }
+.sb-icons { flex-direction: row; justify-content: space-between; height: 36px; align-items: center; }
+.sidebar .item, .tabbar .item { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 7px; border-radius: 6px; color: var(--ink-2); text-decoration: none; white-space: nowrap; position: relative; }
+.sidebar .item:hover, .tabbar .item:hover { background: var(--panel-2); text-decoration: none; }
+.sidebar .item.on, .tabbar .item.on { background: var(--sel); color: var(--ink); font-weight: 600; }
+.sidebar .item svg, .tabbar .item svg { flex: none; width: 16px; height: 16px; }
+.sidebar .item .lb { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.sidebar .item b, .tabbar .item b { font-weight: 600; font-size: .867rem; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.sidebar .item b.amber, .tabbar .item b.amber { color: var(--amber); }
+.sidebar .item b.magenta, .tabbar .item b.magenta { color: var(--magenta); }
+.sidebar .item b.red, .tabbar .item b.red { color: var(--red); }
+/* Agents first: the page links as icons, each badge a dot (the old folded rail's rule). */
+.sidebar .item.icon { height: 30px; width: 26px; padding: 0; justify-content: center; }
+.sidebar .item.icon .lb { display: none; }
+.sidebar .item.icon b { position: absolute; top: 3px; right: 2px; width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3); font-size: 0; }
+.sidebar .item.icon b.zero { display: none; }
+.sidebar .item.icon b.amber { background: var(--amber); }
+.sidebar .item.icon b.magenta { background: var(--magenta); } .sidebar .item.icon b.red { background: var(--red); }
+.sb-head { flex: none; height: 34px; display: flex; align-items: center; gap: 6px; padding: 0 2px 0 7px; margin-top: 4px; border-top: 1px solid var(--line); font-size: .867rem; }
+.sb-head .lb { font-weight: 650; color: var(--ink); }
+.sb-head .sb-live { color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.sb-head .sb-live:hover { color: var(--ink); }
+.sb-head b.magenta { color: var(--magenta); font-weight: 650; font-variant-numeric: tabular-nums; }
+.sb-head .sp { flex: 1; }
+.sb-head .sb-new { font-size: 1.067rem; line-height: 1; padding: 2px 7px; }
+/* Only the session list scrolls. */
+.sb-agents { flex: 1; min-height: 0; overflow-y: auto; margin: 0 -7px; scrollbar-width: thin; }
+.sb-agents .term-switch { padding-top: 0; }
+.sb-lines { display: flex; flex-direction: column; padding-bottom: 6px; }
+.sb-group + .sb-group { margin-top: 6px; }
+.sb-line { width: 100%; height: 26px; display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; column-gap: 8px; align-items: center; padding: 0 10px 0 14px; cursor: pointer; border: 0; background: none; text-align: left; font-size: .933rem; }
+.sb-line:hover { background: var(--panel-2); }
+.sb-line.cur { background: var(--sel); box-shadow: inset 3px 0 0 var(--accent); }
+.sb-line .sw-nm { font-weight: 500; }
+.sb-fact { font-size: .8rem; white-space: nowrap; max-width: 6rem; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; color: var(--ink-3); }
+.sb-fact.green { color: var(--green); } .sb-fact.amber { color: var(--amber); } .sb-fact.magenta { color: var(--magenta); }
+.sb-fact.red { color: var(--red); } .sb-fact.cyan { color: var(--cyan); }
+.sb-idle { display: block; color: var(--ink-3); font-size: .867rem; }
+.sidebar .dash { margin: 0 -7px 4px; padding: 8px 14px 10px; }
+.sidebar > .item { flex: none; }
+/* The fold strip: the sidebar's right edge when open; alone when folded, with a dot when something needs you. */
+.sb-edge { flex: 0 0 var(--edge-w); width: var(--edge-w); padding: 0; border: 0; border-left: 1px solid var(--line); border-right: 1px solid var(--line); background: var(--panel); color: var(--ink-2); cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; }
+.sb-edge:hover, .sb-edge:focus-visible { background: var(--panel-2); color: var(--accent); outline: none; }
+.sb-signal { position: absolute; top: 12px; left: 3px; width: 6px; height: 6px; border-radius: 50%; }
+.sb-signal.red { background: var(--red); } .sb-signal.magenta { background: var(--magenta); }
+.sb-card { position: fixed; z-index: 45; width: 24rem; max-width: calc(100vw - 24px); box-shadow: var(--shadow); border-radius: 8px; }
+.sb-card .card { margin: 0; }
+.home-empty { align-items: center; justify-content: center; color: var(--ink-2); }
+.home-empty p { margin: 0; font-size: 1.067rem; }
+.home-list { padding: 0; }
+.new-agent-host { position: fixed; top: 40px; right: 12px; z-index: 40; }
+.new-agent-host .pop { right: 0; left: auto; top: 6px !important; max-height: calc(100vh - 56px); max-height: calc(100dvh - 56px); overflow-y: auto; }
+/* The sidebar clips its overflow, so its + opens the sheet here, beside the sidebar. */
+.new-agent-host.side { right: auto; left: calc(var(--rail-w) + 8px); top: 40px; }
+.new-agent-host.side .pop { left: 0; right: auto; }
+/* A widened panel covers the terminal, its bar included (the bar stacks at 32). */
+.app.term.wide > .panel { z-index: 33; }
 .dash { display: flex; flex-direction: column; gap: 7px; padding: 8px 7px 10px; margin: 0 -7px 4px; border-top: 1px solid var(--line); font-size: .8rem; font-variant-numeric: tabular-nums; }
 .dash .dh { color: var(--ink-3); font-size: .733rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0 -3px; text-decoration: none; }
 .dash a.dh:hover { color: var(--ink-2); }
@@ -84,26 +136,16 @@ code, .mono { font-family: var(--mono); font-size: .9rem; }
 .dash small { color: var(--ink-3); font-size: .733rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dash small.amber { color: var(--amber); }
 .dash small.red { color: var(--red); }
-.folded .dash { padding: 8px 3px 10px; gap: 6px; }
-.folded .dash .dh, .folded .dash small, .folded .dash .dl .lb { display: none; }
-.folded .dash .dl { flex-direction: column; align-items: center; gap: 0; font-size: .733rem; }
-.folded .dash .dl .sh { display: block; color: var(--ink-3); }
-.folded .rail .brand { justify-content: center; padding: 0 0 10px; }
-.folded .rail .brand a { display: none; }
-.folded .rail .item { justify-content: center; padding: 6px 0; }
-.folded .rail .item .lb { display: none; }
-.folded .rail .item b { position: absolute; top: 3px; right: 5px; width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3); font-size: 0; }
-.folded .rail .item b.zero { display: none; }
-.folded .rail .item b.amber { background: var(--amber); }
-.folded .rail .item b.magenta { background: var(--magenta); } .folded .rail .item b.red { background: var(--red); }
 
 /* ---- top bar ---------------------------------------------------------------- */
-.bar { display: flex; align-items: center; gap: 12px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); min-height: 44px; flex-wrap: nowrap; container-type: inline-size; }
+/* 40 px on every view (2543 C), level with the sidebar's search row. */
+.bar { display: flex; align-items: center; gap: 12px; padding: 0 16px; border-bottom: 1px solid var(--line); background: var(--panel); height: 40px; flex: none; flex-wrap: nowrap; container-type: inline-size; }
 .bar > * { flex: none; }
 .bar > .sp { flex: 1; }
 .bar h1 { margin: 0; font-size: 1rem; font-weight: 650; white-space: nowrap; }
 .bar .sp { flex: 1; }
-.bar > .search { flex: 0 1 11rem; min-width: 6rem; }
+/* Search lives in the sidebar; the phone, which has none, keeps it in the bar. */
+.bar > .search { display: none; flex: 0 1 11rem; min-width: 6rem; }
 .search { color: var(--ink-3); border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; background: var(--bg); cursor: pointer; text-align: left; display: flex; justify-content: space-between; gap: 12px; }
 .search span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .search kbd { font: .867rem var(--ui); color: var(--ink-3); }
@@ -307,14 +349,12 @@ div.toast { cursor: default; display: flex; align-items: center; gap: 12px; }
 /* ---- placeholder and terminal pages ------------------------------------------- */
 .stub { max-width: 34rem; color: var(--ink-2); display: flex; flex-direction: column; gap: 10px; }
 .stub h2 { margin: 0; font-size: 1.2rem; color: var(--ink); }
-.term-page { position: fixed; inset: 0; display: flex; flex-direction: column; background: var(--term); color: var(--term-ink); z-index: 30; }
+.term-page { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--term); color: var(--term-ink); position: relative; }
 .term-bar { position: relative; z-index: 32; height: 40px; flex: 0 0 40px; min-width: 0; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: var(--panel); color: var(--ink); border-bottom: 1px solid var(--line); }
 .term-bar .t { font-weight: 650; }
 .term-home { font: 700 1.133rem var(--mono); color: var(--accent); text-decoration: none; }
-.term-main { flex: 1; min-height: 0; position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-areas: "side term"; }
-/* Details and Notes sit beside the terminal, which refits to the space left. */
-.term-main.with-panel { grid-template-columns: auto minmax(0, 1fr) min(28rem, 40vw); grid-template-areas: "side term panel"; }
-.term-body { grid-area: term; min-height: 0; min-width: 0; overflow: hidden; position: relative; }
+.term-main { flex: 1; min-height: 0; position: relative; display: grid; grid-template-columns: minmax(0, 1fr); }
+.term-body { min-height: 0; min-width: 0; overflow: hidden; position: relative; }
 .term-body .term-copy { position: absolute; top: 8px; right: 18px; z-index: 5; }
 .term-body .xterm { height: 100%; padding: 10px 14px; }
 /* xterm.css paints its scroll area black; the theme colour on .term-body shows instead. */
@@ -326,12 +366,6 @@ div.toast { cursor: default; display: flex; align-items: center; gap: 12px; }
 .term-theme-dots { display: flex; gap: 4px; margin-top: 4px; }
 .term-theme-dots i { width: 10px; height: 10px; border-radius: 50%; }
 .term-theme-name { padding: 0 6px 2px; font-size: .9rem; }
-.term-page .term-main > .term-panel { grid-area: panel; }
-/* The agent list ends in an edge bar that folds it; folded, only the bar stays (#2242). */
-.term-side { grid-area: side; display: flex; min-height: 0; }
-.term-switch-wrap { width: 15.5rem; min-height: 0; overflow-y: auto; background: var(--panel); color: var(--ink); }
-.term-edge { flex: 0 0 14px; width: 14px; padding: 0; border: 0; border-left: 1px solid var(--line); border-right: 1px solid var(--line); background: var(--panel); color: var(--ink-2); cursor: pointer; display: flex; align-items: center; justify-content: center; }
-.term-edge:hover, .term-edge:focus-visible { background: var(--panel-2); color: var(--accent); outline: none; }
 .term-switch { display: flex; flex-direction: column; padding: 4px 0 12px; }
 .sw-sec { font: 600 .8rem var(--ui); letter-spacing: .06em; text-transform: uppercase; padding: 10px 12px 3px; text-align: left; border: 0; background: none; color: var(--ink-3); }
 .sw-sec.red { color: var(--red); } .sw-sec.magenta { color: var(--magenta); } .sw-sec.cyan { color: var(--cyan); } .sw-sec.amber { color: var(--amber); } .sw-sec.green { color: var(--green); }
@@ -348,7 +382,14 @@ button.sw-sec { cursor: pointer; }
 .term-route { white-space: nowrap; font-size: .9rem; color: var(--ink-2); font-variant-numeric: tabular-nums; }
 .term-bar .icon-btn.on { color: var(--accent); }
 .term-bar.wide .sp { flex: 1; }
-.term-who { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.term-who { display: flex; align-items: center; gap: 8px; min-width: 0; flex: none; }
+/* The agent's ticket in the bar's middle (2543 C): it alone shrinks, with an ellipsis. */
+.term-ticket { flex: 0 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 7px; overflow: hidden; white-space: nowrap; font-size: .933rem; }
+.term-ticket .tk { color: var(--ink); font-weight: 600; flex: none; }
+.term-ticket .ttl { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.term-ticket .repo { color: var(--ink-3); flex: none; }
+.term-bar.wide > * { flex: none; }
+.term-bar.wide > .term-ticket { flex: 0 1 auto; }
 .term-icons { display: flex; align-items: center; gap: 2px; }
 .term-bar.wide .term-connection { color: var(--amber); }
 .term-bar .t { max-width: 20vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -359,19 +400,22 @@ button.sw-sec { cursor: pointer; }
 /* The phone bar scrolls sideways, which would clip a popover anchored inside it. */
 .term-bar .pop { position: fixed; top: 44px !important; right: 12px !important; left: auto !important; }
 .term-notice { position: absolute; bottom: 16px; left: 12px; right: 12px; padding: 10px; background: var(--panel); color: var(--ink); border: 1px solid var(--line); display: flex; align-items: center; gap: 12px; }
-.term-page .term-panel, .term-page .term-panel:has(.doc-reader.ask-open) { position: relative; inset: auto; z-index: auto; width: auto; min-height: 0; overflow: hidden; color: var(--ink); }
 @media (max-width: 900px) {
   .term-bar { overflow-x: auto; gap: 6px; padding: 0 6px; }
   .term-bar > * { flex-shrink: 0; }
   .term-bar .t { max-width: 6.667rem; }
   .term-state { display: none; }
 }
-/* Below 900 px the switcher covers the terminal instead of squeezing it. */
+/* Below 900 px the open sidebar covers the page instead of squeezing it (2543 B.9). */
 @media (max-width: 899.98px) {
-  /* Below 900 px the panel takes the lower half, under the terminal. */
-  .term-main.with-panel { grid-template-columns: auto minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); grid-template-areas: "side term" "side panel"; }
-  .term-page .term-panel { border-left: 0; border-top: 1px solid var(--line); }
-  .term-switch-wrap { position: absolute; top: 0; bottom: 0; left: 14px; z-index: 2; width: min(15.5rem, 80vw); box-shadow: var(--shadow); }
+  .app { --rail-w: var(--edge-w); }
+  .sidebar { position: absolute; top: 0; bottom: 0; left: var(--edge-w); z-index: 26; width: min(var(--sidebar-w), 80vw); box-shadow: var(--shadow); }
+  .sb-wrap > .sb-edge { order: -1; }
+  /* On a terminal, Details and Notes take the lower half, under the terminal. */
+  .app.term.with-panel { grid-template-columns: auto minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+  .app.term.with-panel > .sb-wrap { grid-row: 1 / span 2; }
+  .app.term > .panel, .app.term.wide > .panel { grid-column: 2; grid-row: 2; position: relative; inset: auto; width: auto; z-index: auto; border-left: 0; border-top: 1px solid var(--line); overflow: hidden; }
+  .app.term > .panel .grip { display: none; }
 }
 
 /* Notes page and the same view in the right pane. */
@@ -423,7 +467,6 @@ button.sw-sec { cursor: pointer; }
 .notes-pane .notes-list { overflow: visible; border-right: 0; }
 .notes-pane .note-card .notes-editor { border-top: 1px solid var(--line); }
 .notes-pane .notes-editor textarea { height: 24em; min-height: 16em; flex: none; }
-.term-panel .notes-view { height: 100%; }
 @media (max-width: 899.98px) {
   .notes-page .notes-columns { display: block; overflow: auto; }
   .notes-page .notes-list { overflow: visible; border-right: 0; }
@@ -434,26 +477,25 @@ button.sw-sec { cursor: pointer; }
 
 /* ---- narrow screens (D9: 390 px) -------------------------------------------- */
 @media (max-width: 720px) {
-  .app, .app.folded { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; --rail-w: 0px; }
-  .main { grid-row: 1; grid-column: 1; }
-  .rail { grid-row: 2; grid-column: 1; flex-direction: row; justify-content: space-around; padding: 4px; border-right: 0; border-top: 1px solid var(--line); gap: 0; }
-  .rail .brand, .rail .grow, .rail .dash { display: none; }
-  .rail .item { flex-direction: column; gap: 1px; padding: 4px 6px; font-size: .8rem; }
-  .rail .item .lb { display: block; }
-  .rail .item b { position: absolute; top: 1px; right: 3px; }
-  .rail .item.minor { display: none; }
+  /* List pages: no sidebar, today's bottom tab bar (B.10). The terminal keeps its strip and overlay. */
+  .app:not(.term), .app.folded:not(.term) { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; --rail-w: 0px; }
+  .app:not(.term) > .sb-wrap { display: none; }
+  .app:not(.term) > .main { grid-row: 1; grid-column: 1; }
+  .app:not(.term) > .tabbar { grid-row: 2; grid-column: 1; display: flex; flex-direction: row; justify-content: space-around; padding: 4px; border-top: 1px solid var(--line); background: var(--panel); }
+  .tabbar .item { flex-direction: column; gap: 1px; height: auto; padding: 4px 6px; font-size: .8rem; }
+  .tabbar .item b { position: absolute; top: 1px; right: 3px; }
+  .tabbar .item b.zero { display: none; }
+  .tabbar .item.minor { display: none; }
   .bar { padding: 6px 12px; gap: 8px; }
-  .bar .meters, .search kbd { display: none; }
-  .bar > .search { min-width: 0; }
+  .search kbd { display: none; }
+  .bar > .search { display: flex; min-width: 0; }
   .content { padding: 10px 12px 20px; }
-  .panel, .app.wide .panel { position: fixed; inset: 0; width: auto; z-index: 25; border-left: 0; }
+  .app:not(.term) > .panel { position: fixed; inset: 0; width: auto; z-index: 25; border-left: 0; }
   .panel .grip { display: none; }
   .details-band:has(> .acts) { grid-template-columns: minmax(0, 1fr); }
   .details-band:has(> .acts) > .phd { grid-column: 1; grid-row: 1; }
   .details-band:has(> .acts) > .acts { grid-column: 1; grid-row: 2; }
 }
-/* The top bar sheds GPU, CPU, then Memory as its content area narrows. */
-@container (max-width: 560px) { .bar .meters { display: none; } }
 
 /* Settings: section menu and compact, labelled forms; no fixed field widths. */
 .settings-page { flex-direction: row; gap: 28px; align-items: flex-start; }
@@ -885,20 +927,6 @@ button.sw-sec { cursor: pointer; }
 .shell-connect-card p.err { color: var(--red); }
 .sw-shell { font-size: 1rem; text-align: center; }
 .sw-terminals-heading { margin-top: 10px; padding-top: 16px; border-top: 1px solid var(--line); }
-.terminal-section { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--line); }
-.terminal-section-heading { display: flex; align-items: baseline; gap: 10px; margin-bottom: 14px; }
-.terminal-section-heading h2 { font-size: 1rem; font-weight: 650; margin: 0; }
-.terminal-section-heading > span { color: var(--ink-3); font-size: .867rem; }
-.terminal-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 22rem), 1fr)); gap: 12px; }
-.terminal-tile { display: flex; align-items: center; gap: 14px; min-width: 0; padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--ink); text-decoration: none; transition: background .15s, border-color .15s; }
-.terminal-tile:hover { background: var(--panel-2); border-color: var(--ink-3); }
-.terminal-tile:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-.terminal-tile-icon { flex: none; display: flex; align-items: center; justify-content: center; width: 42px; height: 42px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; color: var(--ink-2); }
-.terminal-tile-content { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
-.terminal-tile-content strong { font-size: .967rem; font-weight: 600; }
-.terminal-tile-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-3); font-size: .8rem; }
-.terminal-tile-fact { margin-top: 5px; font-size: .8rem; color: var(--ink-2); }
-.terminal-tile > svg { flex: none; color: var(--ink-3); }
 @media (max-width: 600px) {
   .shell-away { padding: 20px 14px; align-items: start; }
   .shell-connect-card { margin: 0 auto; padding: 24px 20px; border-radius: 12px; }
