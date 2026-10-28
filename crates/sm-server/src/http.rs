@@ -360,6 +360,7 @@ pub enum GitHubPullRequestState {
 mod agent_history;
 mod agent_waits;
 mod analytics;
+mod app_links;
 mod artifacts;
 mod ask;
 mod auto_retire;
@@ -1980,6 +1981,8 @@ pub fn router(state: AppState) -> Router {
     }
     let mut app = Router::new()
         .route("/health", get(health))
+        // Public on every host: Android reads it without signing in (#2594).
+        .route("/.well-known/assetlinks.json", get(app_links::assetlinks))
         .route("/health/detailed", get(health_detailed))
         .route("/auth/session", get(auth_session))
         .route("/auth/device/google", post(auth_device_google))
@@ -18438,6 +18441,9 @@ mod tests {
     }
     mod perf_tests {
         include!("http/perf_tests.rs");
+    }
+    mod app_links_tests {
+        include!("http/app_links_tests.rs");
     }
     use super::*;
     use crate::google_auth::test_support::{

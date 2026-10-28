@@ -39,6 +39,7 @@ pub struct AppConfig {
     pub cloudflare_access: CloudflareAccessConfig,
     pub partner_access_audiences: Vec<String>,
     pub public_edge: PublicEdgeConfig,
+    pub android_app_links: AndroidAppLinksConfig,
     pub mobile_terminal: MobileTerminalConfig,
     pub terminal_direct: TerminalDirectConfig,
     pub terminal_limits: crate::plain_terminals::Limits,
@@ -105,6 +106,7 @@ impl Default for AppConfig {
             cloudflare_access: CloudflareAccessConfig::default(),
             partner_access_audiences: Vec::new(),
             public_edge: PublicEdgeConfig::default(),
+            android_app_links: AndroidAppLinksConfig::default(),
             mobile_terminal: MobileTerminalConfig::default(),
             terminal_direct: TerminalDirectConfig::default(),
             terminal_limits: Default::default(),
@@ -1049,6 +1051,19 @@ impl CloudflareAccessConfig {
             Some(format!("https://{}", value.trim_end_matches('/')))
         }
     }
+}
+
+/// The sm Android app's claim on the owner's browser host (#2594): Android opens
+/// that host's /docs/, /t/ and other reader links in the app only after it reads
+/// `/.well-known/assetlinks.json` naming this package and its signing certificate.
+/// Empty serves no file.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AndroidAppLinksConfig {
+    #[serde(default)]
+    pub package_name: String,
+    /// SHA-256 digests of the APK signing certificate, hex with or without colons.
+    #[serde(default)]
+    pub sha256_cert_fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2344,6 +2359,8 @@ struct RawConfig {
     #[serde(default)]
     public_edge: PublicEdgeConfig,
     #[serde(default)]
+    android_app_links: AndroidAppLinksConfig,
+    #[serde(default)]
     mobile_terminal: MobileTerminalConfig,
     #[serde(default)]
     terminal_direct: TerminalDirectConfig,
@@ -2503,6 +2520,7 @@ impl From<RawConfig> for AppConfig {
             cloudflare_access: raw.cloudflare_access,
             partner_access_audiences: raw.partner_access_audiences,
             public_edge: raw.public_edge,
+            android_app_links: raw.android_app_links,
             mobile_terminal: raw.mobile_terminal,
             terminal_direct: raw.terminal_direct,
             terminal_limits: raw.terminal_limits.clamped(),
