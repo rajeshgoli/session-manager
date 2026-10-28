@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2594 — Open sm doc links in the phone app</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>2594 — Open sm doc links in the phone app</h1>
+<p class="sans"><small>Author: fit-and-finish agent <code>e7838871</code> · Ticket #2594 · Revision 4</small></p>
+
+<h2>Memo</h2>
+
+<p><b>Recommendation: make exactly one file on sm.rajeshgo.li public, and nothing else.</b> A doc link tapped on your phone opens in Chrome, and Chrome then stops at the Cloudflare login, because Android cannot confirm that the sm app owns sm.rajeshgo.li. Android confirms ownership by fetching a small public file from the site. The file names the app and the certificate that signs it. Today that fetch hits the Cloudflare login page, so the check fails silently and Android hands every sm link to the browser. The fix is for sm-server to serve that file and for Cloudflare to let anyone fetch that one exact path without logging in. Afterwards your doc, ticket and board links open in the app. Nothing a stranger can fetch gets more interesting than one line naming the app.</p>
+
+<dl class="vocab">
+<dt>App Link</dt><dd>Android's name for a website link that opens straight in an app instead of the browser. The app lists the site and paths it wants (the sm app lists sm.rajeshgo.li's <code>/docs/</code>, <code>/t/</code>, <code>/board</code>, <code>/history</code>, <code>/guestbook</code> and <code>/artifacts</code>). Since Android 12, Android honours that list only if the site agrees.</dd>
+<dt>Ownership file (<code>assetlinks.json</code>)</dt><dd>How the site agrees. It is a public file at <code>https://&lt;site&gt;/.well-known/assetlinks.json</code> that names the app's package (<code>li.rajeshgo.sm</code>) and the fingerprint of the certificate that signs the app. Android fetches it when the app is installed or updated. Android follows no redirects and logs in nowhere: either the file comes back directly, or the check fails.</dd>
+<dt>Cloudflare Access</dt><dd>The login wall in front of sm.rajeshgo.li. Every request must carry your Google login (or an enrolled device certificate) before Cloudflare passes it to sm-server.</dd>
+<dt>Bypass rule</dt><dd>A Cloudflare Access setting that lets one named path through the login wall without a login.</dd>
+</dl>
+
+<figure>
+<svg viewBox="0 0 760 250" role="img" aria-label="Before and after: Android's ownership check against sm.rajeshgo.li" font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="13">
+  <style>.box{fill:var(--surface-2);stroke:var(--ink-3)}.t{fill:var(--ink)}.s{fill:var(--ink-2);font-size:11.5px}.bad{fill:var(--red)}.good{fill:var(--green)}.ln{stroke:var(--ink-2);stroke-width:1.5;fill:none;marker-end:url(#a)}</style>
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--ink-2)"/></marker></defs>
+  <text x="10" y="18" class="t" font-weight="700">Today</text>
+  <rect x="10" y="30" width="150" height="44" rx="6" class="box"/><text x="85" y="50" text-anchor="middle" class="t">Android</text><text x="85" y="66" text-anchor="middle" class="s">checks ownership</text>
+  <path d="M160 52 H290" class="ln"/><text x="225" y="45" text-anchor="middle" class="s">GET assetlinks.json</text>
+  <rect x="290" y="30" width="170" height="44" rx="6" class="box"/><text x="375" y="50" text-anchor="middle" class="t">Cloudflare login wall</text><text x="375" y="66" text-anchor="middle" class="s">no login → redirect</text>
+  <path d="M460 52 H590" class="ln"/><text x="525" y="45" text-anchor="middle" class="bad">302 to login</text>
+  <rect x="590" y="30" width="160" height="44" rx="6" class="box"/><text x="670" y="50" text-anchor="middle" class="bad" font-weight="700">Check fails</text><text x="670" y="66" text-anchor="middle" class="s">links go to Chrome</text>
+  <text x="10" y="128" class="t" font-weight="700">Proposed</text>
+  <rect x="10" y="140" width="150" height="44" rx="6" class="box"/><text x="85" y="160" text-anchor="middle" class="t">Android</text><text x="85" y="176" text-anchor="middle" class="s">checks ownership</text>
+  <path d="M160 162 H290" class="ln"/><text x="225" y="155" text-anchor="middle" class="s">GET assetlinks.json</text>
+  <rect x="290" y="140" width="170" height="44" rx="6" class="box"/><text x="375" y="160" text-anchor="middle" class="t">Cloudflare login wall</text><text x="375" y="176" text-anchor="middle" class="s">this one path: no login</text>
+  <path d="M460 162 H590" class="ln"/>
+  <rect x="590" y="140" width="160" height="44" rx="6" class="box"/><text x="670" y="160" text-anchor="middle" class="t">sm-server</text><text x="670" y="176" text-anchor="middle" class="s">returns the file</text>
+  <text x="670" y="210" text-anchor="middle" class="good" font-weight="700">Check passes → links open in sm</text>
+  <text x="375" y="232" text-anchor="middle" class="s">Every other path, including anything below this one, still needs your login.</text>
+</svg>
+<figcaption>The ownership check today and after the change. Only the second hop changes, and only for one exact path.</figcaption>
+</figure>
+
+<h3>What becomes public</h3>
+<p>This file, and only this file:</p>
+<pre><code>[{"relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {"namespace": "android_app", "package_name": "li.rajeshgo.sm",
+             "sha256_cert_fingerprints": ["FD:BF:0B:BD:…:00:F6:BF"]}}]</code></pre>
+<p>It reveals that an Android app called <code>li.rajeshgo.sm</code> exists, plus a certificate fingerprint. That fingerprint is printed inside every copy of the app, so it is not a secret. The file grants exactly one thing: the app may open this site's links. It deliberately leaves out the other grant Android supports, sharing saved passwords between the site and the app. One condition comes with it: Android also treats this association as the link that lets an app use the site's passkeys. sm.rajeshgo.li has no passkeys today (your login is Google's, through Cloudflare), so no passkey depends on it. If sm ever adds passkey login on this host, the signing key below becomes part of that login's security and needs revisiting.</p>
+
+<h3>Security review</h3>
+<table>
+<thead><tr><th style="width:24%">Risk</th><th>Why it is acceptable, and what guards it</th></tr></thead>
+<tbody>
+<tr><td><b>The exception is wider than one file.</b> A Cloudflare path rule also covers every path beneath it.</td><td>Two independent guards, each enough on its own.
+<ul>
+<li><b>Cloudflare:</b> a second, more specific rule puts every path <i>beneath</i> the file back behind your login. Cloudflare applies the most specific rule, and a rule for "everything beneath" does not cover the file itself. Only the exact file passes without login.</li>
+<li><b>sm-server:</b> it answers only the exact path <code>/.well-known/assetlinks.json</code>. Anything below it, beside it, or written to climb back out (<code>/../</code>, including the percent-encoded form) gets "not found". A test covers each case.</li>
+</ul>
+After the change, a fixed list of curl probes (Appendix B) must show the login redirect for every neighbouring path. Any neighbouring path that reaches sm-server without a login, even as "not found", means the Cloudflare guard failed, and both rules are rolled back.</td></tr>
+<tr><td><b>Someone else's app claims your links.</b></td><td>Only an app signed with the same certificate can claim them. That certificate is the Android debug key on this Mac. Anyone who holds it has this Mac, which also holds the Cloudflare token, the device-certificate keys and sm's databases, so the key adds nothing to what such an attacker already has. Such an app could open sm links and, if sm ever adds passkeys on this host, ask to use them; it could not read sm pages, which still need your login. sm's reader links carry no tokens or secrets.</td></tr>
+<tr><td><b>Changing Cloudflare with an API token.</b></td><td>The change is two new Access applications: the public one, scoped to one path with one Bypass policy, and the "everything beneath it" one, which reuses your login application's existing policies. It uses the token already in sm's config, which sm already uses to manage device policies. Both ids are recorded on the ticket, and deleting the two applications rolls it back. Your existing login application is not edited.</td></tr>
+<tr><td><b>A pre-existing gap the review surfaced:</b> sm-server relies on Cloudflare for the login on most routes.</td><td>Some sm-server routes check your login themselves (docs, messages, the web app's files). Others trust that Cloudflare already did. This change keeps that gap from widening: only the exact path passes the wall, and that path serves the public file. Closing the gap is decision 4 below.</td></tr>
+</tbody>
+</table>
+
+<h3>Decision surface</h3>
+<table>
+<thead><tr><th style="width:24%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr></thead>
+<tbody>
+<tr><td>1. Let Cloudflare pass <code>sm.rajeshgo.li/.well-known/assetlinks.json</code> without login?</td><td><b>Yes</b>: one exact path, through a separate Cloudflare Access application with a Bypass policy, plus a second application that keeps everything beneath it behind login. I make the change by API after this merges and deploys, then run the probe list.</td><td>It is the only way Android's check can pass while everything else stays behind login.</td></tr>
+<tr><td>2. Keep signing the app with this Mac's debug key?</td><td><b>Yes, for now.</b> The file lists the debug key's fingerprint.</td><td>The key adds no exposure beyond holding this Mac. Switching means uninstalling the app on your phone, because Android refuses an update signed by a new key. Revisit if sm adds passkeys.</td></tr>
+<tr><td>3. Where does the fingerprint live?</td><td><b>In sm's config</b> (<code>android_app_links</code>), not in code.</td><td>A rebuilt or re-keyed app needs a config edit, not a release.</td></tr>
+<tr><td>4. Close the reliance on Cloudflare for login?</td><td><b>Separate ticket</b>: sm-server refuses any request on the public hostnames without a verified Cloudflare login, except a short list of public paths.</td><td>It is a real gap, but it is independent of this change and touches every route.</td></tr>
+</tbody>
+</table>
+
+<h3>What you do afterwards</h3>
+<p>Nothing, unless the links still open in Chrome. Android re-checks ownership when the app updates, so the next sm app update picks it up. To pick it up sooner: Settings → Apps → sm → Open by default, switch "Open supported links" off and on. The same screen's "Add link" works today as a manual stopgap.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p><b>Is the public exception exact now?</b> Yes. Revision 1 relied on sm-server alone for paths beneath the file. Cloudflare's rule covers those paths too, so a second Cloudflare rule now puts them back behind login. The probes accept nothing but the login redirect for them.</p>
+<p><b>Can a half-finished Cloudflare change leave paths open?</b> No. The login rule for the paths beneath the file is installed and checked first, and the public rule is installed last, so any failure stops with nothing new made public. Undoing it runs in the reverse order, and the login rule is removed only after the public rule is confirmed gone.</p>
+<p><b>Does the file grant anything besides opening links?</b> Android also uses this association for passkeys. sm has none, so nothing changes today. It is the reason to revisit the signing key if sm ever adds passkey login on this host.</p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<h3>A. sm-server change</h3>
+<ul>
+<li><b>Route:</b> <code>GET /.well-known/assetlinks.json</code>, registered beside <code>/health</code> in <code>router()</code> (<code>crates/sm-server/src/http.rs</code>). The handler is <code>app_links::assetlinks</code> in <code>crates/sm-server/src/http/app_links.rs</code>. It takes no identity, so it is public on every host, like <code>/health</code>.</li>
+<li><b>Response:</b> <code>200</code>, <code>Content-Type: application/json</code>, with the statement list shown in the memo, when the config holds a valid package name and at least one valid fingerprint. Otherwise <code>404</code>. It never redirects.</li>
+<li><b>Config</b> (<code>AndroidAppLinksConfig</code> in <code>config.rs</code>; defaults are empty, so no file is served):
+<pre><code>android_app_links:
+  package_name: li.rajeshgo.sm
+  sha256_cert_fingerprints:
+    - fdbf0bbd96cb4f42912a78edb94bca7c4fc10b30302f611731a2bfa00300f6bf</code></pre>
+Fingerprints are accepted as 64 hex digits, with or without colons, and served as upper-case colon pairs. Malformed entries are dropped. The package name must have at least two dot-separated parts, each starting with a letter and containing only letters, digits and <code>_</code>. To read the fingerprint from a built APK: <code>apksigner verify --print-certs &lt;apk&gt;</code>, "Signer #1 certificate SHA-256 digest".</li>
+<li><b>Exact path only.</b> The router matches paths literally and does not resolve dot segments or percent-encoding, so no request path other than this one reaches the handler. Test <code>assetlinks_is_public_exact_and_absent_until_configured</code> (<code>http/app_links_tests.rs</code>) checks 404 for <code>/.well-known/assetlinks.json/</code>, <code>…/x</code>, <code>…jsonx</code>, <code>/.well-known/</code>, <code>…/../../health</code> and <code>…/%2e%2e/%2e%2e/health</code>, all sent on the browser hostname with no login. It also checks 404 before the file is configured. The unit tests in <code>http/app_links.rs</code> cover the statement shape, fingerprint normalisation and rejected inputs.</li>
+<li><b>Live config:</b> add the block above to <code>~/.config/session-manager/config.yaml</code> before the deploy that ships this code.</li>
+</ul>
+
+<h3>B. Cloudflare change, probes and rollback</h3>
+<p>The change uses account <code>cloudflare_access.account_id</code> and token <code>cloudflare_access.api_token</code> from the live config. The existing login application (<code>cloudflare_access.browser.app_id</code>) is not modified.</p>
+<ol>
+<li>Close the paths beneath the file first: <code>GET /accounts/{account}/access/apps/{browser app id}</code>. If any of its policies has no reusable id, stop and report; nothing has changed yet. Otherwise create <code>{"name":"sm assetlinks (below: login)","type":"self_hosted","domain":"sm.rajeshgo.li/.well-known/assetlinks.json/*"}</code>, with <code>policies</code> set to the browser application's policy ids in the same order (<code>[{"id":…,"precedence":n}]</code>). Confirm with <code>curl</code> that <code>/.well-known/assetlinks.json/x</code> still answers <code>302</code> to login. A wildcard path does not cover its parent, so this application leaves the exact file as it was (behind login). It does not receive later device-policy changes (<code>mobile_devices.rs</code> updates only the browser application). It guards only paths sm-server answers with "not found", so being stricter there is harmless.</li>
+<li>Create the Bypass policy: <code>POST /accounts/{account}/access/policies</code> with <code>{"name":"sm assetlinks: public (Android App Links)","decision":"bypass","include":[{"everyone":{}}]}</code>. On failure, stop. The "below" application alone changes nothing visible.</li>
+<li>Last, create the public application: <code>POST /accounts/{account}/access/apps</code> with <code>{"name":"sm assetlinks (public)","type":"self_hosted","domain":"sm.rajeshgo.li/.well-known/assetlinks.json","policies":[{"id":"&lt;bypass policy id&gt;","precedence":1}]}</code>. Cloudflare applies the most specific application to a path. A path application also covers the paths beneath it, but those are already claimed by the more specific "below" application. If this call fails or its response is unclear, list the account's applications and delete any "sm assetlinks (public)" before stopping.</li>
+<li>Record both application ids and the Bypass policy id on ticket #2594.</li>
+<li>Probes, run from a machine with no Cloudflare login cookie (<code>curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n'</code>):
+<table>
+<thead><tr><th>URL on https://sm.rajeshgo.li</th><th>Required result</th></tr></thead>
+<tbody>
+<tr><td><code>/.well-known/assetlinks.json</code></td><td><code>200</code>, JSON body naming <code>li.rajeshgo.sm</code></td></tr>
+<tr><td><code>/.well-known/assetlinks.json/</code>, <code>/.well-known/assetlinks.json/x</code>, <code>/.well-known/assetlinks.json/x/y</code></td><td><code>302</code> to the Cloudflare login</td></tr>
+<tr><td><code>/.well-known/assetlinks.json/../../health</code> (sent with <code>--path-as-is</code>), <code>/.well-known/assetlinks.json/%2e%2e/%2e%2e/health</code>, <code>/.well-known/assetlinks.json%2fx</code>, <code>/.well-known/assetlinks.json;x</code>, <code>/.well-known/assetlinks.json?x=1</code></td><td><code>302</code> to login, except a query-only variant of the exact path (<code>?x=1</code>), which may return the same <code>200</code> file</td></tr>
+<tr><td><code>/.well-known/assetlinks.jsonx</code>, <code>/.well-known/</code>, <code>/health</code>, <code>/docs/x</code>, <code>/</code></td><td><code>302</code> to login</td></tr>
+</tbody>
+</table>
+Any other answer on a neighbouring row, including <code>404</code> from sm-server, means a request reached the origin without login, so the Cloudflare guard failed: roll back both applications, then report.</li>
+<li>Google's own check: <code>https://digitalassetlinks.googleapis.com/v1/statements:list?source.web.site=https://sm.rajeshgo.li&amp;relation=delegate_permission/common.handle_all_urls</code> lists the statement.</li>
+<li>Rollback, in this order, stopping at the first failure or uncertain answer:
+<ol type="a">
+<li><code>DELETE /accounts/{account}/access/apps/{public app id}</code>. This alone puts the file back behind login.</li>
+<li>Confirm the public application is gone: <code>GET</code> on its id returns not found, no application named "sm assetlinks (public)" remains in the account's list, and an unauthenticated <code>curl</code> of <code>/.well-known/assetlinks.json</code> and <code>/.well-known/assetlinks.json/x</code> both answer <code>302</code> to login.</li>
+<li>Only then delete the "below" application and the Bypass policy. Keeping the "below" application is also harmless, because it only requires login.</li>
+</ol>
+If step a or b fails or is unclear, keep the "below" application, which keeps the paths beneath the file behind login, and report the incomplete rollback on ticket #2594 and to Rajesh.</li>
+</ol>
+
+<h3>C. Android side</h3>
+<ul>
+<li>No app change. <code>android-app/app/src/main/AndroidManifest.xml</code> already declares the auto-verified link filter for <code>${smLinkHost}</code> (= <code>SM_LINK_HOST</code>, the browser hostname).</li>
+<li>Only the browser hostname is checked. The app's own API host (sm-app.rajeshgo.li) is not in the link filter, so it needs no file.</li>
+<li>Re-check on a connected device: <code>adb shell pm verify-app-links --re-verify li.rajeshgo.sm</code>, then <code>adb shell pm get-app-links li.rajeshgo.sm</code>, which should show <code>sm.rajeshgo.li: verified</code>.</li>
+</ul>
+
+<h3>Z. FAQ</h3>
+<p><b>Why not only use the manual "Add link" setting?</b> It works for one phone and is undone by a reinstall. It also never shows up as a failure, so the problem quietly comes back.</p>
+<p><b>Why not serve the file from a Cloudflare Worker?</b> It would put the fingerprint in a second place to keep in sync. The bypass rule is still needed either way.</p>
+<p><b>Do the links carry secrets the app would now receive?</b> No. Reader links carry only the doc, message or ticket path and non-secret options (version, format). The doc token used by the page's own requests travels in a header, not in the URL.</p>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  @media screen and (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+    }
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  if (!window.frameElement) {
+    try { saved = localStorage.getItem(KEY); } catch (e) {}
+    if (saved === 'dark' || saved === 'light') root.setAttribute('data-theme', saved);
+  }
+  function isDark() {
+    return root.getAttribute('data-theme') === 'dark' ||
+      (!root.hasAttribute('data-theme') && matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = isDark() ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = isDark();
+    root.setAttribute('data-theme', dark ? 'light' : 'dark');
+    if (!window.frameElement) {
+      try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    }
+    label();
+  };
+  new MutationObserver(label).observe(root, { attributes: true, attributeFilter: ['data-theme'] });
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', label);
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
