@@ -30,6 +30,9 @@ export function revisionNumber(revisions, sha) {
   return index < 0 ? null : revisions.length - index;
 }
 
+/** The Review button counts this revision's draft comments (sm#2568). */
+export const reviewLabel = (drafts) => (drafts ? `Review (${drafts})` : 'Review');
+
 export const repliesText = (count) => `${count} ${count === 1 ? 'reply' : 'replies'} on changed passages`;
 
 const when = (value) => {
@@ -67,6 +70,8 @@ export function Reader({ id, watch, moon = null }) {
   const [current, setCurrent] = useState(id);
   const [doc, setDoc] = useState(null);
   const [replies, setReplies] = useState(0);
+  // The review client's state, posted whenever it would have redrawn its own bar (sm#2568).
+  const [review, setReview] = useState(null);
   const [error, setError] = useState(src ? '' : 'This link is not a document reader path.');
   const [menu, setMenu] = useMenu();
   const sessions = (watch?.[0]?.sessions) || [];
@@ -79,6 +84,7 @@ export function Reader({ id, watch, moon = null }) {
     const listen = (e) => {
       if (e.origin !== location.origin || e.source !== frame.current?.contentWindow) return;
       if (e.data?.type === 'sm-doc-replies') setReplies(Number(e.data.count) || 0);
+      if (e.data?.type === 'sm-doc-bar' && e.data.state) setReview(e.data.state);
     };
     window.addEventListener('message', listen);
     return () => window.removeEventListener('message', listen);
@@ -94,6 +100,7 @@ export function Reader({ id, watch, moon = null }) {
       const details = win.__smDoc ? { ...win.__smDoc.config, prState: win.__smDoc.prState } : { title: win.document.title };
       setDoc({ ...details, hasAppendix: !!win.document.querySelector('.appendix-divider') });
       setReplies(win.__smDoc?.repliesUnseen || 0);
+      setReview(win.__smDoc?.barState?.() || null);
       if (url.hash === '#sm-review' && win.__smDoc?.openReview) win.__smDoc.openReview();
       // Links inside a document stay in the document view, including links in authored docs.
       win.document.addEventListener('click', (e) => {
@@ -141,13 +148,17 @@ export function Reader({ id, watch, moon = null }) {
     return () => document.removeEventListener('keydown', shortcut);
   }, []);
 
-  const review = () => frame.current?.contentWindow?.__smDoc?.openReview?.();
-  const readReplies = () => frame.current?.contentWindow?.__smDoc?.showChangedThreads?.();
-  const revision = revisionNumber(doc?.revisions, doc?.sha);
+  const client = (name) => frame.current?.contentWindow?.__smDoc?.[name]?.();
+  const info = review ? { ...doc, prNumber: review.prNumber ?? doc?.prNumber, prUrl: review.prUrl ?? doc?.prUrl,
+    prState: review.prState ?? doc?.prState, revisions: review.revisions?.length ? review.revisions : doc?.revisions } : doc;
+  const canReview = review ? review.canReview : !!doc?.docId;
+  const note = review?.note;
+  const hold = review?.mergeHold;
+  const revision = revisionNumber(info?.revisions, info?.sha);
   const author = authorOf(doc, sessions);
   const linked = author?.session?.remote_control?.url?.startsWith('https://claude.ai/code/');
   const pr = () => {
-    const match = doc.prUrl?.match(/github.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+    const match = info.prUrl?.match(/github.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
     if (match) openPanel(`ticket:${match[1]}#${match[2]}`);
   };
   return html`<section class="doc-reader">
@@ -157,12 +168,17 @@ export function Reader({ id, watch, moon = null }) {
       ${revision ? html`<span class="anchor doc-menu">
         <button type="button" class="btn sm" aria-haspopup="menu" aria-expanded=${menu === 'revisions'}
           onClick=${() => setMenu(menu === 'revisions' ? null : 'revisions')}>Revision ${revision} ▾</button>
-        ${menu === 'revisions' ? html`<div class="pop menu" role="menu">${doc.revisions.map((r, i) => html`<button type="button" role="menuitem"
-            class=${r.sha === doc.sha ? 'on' : ''} onClick=${() => { setMenu(null); if (r.sha !== doc.sha) navigate(readHref(r.path)); }}>
-            Revision ${doc.revisions.length - i} · ${when(r.publishedAt)}${r.reviewRequested ? ' · review asked' : ''}</button>`)}</div>` : null}
+        ${menu === 'revisions' ? html`<div class="pop menu" role="menu">${info.revisions.map((r, i) => html`<button type="button" role="menuitem"
+            class=${r.sha === info.sha ? 'on' : ''} onClick=${() => { setMenu(null); if (r.sha !== info.sha) navigate(readHref(r.path)); }}>
+            Revision ${info.revisions.length - i} · ${when(r.publishedAt)}${r.reviewRequested ? ' · review asked' : ''}</button>`)}</div>` : null}
       </span>` : null}
-      ${doc?.prNumber ? html`<button type="button" class="btn sm" onClick=${pr}>#${doc.prNumber} · ${doc.prState || 'unknown'}</button>` : null}
-      ${replies > 0 ? html`<button type="button" class="plain-btn doc-replies" onClick=${readReplies}>${repliesText(replies)} · <u>Read</u></button>` : null}
+      ${info?.prNumber ? html`<button type="button" class="btn sm" onClick=${pr}>#${info.prNumber} · ${info.prState || 'unknown'}</button>` : null}
+      ${hold ? html`<span class="doc-hold" title=${`Merge held by ${hold.placed_by}${hold.reason ? `: ${hold.reason}` : ''}`}>⏸</span>` : null}
+      ${replies > 0 ? html`<button type="button" class="plain-btn doc-replies" onClick=${() => client('showChangedThreads')}>${repliesText(replies)} · <u>Read</u></button>` : null}
+      ${note?.kind === 'failed' ? html`<span class="doc-note red" title=${note.text}><span>${note.text}</span> ·
+          <button type="button" class="plain-btn" onClick=${() => client('resubmit')}><u>Submit again</u></button> ·
+          <button type="button" class="plain-btn" onClick=${() => client('discardSubmission')}><u>Discard</u></button></span>`
+        : note ? html`<span class=${`doc-note ${note.kind === 'sent' ? 'green' : 'muted'}`} role="status">${note.text}</span>` : null}
       <span class="sp"></span>
       ${author ? html`<button type="button" class="plain-btn doc-author" title=${author.live ? `Open ${author.name}'s terminal` : `${author.name} in History`}
           onClick=${() => navigate(author.live ? `/terminal/${encodeURIComponent(author.id)}` : `/history?open=agent:${encodeURIComponent(author.id)}`)}>
@@ -175,12 +191,14 @@ export function Reader({ id, watch, moon = null }) {
           onClick=${() => setMenu(menu === 'more' ? null : 'more')}>⋯</button>
         ${menu === 'more' ? html`<div class="pop menu" role="menu">
           ${doc?.hasAppendix ? html`<button type="button" role="menuitem" onClick=${() => { setMenu(null); printDoc(true); }}>Print all</button>` : null}
+          ${doc?.docId && info?.prState === 'open' ? html`<button type="button" role="menuitem" onClick=${() => { setMenu(null); client('toggleHold'); }}>${hold ? 'Release hold' : 'Hold merge'}</button>` : null}
           <button type="button" role="menuitem" onClick=${() => { setMenu(null); window.open(current, '_blank', 'noopener'); }}>Open in new tab</button>
         </div>` : null}
       </span>
       ${moon}
       <${BugButton} page="Document" />
-      ${doc?.docId ? html`<button type="button" class="btn pri" onClick=${review}>Review</button>` : null}
+      ${review?.reviewRequested ? html`<button type="button" class="btn sm" onClick=${() => client('dismissReview')}>No review needed</button>` : null}
+      ${canReview ? html`<button type="button" class="btn pri" onClick=${() => client('openReview')}>${reviewLabel(review?.drafts)}</button>` : null}
     </header>
     ${error ? html`<p role="alert">${error}</p>` : null}
     <div class="doc-reader-body">

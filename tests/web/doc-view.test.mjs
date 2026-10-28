@@ -138,7 +138,7 @@ test('the author chip finds the live author by id or name, else points at Histor
 test('the document view drops Ask and full screen, and puts Review last in the bar', () => {
   assert.doesNotMatch(reader, /Ask|doc-ask|fullScreen|ask-target/);
   const bar = slice(reader, '<header class="bar doc-bar">', '</header>');
-  const order = ['Back', 'doc-title', 'Revision ', 'doc-replies', 'doc-author', 'Open in Claude', '⎙ Print', 'title="More"', '${moon}', 'BugButton', '>Review</button>'];
+  const order = ['Back', 'doc-title', 'Revision ', 'doc-hold', 'doc-replies', 'doc-note', 'doc-author', 'Open in Claude', '⎙ Print', 'title="More"', '${moon}', 'BugButton', 'No review needed', 'reviewLabel(review?.drafts)'];
   const at = order.map(item => bar.indexOf(item));
   assert.ok(at.every(i => i >= 0), JSON.stringify(Object.fromEntries(order.map((k, i) => [k, at[i]]))));
   assert.deepEqual([...at].sort((a, b) => a - b), at);
@@ -164,4 +164,54 @@ test('the review client counts unseen changed-passage replies for the app and le
   // The banner line is kept on a direct /docs/… load only.
   assert.match(source, /noteReplies\(unseen\);[\s\S]{0,120}if \(unseen && !framed\) \{/);
   assert.match(source, /S\.showChangedThreads = showChangedThreads;/);
+});
+
+test('inside the app the review client draws no toolbar or pill and hands its state to the document bar (sm#2568)', () => {
+  const source = readFileSync('crates/sm-server/src/http/doc_client.js', 'utf8');
+  // Layout hides both the bar and its folded pill when framed; a direct load keeps them.
+  const layout = slice(source, '  function layout() {', '  // Fixed elements are placed');
+  const run = framed => {
+    const classes = new Set(['sm-doc-bar-open']);
+    const context = {framed, collapsed: true, bar: {hidden: false, offsetHeight: 40}, pill: {hidden: false}, banner: {style: {}},
+      document: {documentElement: {style: {setProperty() {}}, classList: {remove: c => classes.delete(c), toggle: (c, on) => on ? classes.add(c) : classes.delete(c)}}}};
+    vm.runInNewContext(`${layout}\nlayout();`, context);
+    return {bar: context.bar.hidden, pill: context.pill.hidden, open: classes.has('sm-doc-bar-open')};
+  };
+  assert.deepEqual(run(true), {bar: true, pill: true, open: false});
+  assert.deepEqual(run(false), {bar: true, pill: false, open: false});
+  assert.match(source, /function renderBar\(\) \{\s+clear\(bar\);\s+if \(framed\) \{ layout\(\); postBar\(\); return; \}/);
+
+  const state = slice(source, '  function barState() {', '  function dismissReview() {');
+  const posting = source.match(/  function posting\(sub\) \{[^\n]*\n/)[0];
+  const posts = [];
+  const make = S => {
+    const context = {S, MSG: false, CONFIG: {prNumber: 7, prUrl: 'https://github.com/o/r/pull/7', revisions: [{sha: 'b'}, {sha: 'a'}]},
+      currentDrafts: () => [{}, {}], location: {origin}, window: {parent: {postMessage: (...args) => posts.push(args)}}, Date};
+    vm.runInNewContext(`${posting}${state}\nthis.barState = barState; this.postBar = postBar;`, context);
+    return context;
+  };
+  const held = make({canComment: true, docState: 'review_requested', mergeHold: {placed_by: 'sm-1', reason: 'waiting'}, prState: 'open', sentUntil: 0, sub: null});
+  assert.deepEqual(JSON.parse(JSON.stringify(held.barState())), {drafts: 2, canReview: true, reviewRequested: true,
+    mergeHold: {placed_by: 'sm-1', reason: 'waiting'}, prNumber: 7, prUrl: 'https://github.com/o/r/pull/7', prState: 'open',
+    revisions: [{sha: 'b'}, {sha: 'a'}], note: null});
+  held.postBar();
+  assert.equal(posts[0][0].type, 'sm-doc-bar'); assert.equal(posts[0][1], origin); assert.equal(posts[0][0].state.drafts, 2);
+  const note = S => make({canComment: true, prState: 'open', sentUntil: 0, ...S}).barState().note;
+  assert.deepEqual({...note({sub: {status: 'failed', error: 'HTTP 422'}})}, {kind: 'failed', text: 'Review not posted: HTTP 422'});
+  assert.equal(note({sentUntil: Date.now() + 4000, sub: {status: 'queued', queued_at: new Date().toISOString()}}).kind, 'sent');
+  assert.equal(note({sub: {status: 'submitting', queued_at: new Date(Date.now() - 61000).toISOString()}}).kind, 'posting');
+  assert.equal(note({sub: {status: 'queued', queued_at: new Date().toISOString()}}), null);
+  for (const action of ['S.dismissReview = dismissReview', 'S.toggleHold = toggleHold', 'S.resubmit = ', 'S.discardSubmission = ', 'S.barState = barState']) {
+    assert.ok(source.includes(action), action);
+  }
+});
+
+test('Review counts draft comments; Hold merge sits in the ⋯ menu while the PR is open', () => {
+  const context = {};
+  vm.runInNewContext(`${slice(reader, 'export const reviewLabel', 'export const repliesText').replace('export ', '')}\nthis.reviewLabel = reviewLabel;`, context);
+  assert.equal(context.reviewLabel(0), 'Review');
+  assert.equal(context.reviewLabel(undefined), 'Review');
+  assert.equal(context.reviewLabel(3), 'Review (3)');
+  const menu = slice(reader, "${menu === 'more'", '${moon}');
+  assert.match(menu, /info\?\.prState === 'open'[\s\S]*hold \? 'Release hold' : 'Hold merge'/);
 });

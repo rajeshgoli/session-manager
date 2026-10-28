@@ -153,6 +153,13 @@
     layout();
   }
   function layout() {
+    // Inside the web app its document bar carries all of this (sm#2568).
+    if (framed) {
+      bar.hidden = pill.hidden = true;
+      document.documentElement.classList.remove('sm-doc-bar-open');
+      banner.style.top = '0px';
+      return;
+    }
     bar.hidden = collapsed;
     pill.hidden = !collapsed;
     // offsetHeight: the bar's size before the zoom compensation below.
@@ -209,8 +216,43 @@
   }
 
   S.openReview = openReview;
+  // What the web app's document bar shows in place of this bar (sm#2568).
+  S.barState = barState;
+  S.dismissReview = dismissReview;
+  S.toggleHold = toggleHold;
+  S.resubmit = function () { if (S.sub) resubmit(S.sub); };
+  S.discardSubmission = function () { if (S.sub) discardSubmission(S.sub); };
+  function barState() {
+    var sub = S.sub, note = null;
+    if (sub && sub.status === 'failed') note = { kind: 'failed', text: 'Review not posted: ' + (sub.error || 'GitHub refused it') };
+    else if (Date.now() < S.sentUntil) note = { kind: 'sent', text: 'Review sent' };
+    else if (posting(sub) && Date.now() - Date.parse(sub.queued_at) > 60000) note = { kind: 'posting', text: 'Posting review…' };
+    return {
+      drafts: currentDrafts().length,
+      canReview: !MSG && (S.canComment || currentDrafts().length > 0),
+      reviewRequested: !MSG && S.docState === 'review_requested',
+      mergeHold: S.mergeHold ? { placed_by: S.mergeHold.placed_by, reason: S.mergeHold.reason || '' } : null,
+      prNumber: CONFIG.prNumber || null, prUrl: CONFIG.prUrl || null, prState: S.prState || null,
+      revisions: CONFIG.revisions || [],
+      note: note
+    };
+  }
+  function postBar() {
+    try { window.parent.postMessage({ type: 'sm-doc-bar', state: barState() }, location.origin); } catch (_) { /* parent gone */ }
+  }
+  function dismissReview() {
+    return api('POST', '/dismiss-review').then(function () { S.docState = 'read'; renderBar(); },
+      function (err) { alertBar(err.message); renderBar(); });
+  }
+  function toggleHold() {
+    return api(S.mergeHold ? 'DELETE' : 'POST', '/merge-hold', {}).then(function (res) {
+      if (res && res.error) throw new Error(res.error);
+      pollHead();
+    }).catch(function (err) { alertBar(err.message); if (err.status === 409) pollHead(); });
+  }
   function renderBar() {
     clear(bar);
+    if (framed) { layout(); postBar(); return; }
     if (MSG) {
       var ms = stateText();
       [el('span', { class: 't', title: CONFIG.title, text: CONFIG.title }),
@@ -246,9 +288,7 @@
       submissionNote(),
       el('span', { class: 'sp' }),
       S.docState === 'review_requested' ? el('button', { text: 'No review needed', onclick: function (e) {
-        var b = e.currentTarget; b.disabled = true;
-        api('POST', '/dismiss-review').then(function () { S.docState = 'read'; renderBar(); },
-          function (err) { b.disabled = false; alertBar(err.message); });
+        e.currentTarget.disabled = true; dismissReview();
       } }) : null,
       (S.canComment || n) ? el('button', { class: 'p', text: 'Review (' + n + ')', onclick: openReview }) : null,
       el('button', { title: 'Hide', text: '▴', onclick: function () { setCollapsed(true); } })

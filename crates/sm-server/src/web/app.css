@@ -674,6 +674,10 @@ button.sw-sec { cursor: pointer; }
 .doc-bar { gap:10px; padding:0 12px; }
 .doc-bar > .doc-title { flex:0 1 auto; min-width:4rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:650; }
 .doc-bar .doc-replies { color:var(--magenta); white-space:nowrap; }
+.doc-bar .doc-note { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.doc-bar .doc-note.red { color:var(--red); } .doc-bar .doc-note.green { color:var(--green); } .doc-bar .doc-note.muted { color:var(--ink-3); }
+.doc-bar .doc-note .plain-btn { color:inherit; }
+.doc-bar .doc-hold { color:var(--amber); }
 .doc-bar .doc-author { display:inline-flex; align-items:center; gap:6px; white-space:nowrap; max-width:12rem; overflow:hidden; text-overflow:ellipsis; }
 .doc-bar .pop { top:34px; left:0; }
 .doc-bar .sp ~ .doc-menu .pop { left:auto; right:0; }
