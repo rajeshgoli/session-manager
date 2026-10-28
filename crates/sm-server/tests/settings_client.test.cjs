@@ -92,7 +92,7 @@ test('reverting to the old value while a save is pending still submits the rever
 
 test('handoff settings list only the providers with a context gauge', () => {
   const providers = harness().evaluate('HANDOFF_PROVIDERS.map(([provider]) => provider).join()');
-  assert.equal(providers, 'claude,codex-fork');
+  assert.equal(providers, 'opencode,claude,codex-fork');
   assert.equal(harness().evaluate('THRESHOLDS.map(([key]) => key).join()'), 'threshold_percent,reminder_percent,review_floor_percent');
 });
 
@@ -101,9 +101,17 @@ test('terminal limits accept blank as reset and refuse values outside the range'
   const limit = h.evaluate('terminalLimit');
   assert.equal(limit('', 1, 256), null);
   assert.equal(limit('100', 1, 256), 100);
+  for (const [, , min, max] of h.evaluate('TERMINAL_LIMITS')) {
+    assert.equal(limit('', min, max), null);
+    assert.equal(limit(String(min), min, max), min);
+    assert.equal(limit(String(max), min, max), max);
+    for (const value of [String(min - 1), String(max + 1), String(min + 0.5), 'word']) {
+      assert.throws(() => limit(value, min, max));
+    }
+  }
   assert.throws(() => limit('0', 1, 256), /from 1 to 256/);
   assert.throws(() => limit('1.5', 60, 86400), /from 60 to 86400/);
-  assert.equal(h.evaluate("TERMINAL_LIMITS.map(([key]) => key).join()"), 'per_user,per_session,global,max_attach_seconds');
+  assert.equal(h.evaluate("TERMINAL_LIMITS.map(([key]) => key).join()"), 'per_user,per_session,global,max_plain_terminals,idle_reap_minutes,tunnel_linger_minutes,max_attach_seconds');
 });
 
 test('Reviews sits after Context handoff and its meter limit refuses values outside 50 to 100', () => {

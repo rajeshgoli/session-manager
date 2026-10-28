@@ -19,11 +19,3 @@ test('web Queue places the Local model card beside Mac memory and handles old re
   assert.ok(source.includes('<${LocalModelCard} card=${queue.local_model} />'));
   assert.equal(context.LocalModelCard({}), null);
 });
-test('web agent row shows why a local agent is parked', () => {
-  const agents = fs.readFileSync('crates/sm-server/src/web/agents.js', 'utf8');
-  const fact = agents.slice(agents.indexOf('export function agentFact('), agents.indexOf('/** "▶', agents.indexOf('export function agentFact('))).replace('export ', '');
-  const ctx = vm.createContext({ age: () => '' });
-  vm.runInContext(fact, ctx);
-  const label = 'parked: model yielded to perf run';
-  assert.equal(ctx.agentFact({ facts: { agent: { state: 'parked', text: label } } }).text, label);
-});

@@ -143,3 +143,10 @@ test("a blocked agent's You line is red (sm#2494)", () => {
   assert.equal(fact.tone, 'red');
   assert.match(fact.text, /^◆ Blocked · 5m: Log in to GitHub$/);
 });
+
+test('web agent row shows why a local agent is parked', () => {
+  const label = 'parked: model yielded to perf run';
+  const fact = agentFact({ kind: 'agent', provider: 'opencode', facts: { agent: { state: 'parked', text: label } } });
+  assert.equal(fact.text, label);
+  assert.equal(fact.tone, 'amber');
+});
