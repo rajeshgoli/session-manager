@@ -12,6 +12,11 @@
 //! finds the row `submitting` reconciles against GitHub by that marker
 //! instead of starting over. The row turns `posted` in the same transaction
 //! that deletes the drafts and queues the wake, so the wake fires once.
+//!
+//! Instant submit (sm#2554): the request only validates and saves the row as
+//! `queued`, then answers `202`. A background worker takes rows one at a
+//! time under the review lock, resolves the target, posts, and retries
+//! transient GitHub failures on [`ReviewRetryPolicy`]'s schedule.
 
 use super::*;
 use crate::owner_docs::{OwnerDocDraft, OwnerDocReview, OwnerDocVerdict, PostedOwnerDocReview};
@@ -252,12 +257,56 @@ fn review_response(review: &OwnerDocReview) -> Value {
     })
 }
 
-/// `POST /docs/{id}/review`.
+/// When the review worker retries a transient failure: after each of
+/// `delays` in turn, then every `then_every`, until `give_up_after` from when
+/// the row was queued (appendix J.4).
+#[derive(Debug, Clone)]
+pub struct ReviewRetryPolicy {
+    pub delays: Vec<Duration>,
+    pub then_every: Duration,
+    pub give_up_after: Duration,
+}
+
+impl Default for ReviewRetryPolicy {
+    fn default() -> Self {
+        Self {
+            delays: [5, 30, 120, 600].map(Duration::from_secs).to_vec(),
+            then_every: Duration::from_secs(15 * 60),
+            give_up_after: Duration::from_secs(60 * 60),
+        }
+    }
+}
+
+impl ReviewRetryPolicy {
+    /// The wait after the `failures`-th transient failure (1-based).
+    fn delay(&self, failures: i64) -> Duration {
+        let index = usize::try_from(failures.max(1) - 1).unwrap_or(usize::MAX);
+        self.delays.get(index).copied().unwrap_or(self.then_every)
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+/// The `202` a saved submission answers with.
+fn queued_response(review: &OwnerDocReview) -> (StatusCode, Value) {
+    (
+        StatusCode::ACCEPTED,
+        json!({"submission_id": review.id, "status": review.status}),
+    )
+}
+
+/// `POST /docs/{id}/review`. Validates and saves the submission, then
+/// answers; no GitHub or git call happens before the response (J.1).
 pub(super) async fn submit_owner_doc_review(
     state: &Arc<AppState>,
     doc: &OwnerDoc,
     payload: SubmitReviewRequest,
-) -> Result<Value, ApiError> {
+) -> Result<(StatusCode, Value), ApiError> {
     let submission_id = payload.submission_id.trim().to_owned();
     if !valid_submission_id(&submission_id) {
         return Err(bad_request(
@@ -277,23 +326,49 @@ pub(super) async fn submit_owner_doc_review(
         .filter(|body| !body.is_empty())
         .map(ToOwned::to_owned);
 
-    let _guard = state.owner_doc_review_lock.lock().await;
+    // Answers that only read the saved row come before the lock: the worker
+    // holds it while GitHub posts, and a resubmit must not wait for that.
     let store = owner_doc_store(state);
+    match store.review(&submission_id)? {
+        Some(existing) if existing.doc_id == doc.id && existing.status == "posted" => {
+            return Ok((StatusCode::OK, review_response(&existing)));
+        }
+        Some(existing)
+            if existing.doc_id == doc.id
+                && matches!(existing.status.as_str(), "queued" | "submitting") =>
+        {
+            state.owner_doc_review_wake.notify_one();
+            return Ok(queued_response(&existing));
+        }
+        Some(_) => {}
+        None => {
+            if let Some(unfinished) = store.unfinished_review(&doc.id, &sha)? {
+                return Err(superseded(Some(unfinished)));
+            }
+        }
+    }
+
+    let _guard = state.owner_doc_review_lock.lock().await;
     if let Some(existing) = store.review(&submission_id)? {
         return match existing.status.as_str() {
             _ if existing.doc_id != doc.id => Err(conflict("submission_id belongs to another doc")),
-            "posted" => Ok(review_response(&existing)),
-            // A retry of any unfinished submission reconciles against
-            // GitHub by its marker before doing anything else, so the
-            // client keeps one id until the review is posted.
+            "posted" => Ok((StatusCode::OK, review_response(&existing))),
+            // Nothing to do but make sure the worker is awake for it.
+            "queued" | "submitting" => {
+                state.owner_doc_review_wake.notify_one();
+                Ok(queued_response(&existing))
+            }
+            // Submit again on a failed row requeues it with its own verdict
+            // and text; the worker reconciles against GitHub by its marker.
             _ => {
-                let existing = store.reopen_review(&existing.id)?;
-                if existing.status == "submitting" {
-                    run_blocking(state, existing, None).await
-                } else {
+                let existing = store.requeue_review(&existing.id, now_ms())?;
+                if existing.status == "failed" {
                     Err(superseded(
                         store.unfinished_review(&doc.id, &existing.commit_sha)?,
                     ))
+                } else {
+                    state.owner_doc_review_wake.notify_one();
+                    Ok(queued_response(&existing))
                 }
             }
         };
@@ -307,8 +382,27 @@ pub(super) async fn submit_owner_doc_review(
     if let Some(unfinished) = store.unfinished_review(&doc.id, &sha)? {
         return Err(superseded(Some(unfinished)));
     }
-    // A doc with no PR (sm#1946) or a closed one goes to the PR the
-    // target names; an open PR takes the review directly.
+    let (review, _) = store.queue_review(
+        &submission_id,
+        &doc.id,
+        &sha,
+        verdict,
+        body.as_deref(),
+        payload.hold,
+        now_ms(),
+    )?;
+    state.owner_doc_review_wake.notify_one();
+    Ok(queued_response(&review))
+}
+
+/// The worker's first pass over a `queued` row: today's synchronous steps,
+/// unchanged. A doc with no PR (sm#1946) or a closed one goes to the PR the
+/// target names; an open PR takes the review directly.
+async fn start_queued(state: &Arc<AppState>, review: OwnerDocReview) -> Result<(), ApiError> {
+    let store = owner_doc_store(state);
+    let doc = store
+        .get(&review.doc_id)?
+        .ok_or(ApiError::NotFound("Doc not found"))?;
     let pr = match doc.pr_number {
         Some(pr_number) => {
             let (lookup_state, repo) = (state.clone(), doc.repo.clone());
@@ -323,18 +417,30 @@ pub(super) async fn submit_owner_doc_review(
         None => None,
     };
     let mut target = if pr.is_none() {
-        Some(super::reopen::target(state, doc).await?)
+        // A lookup GitHub could not answer is retried; a target that
+        // refuses the review is not.
+        Some(
+            super::reopen::target(state, &doc)
+                .await
+                .map_err(|error| match error {
+                    ApiError::Status { detail, .. } if transient_github_error(&detail) => {
+                        github_failure(detail)
+                    }
+                    other => other,
+                })?,
+        )
     } else {
         None
     };
+    let hold = review.schedule.hold;
     if let Some(target) = target.as_mut() {
         let stem = StdPath::new(&doc.path)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("doc");
-        target["branch"] = json!(format!("sm-doc/{stem}-{}", &submission_id[..8]));
-        target["hold"] = json!(payload.hold);
-    } else if let Some((pr_number, _)) = pr.as_ref().filter(|_| payload.hold) {
+        target["branch"] = json!(format!("sm-doc/{stem}-{}", &review.id[..8]));
+        target["hold"] = json!(hold);
+    } else if let Some((pr_number, _)) = pr.as_ref().filter(|_| hold) {
         super::super::merge_holds::change(
             state.clone(),
             super::super::merge_holds::HoldRequest {
@@ -348,17 +454,205 @@ pub(super) async fn submit_owner_doc_review(
         )
         .await?;
     }
-    let bytes = load_doc_bytes_async(state, doc, &sha).await?;
-    let (review, inserted) = store.begin_review_target(
-        &submission_id,
-        &doc.id,
-        &sha,
-        &git_blob_sha(&bytes),
-        verdict,
-        body.as_deref(),
-        target.as_ref(),
-    )?;
-    run_blocking(state, review, pr.filter(|_| inserted).map(|(_, pr)| pr)).await
+    let bytes = load_doc_bytes_async(state, &doc, &review.commit_sha).await?;
+    let review = store.start_review(&review.id, &git_blob_sha(&bytes), target.as_ref())?;
+    run_blocking(state, review, pr.map(|(_, pr)| pr))
+        .await
+        .map(|_| ())
+}
+
+/// What a failed attempt says, for the row's `error` and the bar's note.
+fn error_text(error: &ApiError) -> String {
+    match error {
+        ApiError::Internal(error) => format!("{error:#}"),
+        ApiError::NotFound(detail) => (*detail).to_owned(),
+        ApiError::Status { detail, .. } => detail.clone(),
+        ApiError::StatusBody { body, .. } => body["detail"].as_str().unwrap_or("").to_owned(),
+        ApiError::Auth { detail, .. } => (*detail).to_owned(),
+    }
+}
+
+/// Whether a failed attempt is worth retrying (J.4): network trouble,
+/// GitHub 5xx or rate limits, a failed spawn. Refusals (GitHub 4xx, a
+/// target that refuses, comments on files the PR does not change) are not.
+fn transient(error: &ApiError) -> bool {
+    match error {
+        ApiError::Internal(_) => true,
+        ApiError::Status { status, detail } if *status == StatusCode::SERVICE_UNAVAILABLE => {
+            transient_github_error(detail)
+        }
+        _ => false,
+    }
+}
+
+fn transient_github_error(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    // GitHub reports rate limits as 403 as well as 429.
+    if detail.contains("rate limit") {
+        return true;
+    }
+    let code = detail.match_indices("http ").find_map(|(at, _)| {
+        detail
+            .get(at + 5..at + 8)
+            .and_then(|code| code.parse::<u16>().ok())
+    });
+    if let Some(code) = code {
+        return code == 429 || code >= 500;
+    }
+    [
+        "timed out",
+        "timeout",
+        "something went wrong",
+        "connection",
+        "could not resolve host",
+        "network",
+        "temporarily",
+        "eof",
+        "gh api failed",
+        "gh api graphql failed",
+        "task failed",
+    ]
+    .iter()
+    .any(|marker| detail.contains(marker))
+}
+
+/// One attempt at a pending row; a failure is retried later or ends the
+/// row `failed` with its message.
+async fn attempt_review(state: &Arc<AppState>, review: OwnerDocReview) {
+    let result = if review.status == "queued" {
+        start_queued(state, review.clone()).await
+    } else {
+        run_blocking(state, review.clone(), None).await.map(|_| ())
+    };
+    let Err(error) = result else {
+        return;
+    };
+    let detail = error_text(&error);
+    let store = owner_doc_store(state);
+    let policy = &state.owner_doc_review_retry;
+    let now = now_ms();
+    let queued_ms = review.schedule.queued_ms.unwrap_or(now);
+    let deadline = queued_ms + policy.give_up_after.as_millis() as i64;
+    let failures = review.schedule.attempts + 1;
+    let outcome = if transient(&error) && now < deadline {
+        let next = (now + policy.delay(failures).as_millis() as i64).min(deadline);
+        store.defer_review(&review.id, &detail, failures, next, queued_ms)
+    } else {
+        store.give_up_review(&review.id, &detail)
+    };
+    if let Err(write_error) = outcome {
+        eprintln!(
+            "Owner doc review {}: could not record the failure: {write_error:#}",
+            review.id
+        );
+    }
+}
+
+/// Runs the next due row, if any, and returns how long to wait before
+/// looking again.
+async fn run_due_review(
+    state: &Arc<AppState>,
+    left_alone: &BTreeSet<String>,
+) -> anyhow::Result<Duration> {
+    const IDLE: Duration = Duration::from_secs(60);
+    let _guard = state.owner_doc_review_lock.lock().await;
+    let now = now_ms();
+    let rows: Vec<_> = owner_doc_store(state)
+        .pending_reviews()?
+        .into_iter()
+        .filter(|row| !left_alone.contains(&row.id))
+        .collect();
+    let due = rows
+        .iter()
+        .find(|row| row.schedule.next_attempt_ms.is_none_or(|at| at <= now));
+    let Some(review) = due.cloned() else {
+        return Ok(rows
+            .iter()
+            .filter_map(|row| row.schedule.next_attempt_ms)
+            .min()
+            .map(|at| Duration::from_millis((at - now).max(1) as u64).min(IDLE))
+            .unwrap_or(IDLE));
+    };
+    attempt_review(state, review).await;
+    Ok(Duration::ZERO)
+}
+
+/// The review worker (J.3): wakes on each new row, at each retry time, and
+/// at startup, so rows a restart left `queued` or `submitting` finish. A
+/// server with the runtime off (a scratch server on a copy of live state)
+/// leaves rows saved before it started to the live server.
+pub(in crate::http) fn spawn_owner_doc_review_worker(state: Arc<AppState>) {
+    let left_alone: BTreeSet<String> = if state.config.rust_core.runtime_enabled {
+        BTreeSet::new()
+    } else {
+        owner_doc_store(&state)
+            .pending_reviews()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    };
+    tokio::spawn(async move {
+        loop {
+            if state.shutdown().is_stopped() {
+                return;
+            }
+            let wait = match run_due_review(&state, &left_alone).await {
+                Ok(wait) => wait,
+                Err(error) => {
+                    eprintln!("Owner doc review worker failed to list rows: {error:#}");
+                    Duration::from_secs(5)
+                }
+            };
+            if wait.is_zero() {
+                continue;
+            }
+            tokio::select! {
+                _ = state.owner_doc_review_wake.notified() => {}
+                _ = sleep(wait) => {}
+            }
+        }
+    });
+}
+
+/// `GET …/head`'s `review_submission` (J.5): the doc's newest owner
+/// submission that is not posted, or was posted in the last 15 s. A failed
+/// row that a newer submission of its revision replaced is not shown; it
+/// can no longer be submitted again.
+pub(super) fn review_submission_json(state: &AppState, doc_id: &str) -> Result<Value, ApiError> {
+    let reviews = owner_doc_store(state).reviews(doc_id)?;
+    let now = time::OffsetDateTime::now_utc();
+    let recent = |at: Option<&str>| {
+        at.and_then(|at| {
+            time::OffsetDateTime::parse(at, &time::format_description::well_known::Rfc3339).ok()
+        })
+        .is_some_and(|at| now - at <= time::Duration::seconds(15))
+    };
+    let shown = reviews
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(i, review)| match review.status.as_str() {
+            "posted" => recent(review.posted_at.as_deref()),
+            "failed" => !reviews[i + 1..]
+                .iter()
+                .any(|newer| newer.commit_sha == review.commit_sha),
+            _ => true,
+        });
+    Ok(match shown {
+        None => Value::Null,
+        Some((_, review)) => json!({
+            "submission_id": review.id,
+            "status": review.status,
+            "error": review.error,
+            "queued_at": review.queued_at.as_deref().unwrap_or(&review.submitted_at),
+            "github_review_url": review.github_review_url,
+            "delivered_to_session_id": review.delivered_to_session_id,
+            "commit_sha": review.commit_sha,
+            "verdict": review.verdict,
+            "body": review.body.clone().unwrap_or_default(),
+        }),
+    })
 }
 
 async fn run_blocking(
@@ -374,7 +668,8 @@ async fn run_blocking(
     result.map(|review| review_response(&review))
 }
 
-/// Carries a `submitting` row to `posted` or `failed`. `fresh` is the open
+/// Carries a `submitting` row to `posted`, or returns the error for the
+/// worker to retry or give up on. `fresh` is the open
 /// PR when this call just inserted the row, so there is nothing on GitHub
 /// yet; otherwise the row is reconciled against GitHub first.
 fn run_submission(
@@ -451,7 +746,6 @@ fn run_submission(
             }
             let pr = doc_pull_request(state, &doc.repo, pr_number, true).map_err(github_failure)?;
             if !pr.is_open() {
-                store.fail_review(&review.id)?;
                 return Err(conflict(format!(
                     "PR #{pr_number} is {}, so the doc is read-only",
                     pr.state
@@ -474,7 +768,6 @@ fn run_submission(
             Ok(false)
         )
     {
-        store.fail_review(&review.id)?;
         return Err(conflict(format!(
             "{} Ask the doc's author to push a change to it on the PR, then submit again. Your comments are kept.",
             doc_not_in_pr_diff(pr_number, &doc.path)
@@ -499,7 +792,6 @@ fn run_submission(
                 }
                 Some(found) => found.node_id.clone(),
                 None => {
-                    store.fail_review(&review.id)?;
                     return Err(github_failure(format!(
                         "GitHub refused the review: {error}"
                     )));
@@ -632,10 +924,10 @@ fn pending_thread(
 
 /// A GitHub error after the pending review exists. If the review was in
 /// fact submitted (the response was lost), finish from it; otherwise delete
-/// the pending review so none is left under the owner's account, and mark
-/// the row failed with the drafts kept. If the delete fails, the pending
-/// review may still be there, so the row stays `submitting` and a retry
-/// resumes it.
+/// the pending review so none is left under the owner's account. Either
+/// way the row stays `submitting`: the worker decides whether to retry
+/// (which reconciles by marker, resuming a pending review the delete
+/// missed) or to give up.
 fn abort(
     state: &AppState,
     doc: &OwnerDoc,
@@ -661,11 +953,14 @@ fn abort(
             "Owner doc review {}: could not delete pending review {pending_id}: {delete_error}",
             review.id
         );
-        return Err(github_failure(format!(
-            "GitHub refused the review: {error}. Submitting again resumes it."
+        // The pending review may still be on GitHub, holding the PR's one
+        // pending slot: keep retrying, so a later attempt resumes or
+        // deletes it, rather than releasing the submission now.
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "GitHub refused the review: {error}. Its unfinished draft on GitHub could not be removed yet."
         )));
     }
-    owner_doc_store(state).fail_review(&review.id)?;
+    owner_doc_store(state).set_pending_review_node_id(&review.id, None)?;
     Err(github_failure(format!(
         "GitHub refused the review: {error}"
     )))
@@ -906,33 +1201,6 @@ fn session_name_or_id(state: &AppState, session_id: &str) -> String {
         .unwrap_or_else(|| session_id.to_owned())
 }
 
-/// Startup: finish or restart any submit a crash left `submitting`.
-pub(in crate::http) fn recover_owner_doc_reviews(state: Arc<AppState>) {
-    if !state.config.rust_core.runtime_enabled {
-        return;
-    }
-    tokio::spawn(async move {
-        let _guard = state.owner_doc_review_lock.lock().await;
-        let pending = match owner_doc_store(&state).submitting_reviews() {
-            Ok(pending) => pending,
-            Err(error) => {
-                eprintln!("Owner doc review recovery failed to list rows: {error:#}");
-                return;
-            }
-        };
-        for review in pending {
-            if state.shutdown().is_stopped() {
-                return;
-            }
-            let id = review.id.clone();
-            match run_blocking(&state, review, None).await {
-                Ok(_) => eprintln!("Owner doc review {id} recovered"),
-                Err(error) => eprintln!("Owner doc review {id} recovery failed: {error:?}"),
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -970,6 +1238,9 @@ mod tests {
             submitted_at: String::new(),
             delivered_to_session_id: None,
             posted_at: None,
+            error: None,
+            queued_at: None,
+            schedule: Default::default(),
         }
     }
 
@@ -1058,5 +1329,44 @@ mod tests {
         for bad in ["short", "has space here", "semi;colon;x", &"a".repeat(65)] {
             assert!(!valid_submission_id(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn retries_wait_5s_30s_2min_10min_then_every_15min() {
+        let policy = ReviewRetryPolicy::default();
+        let waits: Vec<u64> = (1..=7).map(|n| policy.delay(n).as_secs()).collect();
+        assert_eq!(waits, [5, 30, 120, 600, 900, 900, 900]);
+        assert_eq!(policy.give_up_after, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn github_trouble_is_retried_and_refusals_are_not() {
+        for transient in [
+            "gh api graphql failed: HTTP 502 Bad Gateway",
+            "gh: API rate limit exceeded (HTTP 403)",
+            "gh: Too Many Requests (HTTP 429)",
+            "You have exceeded a secondary rate limit",
+            "Something went wrong while executing your query",
+            "gh api graphql failed: timed out after 30s",
+            "gh api graphql failed: No such file or directory (os error 2)",
+        ] {
+            assert!(transient_github_error(transient), "{transient}");
+        }
+        for refusal in [
+            "gh: Validation Failed (HTTP 422)",
+            "gh api failed: gh: Not Found (HTTP 404)",
+            "User can only have one pending review per pull request",
+            "Line could not be resolved",
+        ] {
+            assert!(!transient_github_error(refusal), "{refusal}");
+        }
+        let conflict = ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "PR #12 is closed, so the doc is read-only".into(),
+        };
+        assert!(!transient(&conflict));
+        assert!(transient(&ApiError::Internal(anyhow::anyhow!(
+            "spawn failed"
+        ))));
     }
 }

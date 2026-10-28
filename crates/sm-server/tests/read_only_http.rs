@@ -29,7 +29,7 @@ use sm_server::{
     http::{
         router, AppState, DocFetchError, DocPullRequest, DocReviewOnGitHub, DocReviewReply,
         GitHubPullRequestState, GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster,
-        OwnerDocSource, SubmittedDocReview,
+        OwnerDocSource, ReviewRetryPolicy, SubmittedDocReview,
     },
     owner_docs::{git_blob_sha, OwnerDocStore, OwnerDocVerdict},
     runtime::TmuxRuntime,
@@ -22540,6 +22540,8 @@ struct StubDocSource {
 #[derive(Default)]
 struct FakeGitHub {
     reopen_info: Option<Value>,
+    /// The PR history lookup fails this way, as GitHub being down does.
+    reopen_error: Option<String>,
     branch_state: Option<Value>,
     open_prs: Option<Value>,
     review_target: Option<(i64, String)>,
@@ -22554,6 +22556,12 @@ struct FakeGitHub {
     error_lines: std::collections::BTreeSet<i64>,
     fail_file_threads: bool,
     fail_submit: bool,
+    /// GitHub refuses the submit outright: no retry helps.
+    refuse_submit: bool,
+    /// This many submits fail transiently before one goes through.
+    flaky_submits: usize,
+    /// GitHub takes this long to answer a submit.
+    submit_delay: Duration,
     /// The mutation takes effect but its response is lost.
     lose_pending_response: bool,
     lose_line_response: bool,
@@ -22615,9 +22623,11 @@ impl StubDocSource {
 
 impl OwnerDocSource for StubDocSource {
     fn doc_pr_info(&self, _: &str, _: i64) -> Result<Value, String> {
-        self.github
-            .lock()
-            .unwrap()
+        let github = self.github.lock().unwrap();
+        if let Some(error) = &github.reopen_error {
+            return Err(error.clone());
+        }
+        github
             .reopen_info
             .clone()
             .ok_or("history unavailable".into())
@@ -22777,10 +22787,19 @@ impl OwnerDocSource for StubDocSource {
         review_node_id: &str,
         body: &str,
     ) -> Result<SubmittedDocReview, String> {
+        let delay = self.github.lock().unwrap().submit_delay;
+        std::thread::sleep(delay);
         let mut github = self.github.lock().unwrap();
         github.calls.push("submit".to_owned());
+        if github.flaky_submits > 0 {
+            github.flaky_submits -= 1;
+            return Err("gh api graphql failed: HTTP 502 Bad Gateway".to_owned());
+        }
         if github.fail_submit {
             return Err("Something went wrong while executing your query".to_owned());
+        }
+        if github.refuse_submit {
+            return Err("Review cannot be submitted".to_owned());
         }
         let review = github
             .review_mut(review_node_id)
@@ -22849,6 +22868,14 @@ fn owner_docs_app(source: StubDocSource) -> (axum::Router, PathBuf) {
     owner_docs_app_with(source, |_| {})
 }
 
+fn owner_docs_app_retrying(
+    source: StubDocSource,
+    policy: ReviewRetryPolicy,
+) -> (axum::Router, PathBuf) {
+    let (state, dir) = owner_docs_state_with(source, |_| {});
+    (router(state.with_owner_doc_review_retry(policy)), dir)
+}
+
 fn owner_docs_app_with(
     source: StubDocSource,
     configure: impl FnOnce(&mut AppConfig),
@@ -22863,6 +22890,16 @@ fn owner_docs_state_with(
 ) -> (AppState, PathBuf) {
     let dir = unique_temp_path();
     fs::create_dir_all(&dir).unwrap();
+    (owner_docs_state_in(&dir, source, configure), dir)
+}
+
+/// A server over `dir`'s state, as a restart builds it.
+fn owner_docs_state_in(
+    dir: &Path,
+    source: StubDocSource,
+    configure: impl FnOnce(&mut AppConfig),
+) -> AppState {
+    let dir = dir.to_path_buf();
     let state_file = dir.join("sessions.json");
     let session = |id: &str, parent: Option<&str>| {
         json!({
@@ -22909,10 +22946,19 @@ fn owner_docs_state_with(
     };
     config.rust_core.fixture_writes_enabled = true;
     configure(&mut config);
-    (
-        AppState::new(config).with_owner_doc_source(Arc::new(source)),
-        dir,
-    )
+    AppState::new(config)
+        .with_owner_doc_source(Arc::new(source))
+        .with_owner_doc_review_retry(fast_review_retry())
+}
+
+/// The review worker's schedule, shrunk so a test sees retries and the
+/// final give-up in well under a second.
+fn fast_review_retry() -> ReviewRetryPolicy {
+    ReviewRetryPolicy {
+        delays: vec![Duration::from_millis(20)],
+        then_every: Duration::from_millis(20),
+        give_up_after: Duration::from_millis(300),
+    }
 }
 
 fn owner_doc_session<'a>(obligations: &'a Value, session_id: &str) -> &'a Value {
@@ -23440,6 +23486,84 @@ fn review_memo_source(head: &str) -> StubDocSource {
     source
 }
 
+/// The doc's `review_submission` once the worker has finished with
+/// `submission_id`: posted or failed (sm#2554).
+async fn settled_submission(app: &axum::Router, doc_id: &str, submission_id: &str) -> Value {
+    for _ in 0..400 {
+        let (_, head) = get_json(app.clone(), &format!("/docs/{doc_id}/head")).await;
+        let sub = &head["review_submission"];
+        if sub["submission_id"] == submission_id
+            && matches!(sub["status"].as_str(), Some("posted" | "failed"))
+        {
+            return sub.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("{submission_id} did not settle");
+}
+
+/// `POST /docs/{id}/review`, then wait for the worker: the posted row as a
+/// same-id retry returns it, or `{"status": "failed", "detail": error}`.
+async fn submit_review(app: &axum::Router, doc_id: &str, payload: Value) -> (StatusCode, Value) {
+    let path = format!("/docs/{doc_id}/review");
+    let (status, queued) = post_json(app.clone(), &path, payload.clone()).await;
+    if status != StatusCode::ACCEPTED {
+        return (status, queued);
+    }
+    let submission_id = payload["submission_id"].as_str().unwrap();
+    let settled = settled_submission(app, doc_id, submission_id).await;
+    if settled["status"] == "failed" {
+        return (
+            status,
+            json!({"status": "failed", "detail": settled["error"]}),
+        );
+    }
+    let (status, posted) = post_json(app.clone(), &path, payload).await;
+    assert_eq!(status, StatusCode::OK, "{posted}");
+    (status, posted)
+}
+
+/// A schedule that parks a row after its first transient failure, so a test
+/// can look at it mid-retry and then retry it with [`retry_review_now`].
+fn parked_review_retry() -> ReviewRetryPolicy {
+    ReviewRetryPolicy {
+        delays: vec![Duration::from_secs(3600)],
+        then_every: Duration::from_secs(3600),
+        give_up_after: Duration::from_secs(7200),
+    }
+}
+
+/// Waits until the worker has tried `submission_id` once and parked it.
+async fn parked(dir: &Path, submission_id: &str) -> Value {
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    for _ in 0..400 {
+        let row = store.review(submission_id).unwrap().unwrap();
+        if row.error.is_some() {
+            return json!({"status": row.status, "error": row.error});
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("{submission_id} was not parked");
+}
+
+/// Makes a parked row due now, then resubmits it (which wakes the worker)
+/// and waits for the outcome.
+async fn retry_review_now(
+    app: &axum::Router,
+    dir: &Path,
+    doc_id: &str,
+    payload: Value,
+) -> (StatusCode, Value) {
+    Connection::open(dir.join("message_queue.db"))
+        .unwrap()
+        .execute(
+            "UPDATE owner_doc_reviews SET next_attempt_ms = 0 WHERE id = ?1",
+            [payload["submission_id"].as_str().unwrap()],
+        )
+        .unwrap();
+    submit_review(app, doc_id, payload).await
+}
+
 #[tokio::test]
 async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
     let (c1, c2) = ("a".repeat(40), "b".repeat(40));
@@ -23518,8 +23642,7 @@ async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
 
     let submit = json!({"submission_id": "sub-aaaaaaaa", "sha": c1,
                         "verdict": "changes_requested", "body": "Tighten it."});
-    let (status, review) =
-        post_json(app.clone(), &format!("/docs/{id}/review"), submit.clone()).await;
+    let (status, review) = submit_review(&app, &id, submit.clone()).await;
     assert_eq!(status, StatusCode::OK, "{review}");
     assert_eq!(review["status"], "posted");
     assert_eq!(review["line_comment_count"], 1);
@@ -23636,13 +23759,13 @@ async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
 
     // A closed PR with unavailable branch history refuses submission, but permits drafting.
     source.github.lock().unwrap().set_pr(12, "closed", &c2);
-    let (status, refused) = post_json(
-        app.clone(),
-        &format!("/docs/{id}/review"),
+    let (_, refused) = submit_review(
+        &app,
+        &id,
         json!({"submission_id": "sub-bbbbbbbb", "sha": c2, "verdict": "approve"}),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["status"], "failed", "{refused}");
     let (status, _) = post_json(
         app.clone(),
         "/docs",
@@ -23731,13 +23854,13 @@ async fn owner_doc_on_a_pr_that_does_not_change_it_is_refused_at_publish_and_sub
         github.calls.clear();
     }
     for attempt in 0..2 {
-        let (status, error) = post_json(
-            app.clone(),
-            &format!("/docs/{id}/review"),
+        let (_, error) = submit_review(
+            &app,
+            &id,
             json!({"submission_id": "sub-nodiff1", "sha": c1, "verdict": "comment"}),
         )
         .await;
-        assert_eq!(status, StatusCode::CONFLICT, "attempt {attempt}: {error}");
+        assert_eq!(error["status"], "failed", "attempt {attempt}: {error}");
         assert!(
             error["detail"]
                 .as_str()
@@ -23786,9 +23909,9 @@ async fn owner_doc_on_a_pr_that_does_not_change_it_is_refused_at_publish_and_sub
         .lock()
         .unwrap()
         .set_pr(12, "open", &"b".repeat(40));
-    let (status, review) = post_json(
-        app.clone(),
-        &format!("/docs/{id}/review"),
+    let (status, review) = submit_review(
+        &app,
+        &id,
         json!({"submission_id": "sub-nodiff1", "sha": c1, "verdict": "comment"}),
     )
     .await;
@@ -23816,13 +23939,15 @@ async fn owner_doc_review_failure_deletes_the_pending_review_and_keeps_drafts() 
             github.calls.clear();
         }
         let submission = format!("sub-fail-{failure}");
-        let (status, error) = post_json(
-            app.clone(),
-            &format!("/docs/{id}/review"),
+        let (_, error) = submit_review(
+            &app,
+            &id,
             json!({"submission_id": submission, "sha": c1, "verdict": "comment"}),
         )
         .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+        // GitHub's "Something went wrong" is transient: retried until the
+        // policy gives up, each attempt cleaning up its pending review.
+        assert_eq!(error["status"], "failed", "{error}");
         {
             let github = source.github.lock().unwrap();
             assert!(
@@ -23848,17 +23973,17 @@ async fn owner_doc_review_failure_deletes_the_pending_review_and_keeps_drafts() 
         github.fail_file_threads = false;
         github.add_review(&c1, "PENDING", "started in the GitHub UI");
     }
-    let (status, _) = post_json(
-        app.clone(),
-        &format!("/docs/{id}/review"),
+    let (_, blocked) = submit_review(
+        &app,
+        &id,
         json!({"submission_id": "sub-blocked1", "sha": c1, "verdict": "comment"}),
     )
     .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(blocked["status"], "failed", "{blocked}");
     source.github.lock().unwrap().reviews.clear();
-    let (status, review) = post_json(
-        app.clone(),
-        &format!("/docs/{id}/review"),
+    let (status, review) = submit_review(
+        &app,
+        &id,
         json!({"submission_id": "sub-works01", "sha": c1, "verdict": "comment"}),
     )
     .await;
@@ -23882,16 +24007,7 @@ async fn owner_doc_review_reconciles_a_submission_a_crash_interrupted() {
     let doc_a = publish_review_memo(&app, "specs/a.html", &c1, "author01", true).await;
     let id_a = doc_a["id"].as_str().unwrap();
     add_draft(&app, id_a, &c1, json!(3), "Buy the dip.", "Why now?").await;
-    store
-        .begin_review(
-            "sub-crash-after",
-            id_a,
-            &c1,
-            &blob,
-            OwnerDocVerdict::Comment,
-            None,
-        )
-        .unwrap();
+    // GitHub's side first: the worker may pick the row up the moment it exists.
     {
         let mut github = source.github.lock().unwrap();
         let node = github.add_review(
@@ -23906,14 +24022,19 @@ async fn owner_doc_review_reconciles_a_submission_a_crash_interrupted() {
         review.threads.push((None, "Overall.".to_owned()));
         github.calls.clear();
     }
+    store
+        .begin_review(
+            "sub-crash-after",
+            id_a,
+            &c1,
+            &blob,
+            OwnerDocVerdict::Comment,
+            None,
+        )
+        .unwrap();
     let submit_a = json!({"submission_id": "sub-crash-after", "sha": c1, "verdict": "comment"});
     for _ in 0..2 {
-        let (status, review) = post_json(
-            app.clone(),
-            &format!("/docs/{id_a}/review"),
-            submit_a.clone(),
-        )
-        .await;
+        let (status, review) = submit_review(&app, id_a, submit_a.clone()).await;
         assert_eq!(status, StatusCode::OK, "{review}");
         assert_eq!(review["status"], "posted");
         assert_eq!(review["line_comment_count"], 1);
@@ -23932,16 +24053,6 @@ async fn owner_doc_review_reconciles_a_submission_a_crash_interrupted() {
     let id_b = doc_b["id"].as_str().unwrap();
     add_draft(&app, id_b, &c1, json!(3), "Buy the dip.", "Why now?").await;
     add_draft(&app, id_b, &c1, json!(4), "Size it small.", "How small?").await;
-    store
-        .begin_review(
-            "sub-crash-mid",
-            id_b,
-            &c1,
-            &blob,
-            OwnerDocVerdict::Approve,
-            None,
-        )
-        .unwrap();
     {
         let mut github = source.github.lock().unwrap();
         let node = github.add_review(
@@ -23954,14 +24065,26 @@ async fn owner_doc_review_reconciles_a_submission_a_crash_interrupted() {
             .unwrap()
             .threads
             .push((Some(3), "> Buy the dip.\n\nWhy now?".to_owned()));
+        github.calls.clear();
+        // Under the fake's lock, so the worker cannot start the row before
+        // its pending review id is recorded.
+        store
+            .begin_review(
+                "sub-crash-mid",
+                id_b,
+                &c1,
+                &blob,
+                OwnerDocVerdict::Approve,
+                None,
+            )
+            .unwrap();
         store
             .set_pending_review_node_id("sub-crash-mid", Some(&node))
             .unwrap();
-        github.calls.clear();
     }
-    let (status, review) = post_json(
-        app.clone(),
-        &format!("/docs/{id_b}/review"),
+    let (status, review) = submit_review(
+        &app,
+        id_b,
         json!({"submission_id": "sub-crash-mid", "sha": c1, "verdict": "approve"}),
     )
     .await;
@@ -23978,6 +24101,7 @@ async fn owner_doc_review_reconciles_a_submission_a_crash_interrupted() {
     // Crash before anything reached GitHub: the retry starts clean.
     source.github.lock().unwrap().reviews.clear();
     add_draft(&app, id_b, &c1, json!(5), "Exit on close.", "Or earlier?").await;
+    source.github.lock().unwrap().calls.clear();
     store
         .begin_review(
             "sub-crash-before",
@@ -23988,10 +24112,9 @@ async fn owner_doc_review_reconciles_a_submission_a_crash_interrupted() {
             None,
         )
         .unwrap();
-    source.github.lock().unwrap().calls.clear();
-    let (status, review) = post_json(
-        app.clone(),
-        &format!("/docs/{id_b}/review"),
+    let (status, review) = submit_review(
+        &app,
+        id_b,
         json!({"submission_id": "sub-crash-before", "sha": c1, "verdict": "comment"}),
     )
     .await;
@@ -24024,9 +24147,9 @@ async fn owner_doc_review_wake_goes_to_a_retired_authors_parent_or_nobody() {
             .unwrap()
             .to_owned();
         add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
-        let (status, review) = post_json(
-            app.clone(),
-            &format!("/docs/{id}/review"),
+        let (status, review) = submit_review(
+            &app,
+            &id,
             json!({"submission_id": submission, "sha": c1, "verdict": "comment"}),
         )
         .await;
@@ -24477,28 +24600,37 @@ async fn owner_doc_page_cookie_opens_only_the_files_beside_that_doc() {
 async fn owner_doc_review_a_newer_submission_from_another_device_takes_over() {
     let c1 = "a".repeat(40);
     let source = review_memo_source(&c1);
-    let (app, dir) = owner_docs_app(source.clone());
+    let (app, dir) = owner_docs_app_retrying(source.clone(), parked_review_retry());
     let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await["id"]
         .as_str()
         .unwrap()
         .to_owned();
     add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
-    let submit = |submission: &'static str, verdict: &'static str, body: &'static str| {
-        let app = app.clone();
-        let payload = json!({"submission_id": submission, "sha": "a".repeat(40),
-                             "verdict": verdict, "body": body});
-        let path = format!("/docs/{id}/review");
-        async move { post_json(app, &path, payload).await }
+    let payload = |submission: &str, verdict: &str, body: &str| {
+        json!({"submission_id": submission, "sha": "a".repeat(40),
+               "verdict": verdict, "body": body})
     };
+    let path = format!("/docs/{id}/review");
 
-    // Tab A's attempt fails cleanly: its row is failed, the drafts stay.
-    source.github.lock().unwrap().fail_submit = true;
-    let (status, _) = submit("sub-tab-a", "approve", "Ship it.").await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    // Tab A's attempt is refused: its row is failed, the drafts stay.
+    source.github.lock().unwrap().refuse_submit = true;
+    let (_, failed) = submit_review(&app, &id, payload("sub-tab-a", "approve", "Ship it.")).await;
+    assert_eq!(failed["status"], "failed", "{failed}");
     // Device B submits the same drafts under its own id and gets stuck.
-    source.github.lock().unwrap().fail_delete = true;
-    let (status, _) = submit("sub-device-b", "changes_requested", "Not yet.").await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    {
+        let mut github = source.github.lock().unwrap();
+        github.refuse_submit = false;
+        github.fail_submit = true;
+        github.fail_delete = true;
+    }
+    let (status, _) = post_json(
+        app.clone(),
+        &path,
+        payload("sub-device-b", "changes_requested", "Not yet."),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(parked(&dir, "sub-device-b").await["status"], "submitting");
     {
         let mut github = source.github.lock().unwrap();
         github.fail_submit = false;
@@ -24506,14 +24638,15 @@ async fn owner_doc_review_a_newer_submission_from_another_device_takes_over() {
         github.calls.clear();
     }
     let store = OwnerDocStore::new(dir.join("message_queue.db"));
-    assert_eq!(
-        store.review("sub-device-b").unwrap().unwrap().status,
-        "submitting"
-    );
 
     // Tab A's retry does not revive its own row past B's: it is handed B's
     // submission to resume, verdict and text included.
-    let (status, refused) = submit("sub-tab-a", "approve", "Ship it.").await;
+    let (status, refused) = post_json(
+        app.clone(),
+        &path,
+        payload("sub-tab-a", "approve", "Ship it."),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");
     assert_eq!(
         refused["unfinished_review"],
@@ -24523,10 +24656,16 @@ async fn owner_doc_review_a_newer_submission_from_another_device_takes_over() {
     assert!(source.github.lock().unwrap().calls.is_empty());
 
     // Confirming resumes B's; A's retry after that is closed, not posted.
-    let (status, review) = submit("sub-device-b", "comment", "").await;
+    let (status, review) =
+        retry_review_now(&app, &dir, &id, payload("sub-device-b", "comment", "")).await;
     assert_eq!(status, StatusCode::OK, "{review}");
     assert_eq!(review["verdict"], "changes_requested");
-    let (status, refused) = submit("sub-tab-a", "approve", "Ship it.").await;
+    let (status, refused) = post_json(
+        app.clone(),
+        &path,
+        payload("sub-tab-a", "approve", "Ship it."),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["unfinished_review"], Value::Null);
     assert_eq!(store.review("sub-tab-a").unwrap().unwrap().status, "failed");
@@ -24535,11 +24674,15 @@ async fn owner_doc_review_a_newer_submission_from_another_device_takes_over() {
 
     // The newest failed attempt still retries under its own id.
     add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "And later?").await;
-    source.github.lock().unwrap().fail_submit = true;
-    let (status, _) = submit("sub-tab-a-2", "comment", "").await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    source.github.lock().unwrap().fail_submit = false;
-    let (status, review) = submit("sub-tab-a-2", "comment", "").await;
+    source.github.lock().unwrap().refuse_submit = true;
+    let (_, failed) = submit_review(&app, &id, payload("sub-tab-a-2", "comment", "")).await;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(
+        failed["detail"],
+        "GitHub refused the review: Review cannot be submitted"
+    );
+    source.github.lock().unwrap().refuse_submit = false;
+    let (status, review) = submit_review(&app, &id, payload("sub-tab-a-2", "comment", "")).await;
     assert_eq!(status, StatusCode::OK, "{review}");
     assert_eq!(queued_wakes(&dir, "[sm review]").len(), 2);
 }
@@ -24548,12 +24691,15 @@ async fn owner_doc_review_a_newer_submission_from_another_device_takes_over() {
 async fn owner_doc_review_retries_under_one_id_never_post_twice() {
     let c1 = "a".repeat(40);
     let source = review_memo_source(&c1);
-    let (app, dir) = owner_docs_app(source.clone());
+    let (app, dir) = owner_docs_app_retrying(source.clone(), parked_review_retry());
+    let body = |submission: &str| json!({"submission_id": submission, "sha": "a".repeat(40), "verdict": "comment"});
     let submit = |id: String, submission: &'static str| {
         let app = app.clone();
-        let body =
-            json!({"submission_id": submission, "sha": "a".repeat(40), "verdict": "comment"});
-        async move { post_json(app, &format!("/docs/{id}/review"), body).await }
+        async move { submit_review(&app, &id, body(submission)).await }
+    };
+    let start = |id: String, submission: &'static str| {
+        let app = app.clone();
+        async move { post_json(app, &format!("/docs/{id}/review"), body(submission)).await }
     };
     let doc = |path: &'static str| {
         let app = app.clone();
@@ -24577,10 +24723,12 @@ async fn owner_doc_review_retries_under_one_id_never_post_twice() {
     // A failed attempt is retried under the same id once GitHub recovers.
     let id = doc("specs/memo.html").await;
     source.github.lock().unwrap().fail_submit = true;
-    let (status, _) = submit(id.clone(), "sub-retry-failed").await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let (status, _) = start(id.clone(), "sub-retry-failed").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let retrying = parked(&dir, "sub-retry-failed").await;
+    assert_eq!(retrying["status"], "submitting", "{retrying}");
     source.github.lock().unwrap().fail_submit = false;
-    let (status, review) = submit(id, "sub-retry-failed").await;
+    let (status, review) = retry_review_now(&app, &dir, &id, body("sub-retry-failed")).await;
     assert_eq!(status, StatusCode::OK, "{review}");
     assert_eq!(take_only_review(&source).threads.len(), 2);
 
@@ -24604,8 +24752,9 @@ async fn owner_doc_review_retries_under_one_id_never_post_twice() {
         github.fail_submit = true;
         github.fail_delete = true;
     }
-    let (status, error) = submit(id.clone(), "sub-stuck-delete").await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+    let (status, error) = start(id.clone(), "sub-stuck-delete").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{error}");
+    parked(&dir, "sub-stuck-delete").await;
     let store = OwnerDocStore::new(dir.join("message_queue.db"));
     assert_eq!(
         store.review("sub-stuck-delete").unwrap().unwrap().status,
@@ -24648,14 +24797,14 @@ async fn owner_doc_review_retries_under_one_id_never_post_twice() {
     }
     // A page that never saw it (loaded before it began) is handed its
     // verdict and text to confirm, not left to post them unseen.
-    let (status, refused) = submit(id.clone(), "sub-after-reload").await;
+    let (status, refused) = start(id.clone(), "sub-after-reload").await;
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");
     assert_eq!(
         refused["unfinished_review"],
         json!({"id": "sub-stuck-delete", "verdict": "comment", "body": ""})
     );
     assert!(source.github.lock().unwrap().calls.is_empty());
-    let (status, review) = submit(id.clone(), "sub-stuck-delete").await;
+    let (status, review) = retry_review_now(&app, &dir, &id, body("sub-stuck-delete")).await;
     assert_eq!(review["submission_id"], "sub-stuck-delete");
     assert_eq!(status, StatusCode::OK, "{review}");
     assert_eq!(
@@ -24700,6 +24849,349 @@ async fn owner_doc_review_retries_under_one_id_never_post_twice() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
     // Another revision has its own budget.
     add_draft(&app, &memo, &"b".repeat(40), json!(3), "Buy", "elsewhere").await;
+}
+
+/// Appendix I.10: the submit answers once the review is saved, and GitHub
+/// posting and the agent's wake follow without the page (sm#2554).
+#[tokio::test]
+async fn owner_doc_review_submit_answers_before_github_is_done() {
+    let c1 = "a".repeat(40);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app(source.clone());
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+    source.github.lock().unwrap().submit_delay = Duration::from_secs(3);
+    let payload = json!({"submission_id": "sub-instant1", "sha": c1, "verdict": "approve"});
+    let path = format!("/docs/{id}/review");
+
+    // The answer comes while GitHub is still inside its 3 s submit: nothing
+    // is on GitHub yet. (The 300 ms target is for the release build; this
+    // debug build spends most of that opening SQLite connections.)
+    let started = Instant::now();
+    let (status, queued) = post_json(app.clone(), &path, payload.clone()).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(source
+        .github
+        .lock()
+        .unwrap()
+        .reviews
+        .iter()
+        .all(|review| review.state == "PENDING"));
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    assert_eq!(
+        queued,
+        json!({"submission_id": "sub-instant1", "status": "queued"})
+    );
+
+    // While GitHub is still answering, the same id only reports progress.
+    let (_, head) = get_json(app.clone(), &format!("/docs/{id}/head")).await;
+    let sub = &head["review_submission"];
+    assert_eq!(sub["submission_id"], "sub-instant1");
+    assert!(
+        matches!(sub["status"].as_str(), Some("queued" | "submitting")),
+        "{sub}"
+    );
+    assert!(sub["queued_at"].is_string(), "{sub}");
+    let (status, again) = post_json(app.clone(), &path, payload.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{again}");
+    assert!(queued_wakes(&dir, "[sm review]").is_empty());
+
+    let settled = settled_submission(&app, &id, "sub-instant1").await;
+    assert_eq!(settled["status"], "posted", "{settled}");
+    assert!(settled["github_review_url"].is_string());
+    assert_eq!(settled["delivered_to_session_id"], "author01");
+    let submits = source
+        .github
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|call| *call == "submit")
+        .count();
+    assert_eq!(submits, 1);
+    assert_eq!(source.github.lock().unwrap().reviews.len(), 1);
+    assert_eq!(queued_wakes(&dir, "[sm review]").len(), 1);
+    let (status, posted) = post_json(app.clone(), &path, payload).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(posted["status"], "posted");
+}
+
+#[tokio::test]
+async fn owner_doc_review_retries_transient_failures_and_ends_refusals_at_once() {
+    let c1 = "a".repeat(40);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app_retrying(
+        source.clone(),
+        ReviewRetryPolicy {
+            delays: vec![Duration::from_millis(20)],
+            then_every: Duration::from_millis(20),
+            give_up_after: Duration::from_secs(30),
+        },
+    );
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+
+    // Five 502s, then GitHub recovers: the sixth attempt posts, once.
+    source.github.lock().unwrap().flaky_submits = 5;
+    let (status, review) = submit_review(
+        &app,
+        &id,
+        json!({"submission_id": "sub-flaky001", "sha": c1, "verdict": "comment"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    {
+        let github = source.github.lock().unwrap();
+        assert_eq!(github.calls.iter().filter(|c| *c == "submit").count(), 6);
+        assert_eq!(
+            github
+                .reviews
+                .iter()
+                .filter(|r| r.state != "PENDING")
+                .count(),
+            1
+        );
+    }
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    let row = store.review("sub-flaky001").unwrap().unwrap();
+    assert_eq!(row.schedule.attempts, 5);
+    assert_eq!(row.error, None);
+    assert_eq!(queued_wakes(&dir, "[sm review]").len(), 1);
+
+    // A refusal ends the row at once, with GitHub's message on head.
+    add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Still?").await;
+    source.github.lock().unwrap().refuse_submit = true;
+    let (_, failed) = submit_review(
+        &app,
+        &id,
+        json!({"submission_id": "sub-refused1", "sha": c1, "verdict": "comment"}),
+    )
+    .await;
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(
+        failed["detail"],
+        "GitHub refused the review: Review cannot be submitted"
+    );
+    assert_eq!(
+        store
+            .review("sub-refused1")
+            .unwrap()
+            .unwrap()
+            .schedule
+            .attempts,
+        0
+    );
+    let (_, drafts) = get_json(app.clone(), &format!("/docs/{id}/drafts")).await;
+    assert_eq!(drafts["drafts"].as_array().unwrap().len(), 1);
+
+    // Discard drops the failed row; its drafts stay as drafts.
+    let (status, _) = delete_json(
+        app.clone(),
+        &format!("/docs/{id}/review/sub-refused1"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(store.review("sub-refused1").unwrap().is_none());
+    let (_, drafts) = get_json(app.clone(), &format!("/docs/{id}/drafts")).await;
+    assert_eq!(drafts["drafts"].as_array().unwrap().len(), 1);
+    let (status, _) = delete_json(
+        app.clone(),
+        &format!("/docs/{id}/review/sub-flaky001"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a posted review is not discarded"
+    );
+}
+
+/// Review findings on #2556: a GitHub outage while resolving a closed PR's
+/// target is retried, and a pending review sm could not delete keeps the
+/// submission open until it is resumed or deleted.
+#[tokio::test]
+async fn owner_doc_review_never_strands_a_pending_review_or_a_target_outage() {
+    let c1 = "a".repeat(40);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app_retrying(source.clone(), parked_review_retry());
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+
+    // Refused, and the pending review cannot be deleted: still submitting.
+    {
+        let mut github = source.github.lock().unwrap();
+        github.refuse_submit = true;
+        github.fail_delete = true;
+    }
+    let stuck = json!({"submission_id": "sub-orphan01", "sha": c1, "verdict": "comment"});
+    let (status, _) = post_json(app.clone(), &format!("/docs/{id}/review"), stuck.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(parked(&dir, "sub-orphan01").await["status"], "submitting");
+    // Once the delete works, the retry resumes it, is refused again, and
+    // cleans up before failing.
+    source.github.lock().unwrap().fail_delete = false;
+    let (_, failed) = retry_review_now(&app, &dir, &id, stuck).await;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert!(source.github.lock().unwrap().reviews.is_empty());
+    let row = store.review("sub-orphan01").unwrap().unwrap();
+    assert_eq!(row.pending_review_node_id, None);
+    let (status, _) = delete_json(
+        app.clone(),
+        &format!("/docs/{id}/review/sub-orphan01"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Given up on with the pending review still there (the retry hour ran
+    // out): Discard deletes it from GitHub first, or refuses.
+    let (app, dir) = owner_docs_app(source.clone());
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+    source.github.lock().unwrap().fail_delete = true;
+    let (_, failed) = submit_review(
+        &app,
+        &id,
+        json!({"submission_id": "sub-orphan02", "sha": c1, "verdict": "comment"}),
+    )
+    .await;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert!(store
+        .review("sub-orphan02")
+        .unwrap()
+        .unwrap()
+        .pending_review_node_id
+        .is_some());
+    let discard = format!("/docs/{id}/review/sub-orphan02");
+    let (status, _) = delete_json(app.clone(), &discard, json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(store.review("sub-orphan02").unwrap().is_some());
+    {
+        let mut github = source.github.lock().unwrap();
+        github.fail_delete = false;
+        github.refuse_submit = false;
+    }
+    let (status, _) = delete_json(app.clone(), &discard, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(source.github.lock().unwrap().reviews.is_empty());
+
+    // A closed PR whose history lookup hits a GitHub outage waits and
+    // retries instead of failing.
+    let (app, dir) = owner_docs_app_retrying(source.clone(), parked_review_retry());
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    {
+        let mut github = source.github.lock().unwrap();
+        github.set_pr(12, "closed", &c1);
+        github.reopen_error = Some("gh api graphql failed: HTTP 502 Bad Gateway".into());
+        github.branch_state = Some(json!({"tip": c1, "prs": []}));
+    }
+    let closed = json!({"submission_id": "sub-outage01", "sha": c1, "verdict": "comment"});
+    let (status, _) = post_json(app.clone(), &format!("/docs/{id}/review"), closed.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let waiting = parked(&dir, "sub-outage01").await;
+    assert_eq!(waiting["status"], "queued", "{waiting}");
+    {
+        let mut github = source.github.lock().unwrap();
+        github.reopen_error = None;
+        github.reopen_info = Some(json!({"state": "CLOSED", "headRefName": "topic"}));
+    }
+    let (status, posted) = retry_review_now(&app, &dir, &id, closed).await;
+    assert_eq!(status, StatusCode::OK, "{posted}");
+}
+
+#[tokio::test]
+async fn owner_doc_review_worker_finishes_rows_a_restart_left() {
+    let c1 = "a".repeat(40);
+    let blob = git_blob_sha(REVIEW_MEMO);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app(source.clone());
+    let doc_a = publish_review_memo(&app, "specs/a.html", &c1, "author01", true).await;
+    let doc_b = publish_review_memo(&app, "specs/b.html", &c1, "author01", true).await;
+    let (id_a, id_b) = (
+        doc_a["id"].as_str().unwrap().to_owned(),
+        doc_b["id"].as_str().unwrap().to_owned(),
+    );
+    add_draft(&app, &id_a, &c1, json!(3), "Buy the dip.", "Why now?").await;
+    add_draft(&app, &id_b, &c1, json!(3), "Buy the dip.", "Why now?").await;
+    drop(app);
+    // The previous run saved one row and had started the other.
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    store
+        .queue_review(
+            "sub-restart-q",
+            &id_a,
+            &c1,
+            OwnerDocVerdict::Comment,
+            None,
+            false,
+            0,
+        )
+        .unwrap();
+    store
+        .begin_review(
+            "sub-restart-s",
+            &id_b,
+            &c1,
+            &blob,
+            OwnerDocVerdict::Comment,
+            None,
+        )
+        .unwrap();
+
+    // A scratch server (runtime off) on this state leaves them alone.
+    let scratch = router(owner_docs_state_in(&dir, source.clone(), |_| {}));
+    let (status, _) = post_json(
+        scratch.clone(),
+        &format!("/docs/{id_a}/review"),
+        json!({"submission_id": "sub-restart-q", "sha": c1, "verdict": "comment"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        store.review("sub-restart-q").unwrap().unwrap().status,
+        "queued"
+    );
+    assert!(source.github.lock().unwrap().reviews.is_empty());
+    drop(scratch);
+
+    // The live server picks both up at startup.
+    let live = router(owner_docs_state_in(&dir, source.clone(), |config| {
+        config.rust_core.runtime_enabled = true;
+    }));
+    assert_eq!(
+        settled_submission(&live, &id_a, "sub-restart-q").await["status"],
+        "posted"
+    );
+    assert_eq!(
+        settled_submission(&live, &id_b, "sub-restart-s").await["status"],
+        "posted"
+    );
+    assert_eq!(source.github.lock().unwrap().reviews.len(), 2);
+    assert_eq!(queued_wakes(&dir, "[sm review]").len(), 2);
 }
 
 #[tokio::test]
@@ -24788,16 +25280,15 @@ async fn owner_doc_merged_review_retries_creation_without_duplicate_pr_or_publis
     assert_eq!(t["base"], "epic");
     assert_eq!(t["doc_changed"], true);
     let payload = json!({"submission_id":"merged-sub-001","sha":sha,"verdict":"comment","body":"Please reconsider"});
-    let (status, _) = post_json(app.clone(), &format!("/docs/{id}/review"), payload.clone()).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let (_, failed) = submit_review(&app, &id, payload.clone()).await;
+    assert_eq!(failed["status"], "failed", "{failed}");
     let store = OwnerDocStore::new(dir.join("message_queue.db"));
     assert_eq!(
         store.review_target("merged-sub-001").unwrap().unwrap()["tip_sha"],
         tip
     );
     for _ in 0..2 {
-        let (status, res) =
-            post_json(app.clone(), &format!("/docs/{id}/review"), payload.clone()).await;
+        let (status, res) = submit_review(&app, &id, payload.clone()).await;
         assert_eq!(status, StatusCode::OK, "{res}");
         assert_eq!(res["file_comment_count"], 1);
         assert_eq!(res["line_comment_count"], 0);
@@ -24854,8 +25345,7 @@ async fn owner_doc_without_pr_review_goes_to_the_open_pr_changing_it() {
     assert_eq!(t, json!({"kind":"attach","pr":40}));
     let payload = json!({"submission_id":"no-pr-sub-001","sha":sha,"verdict":"comment"});
     for _ in 0..2 {
-        let (status, res) =
-            post_json(app.clone(), &format!("/docs/{id}/review"), payload.clone()).await;
+        let (status, res) = submit_review(&app, &id, payload.clone()).await;
         assert_eq!(status, StatusCode::OK, "{res}");
         assert_eq!(res["file_comment_count"], 1);
     }
@@ -24899,8 +25389,7 @@ async fn owner_doc_closed_review_reopens_once_and_preserves_original_commit() {
     }
     let payload = json!({"submission_id":"closed-sub-001","sha":sha,"verdict":"comment"});
     for _ in 0..2 {
-        let (status, res) =
-            post_json(app.clone(), &format!("/docs/{id}/review"), payload.clone()).await;
+        let (status, res) = submit_review(&app, &id, payload.clone()).await;
         assert_eq!(status, StatusCode::OK, "{res}");
     }
     let g = source.github.lock().unwrap();

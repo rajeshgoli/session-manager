@@ -402,7 +402,7 @@ mod worktrees;
 pub use auto_retire::sweep_auto_retire;
 pub use docs::{
     DocFetchError, DocPullRequest, DocReviewOnGitHub, DocReviewReply, OwnerDocSource,
-    SubmittedDocReview,
+    ReviewRetryPolicy, SubmittedDocReview,
 };
 
 pub trait GitHubReviewPoster: Send + Sync {
@@ -704,6 +704,9 @@ pub struct AppState {
     /// Analytics payloads per parameter set, cached for 60s.
     analytics_cache: Arc<Mutex<analytics::AnalyticsCache>>,
     owner_doc_review_lock: Arc<AsyncMutex<()>>,
+    /// Wakes the owner doc review worker when a submission is queued (sm#2554).
+    owner_doc_review_wake: Arc<tokio::sync::Notify>,
+    owner_doc_review_retry: ReviewRetryPolicy,
     /// Serializes owner message replies with their draft writes (sm#1580).
     owner_message_lock: Arc<AsyncMutex<()>>,
     /// Limits repeated Enter frames and prompt hooks to one answer pass per agent in two seconds.
@@ -966,6 +969,8 @@ impl AppState {
             owner_doc_replies_cache: Arc::new(Mutex::new(BTreeMap::new())),
             analytics_cache: Arc::new(Mutex::new(BTreeMap::new())),
             owner_doc_review_lock: Arc::new(AsyncMutex::new(())),
+            owner_doc_review_wake: Arc::new(tokio::sync::Notify::new()),
+            owner_doc_review_retry: ReviewRetryPolicy::default(),
             owner_message_lock: Arc::new(AsyncMutex::new(())),
             owner_answered_at: Arc::new(Mutex::new(BTreeMap::new())),
             work_item_source: Arc::new(claims::GhCliWorkItemSource),
@@ -1100,6 +1105,12 @@ impl AppState {
 
     pub fn with_owner_doc_source(mut self, source: Arc<dyn OwnerDocSource>) -> Self {
         self.owner_doc_source = source;
+        self
+    }
+
+    /// Tests shorten the review worker's retry schedule.
+    pub fn with_owner_doc_review_retry(mut self, policy: ReviewRetryPolicy) -> Self {
+        self.owner_doc_review_retry = policy;
         self
     }
 
@@ -1952,7 +1963,7 @@ pub fn router(state: AppState) -> Router {
         eprintln!("Codex review request schema initialization failed: {error:#}");
     }
     docs::init_owner_docs(&state.config);
-    docs::recover_owner_doc_reviews(state.clone());
+    docs::spawn_owner_doc_review_worker(state.clone());
     claims::init_work_claims(state.clone());
     board::init_board(state.clone());
     recover_codex_review_request_watchers(state.clone());
