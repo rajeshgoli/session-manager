@@ -207,7 +207,7 @@ function Appearance() {
       <button class="btn sm" type="button" onClick=${() => chooseSize(15)}>Reset</button></div>
     <div class="settings-field"><label><span>Ticket titles on agent cards</span>
       <${Toggle} label="Ticket titles on agent cards" checked=${titles} onChange=${chooseTitles} /></label>
-      <p class="sub">Shows each agent's ticket title under its name on the Agents page.</p></div>
+      <p class="sub">Shows each agent's ticket title under its name on its card.</p></div>
     <p class="sub">Saved in this browser only.</p><p role="status" class="saved">${status}</p>`;
 }
 

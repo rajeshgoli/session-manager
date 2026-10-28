@@ -192,7 +192,7 @@ export function TerminalPage({ id, watch, moon }) {
     setTimeout(() => control.current?.focus(), 0);
   };
   // A retired agent's terminal has nothing left to show, so move on to the next agent,
-  // or to the Agents page when none is left (going back could land on one retired earlier).
+  // or to `/` when none is left (going back could land on one retired earlier).
   const retired = (done) => {
     if (!done) { reload(); return; }
     const next = rowAfterRetire(order, id);

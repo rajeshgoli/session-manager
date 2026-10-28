@@ -364,7 +364,7 @@ export function HostRestartBanner() {
 
 const refreshMs = () => Math.max(1, config.refresh_seconds || 3) * 1000;
 
-/** Today's Agents page card for one agent; a click or its terminal icon opens the terminal. */
+/** The card the Agents page showed for one agent; a click or its terminal icon opens the terminal. */
 export function AgentCard({ agent, now, onAnswered, onRetired, onOpen = () => openTerminal(agent) }) {
   const codex = (agent.provider || '').startsWith('codex');
   const section = sectionOf(agent);
