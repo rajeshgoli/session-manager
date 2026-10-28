@@ -101,8 +101,8 @@ const CODEX_FORK_CONTROL_RECOVERY_POLL: Duration = Duration::from_millis(50);
 const SEAT_SESSION_RETRY_ATTEMPTS: usize = 20;
 const SEAT_SESSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 const REPARENT_REQUEST_TTL_HOURS: i64 = 24;
-const POEM_NAMES: &str = "ozymandias kubla-khan dover-beach the-raven invictus jabberwocky ulysses tintern-abbey the-tyger annabel-lee daffodils ode-to-autumn fern-hill birches mending-wall still-i-rise the-lake-isle byzantium the-lamb lycidas the-eagle crossing-the-bar the-kraken the-listeners adlestrop pied-beauty the-windhover gods-grandeur the-wild-swans prufrock digging the-fish one-art the-moose wild-geese the-summer-day the-flea the-garden the-prelude bright-star la-belle-dame to-a-skylark the-cloud lady-of-shalott my-last-duchess the-owl stopping-by-woods fire-and-ice nothing-gold red-wheelbarrow anecdote-of-the-jar thirteen-ways richard-cory chicago fog harlem sympathy o-captain i-wandered-lonely the-solitary-reaper kubla endymion the-snow-man the-good-morrow";
-const STAR_NAMES: &str = "vega rigel sirius altair deneb polaris capella arcturus aldebaran antares betelgeuse procyon spica regulus castor pollux canopus achernar fomalhaut bellatrix mira algol alcor mizar dubhe merak alioth alkaid shaula sadr albireo alnilam alnitak mintaka saiph hadar acrux mimosa markab scheat alpheratz hamal menkar nunki kochab thuban denebola algieba elnath alhena wezen adhara avior suhail orion lyra cygnus carina perseus draco auriga pleiades hyades andromeda";
+const POEM_NAMES: &str = "ozymandias kubla-khan dover-beach the-raven invictus jabberwocky ulysses tintern-abbey the-tyger annabel-lee daffodils ode-to-autumn fern-hill birches mending-wall still-i-rise the-lake-isle byzantium the-lamb lycidas the-eagle crossing-the-bar the-kraken the-listeners adlestrop pied-beauty the-windhover gods-grandeur the-wild-swans prufrock digging the-fish one-art the-moose wild-geese the-summer-day the-flea the-garden the-prelude bright-star la-belle-dame to-a-skylark the-cloud lady-of-shalott my-last-duchess the-owl stopping-by-woods fire-and-ice nothing-gold red-wheelbarrow anecdote-of-the-jar thirteen-ways richard-cory chicago fog harlem sympathy o-captain i-wandered-lonely the-solitary-reaper the-second-coming endymion the-snow-man the-good-morrow meghaduta kumarasambhava raghuvamsha ritusamhara gita-govinda amaru-shataka niti-shataka vairagya-shataka buddhacharita saundarananda kiratarjuniya shishupala-vadha naishadha-charita soundarya-lahari bhaja-govindam shiva-tandava vikramarjuna-vijaya adi-purana gadayuddha harishchandra-kavya jaimini-bharata ramayana-darshanam naaku-tanti sakhigeetha bhumi-geeta mysuru-mallige gitanjali rubaiyat masnavi shahnameh the-guest-house shikwa thirukkural silappatikaram yaadhum-oore kalevala gilgamesh beowulf the-odyssey the-aeneid metamorphoses inferno the-prophet tao-te-ching quiet-night-thought spring-view narrow-road the-panther duino-elegies erlkonig ode-to-joy le-lac the-albatross the-bronze-horseman romance-sonambulo ode-to-tomatoes song-of-myself the-waste-land howl";
+const STAR_NAMES: &str = "vega rigel sirius altair deneb polaris capella arcturus aldebaran antares betelgeuse procyon spica regulus castor pollux canopus achernar fomalhaut bellatrix mira algol alcor mizar dubhe merak alioth alkaid shaula sadr albireo alnilam alnitak mintaka saiph hadar acrux mimosa markab scheat alpheratz hamal menkar nunki kochab thuban denebola algieba elnath alhena wezen adhara avior suhail orion lyra cygnus carina perseus draco auriga pleiades hyades andromeda ashwini bharani krittika rohini mrigashira ardra punarvasu pushya ashlesha magha purva-phalguni uttara-phalguni hasta chitra swati vishakha anuradha jyeshtha mula purva-ashadha uttara-ashadha shravana dhanishta shatabhisha purva-bhadrapada uttara-bhadrapada revati";
 static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default)]
@@ -14968,13 +14968,16 @@ fn generated_session_name(
         _ => return None,
     };
     let names = list.split_whitespace().collect::<Vec<_>>();
-    let start = (OsRng.next_u64() as usize) % names.len();
-    for offset in 0..names.len() {
-        let name = names[(start + offset) % names.len()];
-        if !name_is_reserved(sessions, name, None, now) {
-            return Some(name.to_owned());
-        }
+    // Uniform over the free names: walking forward from a random start made a
+    // name right after a run of taken ones win every pick landing in the run (#2585).
+    let free = names
+        .iter()
+        .filter(|name| !name_is_reserved(sessions, name, None, now))
+        .collect::<Vec<_>>();
+    if !free.is_empty() {
+        return Some(free[(OsRng.next_u64() as usize) % free.len()].to_string());
     }
+    let start = (OsRng.next_u64() as usize) % names.len();
     Some(first_free_name(sessions, names[start], None, now))
 }
 
@@ -18671,6 +18674,35 @@ mod tests {
             "agent_registrations": [{"session_id": "holder", "role": "VEGA"}]
         }));
         assert!(name_is_reserved(&registered, "vega", None, now));
+    }
+
+    #[test]
+    fn generated_names_spread_evenly_over_free_names() {
+        let now = OffsetDateTime::now_utc();
+        for list in [POEM_NAMES, STAR_NAMES] {
+            let all = list.split_whitespace().collect::<Vec<_>>();
+            assert_eq!(
+                all.iter().collect::<BTreeSet<_>>().len(),
+                all.len(),
+                "no name listed twice"
+            );
+        }
+        let names = POEM_NAMES.split_whitespace().collect::<Vec<_>>();
+        // Take the first 20 names, a run the old forward walk funnelled into the 21st.
+        let used = names[..20]
+            .iter()
+            .map(|name| json!({"id": format!("used-{name}"), "name": name, "status": "running"}))
+            .collect::<Vec<_>>();
+        let mut counts = BTreeMap::<String, usize>::new();
+        let free = names.len() - 20;
+        for _ in 0..free * 100 {
+            let name = generated_session_name(&used, "claude", now).unwrap();
+            assert!(!names[..20].contains(&name.as_str()), "{name} is taken");
+            *counts.entry(name).or_default() += 1;
+        }
+        // 100 picks per free name on average; the old walk gave the 21st 21 times that.
+        assert_eq!(counts.len(), free);
+        assert!(counts.values().all(|&n| n < 200), "{counts:?}");
     }
 
     #[test]
