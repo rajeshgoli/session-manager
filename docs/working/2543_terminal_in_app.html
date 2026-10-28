@@ -481,16 +481,18 @@ Opus 5.5 (1M context) with medium effort · Claude Max
 </table>
 
 <h3>Delivery</h3>
-<p>Three tickets. The first two run one after the other, after the terminal mouse and copy fix (#2540, pull request #2542) merges, because all three edit the same files. The third touches different files and can start now.</p>
+<p>Five tickets under #2543. The four web tickets run one after another, starting after the terminal mouse and copy fix (#2540, pull request #2542) merges, because they all edit the same files. The review-submit ticket touches different files and can start now.</p>
 <ol>
-<li><b>One sidebar</b>: the sidebar and its two arrangements, hover cards, compact meters, the terminal inside the frame with its ticket line, the top bar rule, search everywhere, the new landing, removal of the Agents page, and the kept terminal connection.</li>
-<li><b>Documents as a focus view</b>: every document link opens full width under the new document bar; the side panel stops showing documents.</li>
-<li><b>Instant review submit</b>: the server answers once the review is saved, and posts and wakes in the background.</li>
+<li><b>#2550 One sidebar</b>: the sidebar and its two arrangements, hover cards, the terminal inside the frame with its ticket line, the top bar rule, search everywhere, the new landing, and removal of the Agents page.</li>
+<li><b>#2551 Compact meters</b>, shown by importance.</li>
+<li><b>#2552 Kept terminal</b>: the last terminal stays connected for 15 minutes.</li>
+<li><b>#2553 Documents as a focus view</b>: every document link opens full width under the new document bar; the side panel stops showing documents.</li>
+<li><b>#2554 Instant review submit</b>: the server answers once the review is saved, and posts and wakes in the background.</li>
 </ol>
-<p>After each ticket I will ask you to try one thing. After the first: from a terminal, click Board, then the same agent in the sidebar, and check that its screen comes straight back. After the second: click a document link in an agent's Details, read, and press ⌘[. After the third: submit a review and see the sheet close at once.</p>
+<p>After each ticket I will ask you to try one thing. After #2552: from a terminal, click Board, then the same agent in the sidebar, and check that its screen comes straight back. After #2553: click a document link in an agent's Details, read, and press ⌘[. After #2554: submit a review and see the sheet close at once.</p>
 
 <h3>FAQ: what changed since the last revision</h3>
-<p><b>Submitting a review no longer waits on GitHub</b> (new section above; decision 6; third ticket). <b>The top-right corner holds each view's main action</b>, with the moon and bug button just to its left, as on today's Agents page: Retire on a terminal, Review on a document, New agent elsewhere. Revision 7's other changes stand: Print stays and Ask goes, the replies note sits in the document bar, the five-hour meter hides until it matters, and the sidebar is 248 points wide.</p>
+<p><b>Submitting a review no longer waits on GitHub</b> (new section above; decision 6; ticket #2554). <b>The top-right corner holds each view's main action</b>, with the moon and bug button just to its left, as on today's Agents page: Retire on a terminal, Review on a document, New agent elsewhere. Revision 7's other changes stand: Print stays and Ask goes, the replies note sits in the document bar, the five-hour meter hides until it matters, and the sidebar is 248 points wide.</p>
 <!-- memo-print-scope keys on this divider: everything after it is hidden when printing
      "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
 <hr class="appendix-divider">
@@ -515,15 +517,15 @@ Opus 5.5 (1M context) with medium effort · Claude Max
 <table>
 <thead><tr><th>Requirement</th><th>Spec</th><th>Code</th><th>Proof</th><th>Ticket</th></tr></thead>
 <tbody>
-<tr><td>One sidebar, every page (decision 1)</td><td>B</td><td><code>web/app.js</code> <code>App</code>, new <code>Sidebar</code> replacing <code>Rail</code>; <code>web/terminal.js</code> <code>Switcher</code> reused; <code>web/app.css</code></td><td>I.1, I.2</td><td>1</td></tr>
-<tr><td>Top bar rules</td><td>C</td><td><code>web/app.js</code> <code>TopBar</code>; <code>web/terminal.js</code> bars</td><td>I.1</td><td>1</td></tr>
-<tr><td>Agents page removed, landing, hover card (decision 2)</td><td>D</td><td><code>web/app.js</code> <code>PAGES</code>, <code>pageFor</code>; <code>web/agents.js</code></td><td>I.3</td><td>1</td></tr>
-<tr><td>Kept terminal (decision 5)</td><td>E</td><td><code>web/app.js</code> <code>App</code>; <code>web/terminal.js</code> <code>TerminalPage</code></td><td>I.4, I.7</td><td>1</td></tr>
-<tr><td>⌘K, ⌘\ everywhere</td><td>G</td><td><code>web/app.js</code> <code>useKeyboard</code>, <code>Palette</code>; <code>web/terminal.js</code> key handler</td><td>I.2</td><td>1</td></tr>
-<tr><td>Documents as focus view (decision 3)</td><td>F</td><td><code>web/reader.js</code>, <code>web/app.js</code>, link sites in F.4; <code>http.rs</code> route</td><td>I.5, I.6, I.9</td><td>2</td></tr>
-<tr><td>Meters by importance (decision 4)</td><td>B.6</td><td><code>web/app.js</code> <code>Dash</code>, <code>usageMeter</code>; <code>web/app.css</code></td><td>I.8</td><td>1</td></tr>
-<tr><td>Instant review submit (decision 6)</td><td>J</td><td><code>http/docs/review.rs</code> <code>submit_owner_doc_review</code>, <code>run_blocking</code>; <code>owner_docs.rs</code> review rows; <code>http/doc_client.js</code> submit handler; <code>http/docs.rs</code> head</td><td>I.10</td><td>3</td></tr>
-<tr><td>Phone unchanged (decision 7)</td><td>B.7</td><td><code>web/app.css</code> ≤720 px block</td><td>I.1</td><td>1</td></tr>
+<tr><td>One sidebar, every page (decision 1)</td><td>B</td><td><code>web/app.js</code> <code>App</code>, new <code>Sidebar</code> replacing <code>Rail</code>; <code>web/terminal.js</code> <code>Switcher</code> reused; <code>web/app.css</code></td><td>I.1, I.2</td><td>#2550</td></tr>
+<tr><td>Top bar rules</td><td>C</td><td><code>web/app.js</code> <code>TopBar</code>; <code>web/terminal.js</code> bars</td><td>I.1</td><td>#2550</td></tr>
+<tr><td>Agents page removed, landing, hover card (decision 2)</td><td>D</td><td><code>web/app.js</code> <code>PAGES</code>, <code>pageFor</code>; <code>web/agents.js</code></td><td>I.3</td><td>#2550</td></tr>
+<tr><td>Kept terminal (decision 5)</td><td>E</td><td><code>web/app.js</code> <code>App</code>; <code>web/terminal.js</code> <code>TerminalPage</code></td><td>I.4, I.7</td><td>#2552</td></tr>
+<tr><td>⌘K, ⌘\ everywhere</td><td>G</td><td><code>web/app.js</code> <code>useKeyboard</code>, <code>Palette</code>; <code>web/terminal.js</code> key handler</td><td>I.2</td><td>#2550</td></tr>
+<tr><td>Documents as focus view (decision 3)</td><td>F</td><td><code>web/reader.js</code>, <code>web/app.js</code>, link sites in F.4; <code>http.rs</code> route</td><td>I.5, I.6, I.9</td><td>#2553</td></tr>
+<tr><td>Meters by importance (decision 4)</td><td>B.6</td><td><code>web/app.js</code> <code>Dash</code>, <code>usageMeter</code>; <code>web/app.css</code></td><td>I.8</td><td>#2551</td></tr>
+<tr><td>Instant review submit (decision 6)</td><td>J</td><td><code>http/docs/review.rs</code> <code>submit_owner_doc_review</code>, <code>run_blocking</code>; <code>owner_docs.rs</code> review rows; <code>http/doc_client.js</code> submit handler; <code>http/docs.rs</code> head</td><td>I.10</td><td>#2554</td></tr>
+<tr><td>Phone unchanged (decision 7)</td><td>B.7</td><td><code>web/app.css</code> ≤720 px block</td><td>I.1</td><td>#2550</td></tr>
 </tbody>
 </table>
 
@@ -626,10 +628,13 @@ Opus 5.5 (1M context) with medium effort · Claude Max
 <p>In the palette, an Agent or Terminal row opens that session's terminal on every page; a Doc row opens the document view. Closing the palette on a terminal view refocuses the terminal.</p>
 
 <h3 id="h">H. Tickets</h3>
+<p>All under goal #2543; order recorded with <code>sm board after</code>. The last of #2553 and #2554 to merge moves this document to <code>docs/specs/</code> in its PR.</p>
 <ol>
-<li><b>One sidebar</b>: B, C, D, E, G. Files: <code>web/app.js</code>, <code>web/terminal.js</code>, <code>web/agents.js</code>, <code>web/app.css</code>, tests. Starts after #2540 / PR #2542.</li>
-<li><b>Documents as a focus view</b>: F, plus the document rows of C and G. Files: <code>web/reader.js</code>, <code>web/inbox.js</code>, <code>web/history.js</code>, <code>web/ui.js</code>, <code>web/terminal.js</code> (link handler only), <code>web/app.js</code>, <code>http.rs</code>, tests. Starts after ticket 1.</li>
-<li><b>Instant review submit</b>: J. Files: <code>http/docs/review.rs</code>, <code>owner_docs.rs</code>, <code>http/docs.rs</code> (head only), <code>http/doc_client.js</code>, tests. No overlap with tickets 1–2 or #2542; starts now.</li>
+<li><b>#2550 One sidebar</b>: B.1–B.5, C, D, G. Files: <code>web/app.js</code>, <code>web/terminal.js</code>, <code>web/agents.js</code>, <code>web/app.css</code>, tests. Starts after #2540 / PR #2542.</li>
+<li><b>#2551 Compact meters</b>: B.6. Files: <code>web/app.js</code> (<code>Dash</code>, <code>usageMeter</code>), <code>web/app.css</code>, tests. Starts after #2550.</li>
+<li><b>#2552 Kept terminal</b>: E. Files: <code>web/app.js</code>, <code>web/terminal.js</code>, tests. Starts after #2551.</li>
+<li><b>#2553 Documents as a focus view</b>: F, plus the document rows of C and G. Files: <code>web/reader.js</code>, <code>web/inbox.js</code>, <code>web/history.js</code>, <code>web/ui.js</code>, <code>web/terminal.js</code> (link handler only), <code>web/app.js</code>, <code>http.rs</code>, <code>http/doc_client.js</code> (replies banner only), tests. Starts after #2552.</li>
+<li><b>#2554 Instant review submit</b>: J. Files: <code>http/docs/review.rs</code>, <code>owner_docs.rs</code>, <code>http/docs.rs</code> (head only), <code>http/doc_client.js</code> (submit handler only), tests. Starts now.</li>
 </ol>
 
 <h3 id="i">I. Tests and live checks</h3>
