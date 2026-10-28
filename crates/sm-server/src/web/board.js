@@ -268,13 +268,15 @@ function boardRows(lanes, others) {
     ...others.flatMap((group) => group.tickets.map((ticket) => ({ ticket, lane: null })))]
     .filter(({ ticket }) => !seen.has(ticketKey(ticket)) && seen.add(ticketKey(ticket)));
 }
-/** Every ticket across lanes that waits on the owner, most pressing first; each once. */
+/** Every ticket across lanes that waits on the owner, most pressing first; each once.
+ * The auto PM manages its own lane, so only an explicit ask from it shows (#2572). */
 export const attentionItems = (lanes, others = []) => boardRows(lanes, others)
+  .filter(({ ticket, lane }) => !lane?.autopm || ticket.needs_you)
   .flatMap((row) => { const reason = attentionReason(row.ticket); return reason ? [{ ...row, ...reason }] : []; })
   .sort((a, b) => a.order - b.order);
 /** Startable tickets nobody holds, in lane order; each once. */
 export const readyItems = (lanes, others = []) => boardRows(lanes, others)
-  .filter(({ ticket }) => canStart(ticket) && !ticket.holder && !attentionReason(ticket));
+  .filter(({ ticket, lane }) => !lane?.autopm && canStart(ticket) && !ticket.holder && !attentionReason(ticket));
 export const shortGoal = (title) => title.split(/\s*[:(]/)[0].trim() || title;
 function MoveRow({ item, jump, action }) {
   const { ticket, lane } = item;

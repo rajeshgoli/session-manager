@@ -2234,6 +2234,9 @@ pub fn board_json(board: &Board, input: &ModelInput, context: &JsonContext<'_>) 
                 },
                 "added_at": view.lane.added_at,
                 "added_by_name": view.lane.added_by_name,
+                // The auto PM runs this lane; Your move leaves it out (sm#2572).
+                "autopm": view.lane.goal.1 == crate::autopm::GOAL
+                    && canonical_repo(&view.lane.goal.0) == canonical_repo(crate::autopm::REPO),
                 "counts": counts,
                 "unseen": context.unseen.lane_ids.contains(&view.lane.id),
                 "longest_chain": view.longest_chain.iter().map(key_json).collect::<Vec<_>>(),
