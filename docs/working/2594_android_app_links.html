@@ -107,7 +107,7 @@
 </style>
 
 <h1>2594 — Open sm doc links in the phone app</h1>
-<p class="sans"><small>Author: fit-and-finish agent <code>e7838871</code> · Ticket #2594 · Revision 1</small></p>
+<p class="sans"><small>Author: fit-and-finish agent <code>e7838871</code> · Ticket #2594 · Revision 2</small></p>
 
 <h2>Memo</h2>
 
@@ -147,19 +147,20 @@
 <pre><code>[{"relation": ["delegate_permission/common.handle_all_urls"],
   "target": {"namespace": "android_app", "package_name": "li.rajeshgo.sm",
              "sha256_cert_fingerprints": ["FD:BF:0B:BD:…:00:F6:BF"]}}]</code></pre>
-<p>It reveals that an Android app called <code>li.rajeshgo.sm</code> exists, plus a certificate fingerprint. That fingerprint is printed inside every copy of the app, so it is not a secret. The file grants exactly one thing: the app may open this site's links. It deliberately leaves out the other grant Android supports, sharing saved passwords between the site and the app.</p>
+<p>It reveals that an Android app called <code>li.rajeshgo.sm</code> exists, plus a certificate fingerprint. That fingerprint is printed inside every copy of the app, so it is not a secret. The file grants exactly one thing: the app may open this site's links. It deliberately leaves out the other grant Android supports, sharing saved passwords between the site and the app. One condition comes with it: Android also treats this association as the link that lets an app use the site's passkeys. sm.rajeshgo.li has no passkeys today (your login is Google's, through Cloudflare), so no passkey depends on it. If sm ever adds passkey login on this host, the signing key below becomes part of that login's security and needs revisiting.</p>
 
 <h3>Security review</h3>
 <table>
 <thead><tr><th style="width:24%">Risk</th><th>Why it is acceptable, and what guards it</th></tr></thead>
 <tbody>
-<tr><td><b>The exception is wider than one file.</b> Cloudflare's documentation does not say whether a rule for a path also covers the paths beneath it.</td><td>Two independent guards.
+<tr><td><b>The exception is wider than one file.</b> A Cloudflare path rule also covers every path beneath it.</td><td>Two independent guards, each enough on its own.
 <ul>
-<li>sm-server answers only the exact path <code>/.well-known/assetlinks.json</code>. Anything below it, beside it, or written to climb back out (<code>/../</code>, including the percent-encoded form) gets "not found". A test covers each case.</li>
-<li>After the change, a fixed list of curl probes (Appendix B) must show the login redirect for every neighbouring path. If any probe reaches sm-server without a login, the rule is rolled back in one call.</li>
-</ul></td></tr>
-<tr><td><b>Someone else's app claims your links.</b></td><td>Only an app signed with the same certificate can claim them. That certificate is the Android debug key stored on this Mac, so whoever holds it can already build and install a fake sm app today. Even then, the fake app receives only the link address. sm's reader links carry no tokens or secrets, and opening the page still needs your login.</td></tr>
-<tr><td><b>Changing Cloudflare with an API token.</b></td><td>The change is one new Access application, scoped to one path, with one Bypass policy. It uses the token already in sm's config, which sm already uses to manage device policies. It is recorded on the ticket with the new application's id, and deleting that application rolls it back. Your existing login application is not edited.</td></tr>
+<li><b>Cloudflare:</b> a second, more specific rule puts every path <i>beneath</i> the file back behind your login. Cloudflare applies the most specific rule, and a rule for "everything beneath" does not cover the file itself. Only the exact file passes without login.</li>
+<li><b>sm-server:</b> it answers only the exact path <code>/.well-known/assetlinks.json</code>. Anything below it, beside it, or written to climb back out (<code>/../</code>, including the percent-encoded form) gets "not found". A test covers each case.</li>
+</ul>
+After the change, a fixed list of curl probes (Appendix B) must show the login redirect for every neighbouring path. Any neighbouring path that reaches sm-server without a login, even as "not found", means the Cloudflare guard failed, and both rules are rolled back.</td></tr>
+<tr><td><b>Someone else's app claims your links.</b></td><td>Only an app signed with the same certificate can claim them. That certificate is the Android debug key on this Mac. Anyone who holds it has this Mac, which also holds the Cloudflare token, the device-certificate keys and sm's databases, so the key adds nothing to what such an attacker already has. Such an app could open sm links and, if sm ever adds passkeys on this host, ask to use them; it could not read sm pages, which still need your login. sm's reader links carry no tokens or secrets.</td></tr>
+<tr><td><b>Changing Cloudflare with an API token.</b></td><td>The change is two new Access applications: the public one, scoped to one path with one Bypass policy, and the "everything beneath it" one, which reuses your login application's existing policies. It uses the token already in sm's config, which sm already uses to manage device policies. Both ids are recorded on the ticket, and deleting the two applications rolls it back. Your existing login application is not edited.</td></tr>
 <tr><td><b>A pre-existing gap the review surfaced:</b> sm-server relies on Cloudflare for the login on most routes.</td><td>Some sm-server routes check your login themselves (docs, messages, the web app's files). Others trust that Cloudflare already did. This change keeps that gap from widening: only the exact path passes the wall, and that path serves the public file. Closing the gap is decision 4 below.</td></tr>
 </tbody>
 </table>
@@ -168,8 +169,8 @@
 <table>
 <thead><tr><th style="width:24%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr></thead>
 <tbody>
-<tr><td>1. Let Cloudflare pass <code>sm.rajeshgo.li/.well-known/assetlinks.json</code> without login?</td><td><b>Yes</b>: one exact path, through a separate Cloudflare Access application with a Bypass policy. I make the change by API after this merges and deploys, then run the probe list.</td><td>It is the only way Android's check can pass while everything else stays behind login.</td></tr>
-<tr><td>2. Keep signing the app with this Mac's debug key?</td><td><b>Yes, for now.</b> The file lists the debug key's fingerprint.</td><td>Switching keys means uninstalling the app on your phone (Android refuses an update signed by a new key). The risk above is bounded.</td></tr>
+<tr><td>1. Let Cloudflare pass <code>sm.rajeshgo.li/.well-known/assetlinks.json</code> without login?</td><td><b>Yes</b>: one exact path, through a separate Cloudflare Access application with a Bypass policy, plus a second application that keeps everything beneath it behind login. I make the change by API after this merges and deploys, then run the probe list.</td><td>It is the only way Android's check can pass while everything else stays behind login.</td></tr>
+<tr><td>2. Keep signing the app with this Mac's debug key?</td><td><b>Yes, for now.</b> The file lists the debug key's fingerprint.</td><td>The key adds no exposure beyond holding this Mac. Switching means uninstalling the app on your phone, because Android refuses an update signed by a new key. Revisit if sm adds passkeys.</td></tr>
 <tr><td>3. Where does the fingerprint live?</td><td><b>In sm's config</b> (<code>android_app_links</code>), not in code.</td><td>A rebuilt or re-keyed app needs a config edit, not a release.</td></tr>
 <tr><td>4. Close the reliance on Cloudflare for login?</td><td><b>Separate ticket</b>: sm-server refuses any request on the public hostnames without a verified Cloudflare login, except a short list of public paths.</td><td>It is a real gap, but it is independent of this change and touches every route.</td></tr>
 </tbody>
@@ -179,7 +180,8 @@
 <p>Nothing, unless the links still open in Chrome. Android re-checks ownership when the app updates, so the next sm app update picks it up. To pick it up sooner: Settings → Apps → sm → Open by default, switch "Open supported links" off and on. The same screen's "Add link" works today as a manual stopgap.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>This is the first revision.</p>
+<p><b>Is the public exception exact now?</b> Yes. Revision 1 relied on sm-server alone for paths beneath the file. Cloudflare's rule covers those paths too, so a second Cloudflare rule now puts them back behind login. The probes accept nothing but the login redirect for them.</p>
+<p><b>Does the file grant anything besides opening links?</b> Android also uses this association for passkeys. sm has none, so nothing changes today. It is the reason to revisit the signing key if sm ever adds passkey login on this host.</p>
 
 <hr class="appendix-divider">
 <h2>Appendices</h2>
@@ -202,20 +204,22 @@ Fingerprints are accepted as 64 hex digits, with or without colons, and served a
 <p>The change uses account <code>cloudflare_access.account_id</code> and token <code>cloudflare_access.api_token</code> from the live config. The existing login application (<code>cloudflare_access.browser.app_id</code>) is not modified.</p>
 <ol>
 <li>Create a reusable policy: <code>POST /accounts/{account}/access/policies</code> with <code>{"name":"sm assetlinks: public (Android App Links)","decision":"bypass","include":[{"everyone":{}}]}</code>. Record the returned id.</li>
-<li>Create the application: <code>POST /accounts/{account}/access/apps</code> with <code>{"name":"sm assetlinks (public)","type":"self_hosted","domain":"sm.rajeshgo.li/.well-known/assetlinks.json","policies":[{"id":"&lt;policy id&gt;","precedence":1}]}</code>. Cloudflare applies the more specific application to that path. Record the application id on ticket #2594.</li>
+<li>Create the public application: <code>POST /accounts/{account}/access/apps</code> with <code>{"name":"sm assetlinks (public)","type":"self_hosted","domain":"sm.rajeshgo.li/.well-known/assetlinks.json","policies":[{"id":"&lt;policy id&gt;","precedence":1}]}</code>. Cloudflare applies the most specific application to a path, and a path application also covers the paths beneath it.</li>
+<li>Close the paths beneath it: <code>GET /accounts/{account}/access/apps/{browser app id}</code>. Then create <code>{"name":"sm assetlinks (below: login)","type":"self_hosted","domain":"sm.rajeshgo.li/.well-known/assetlinks.json/*"}</code>, with <code>policies</code> set to the browser application's policy ids in the same order (<code>[{"id":…,"precedence":n}]</code>). A wildcard path does not cover its parent, so the exact file stays public. If any browser-application policy has no reusable id, stop and report rather than inventing a policy. This application does not receive later device-policy changes (<code>mobile_devices.rs</code> updates only the browser application). It guards only paths sm-server answers with "not found", so being stricter there is harmless.</li>
+<li>Record both application ids and the Bypass policy id on ticket #2594.</li>
 <li>Probes, run from a machine with no Cloudflare login cookie (<code>curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n'</code>):
 <table>
 <thead><tr><th>URL on https://sm.rajeshgo.li</th><th>Required result</th></tr></thead>
 <tbody>
 <tr><td><code>/.well-known/assetlinks.json</code></td><td><code>200</code>, JSON body naming <code>li.rajeshgo.sm</code></td></tr>
-<tr><td><code>/.well-known/assetlinks.json/</code>, <code>/.well-known/assetlinks.json/x</code></td><td><code>302</code> to the Cloudflare login, or <code>404</code> from sm-server</td></tr>
-<tr><td><code>/.well-known/assetlinks.json/../../health</code> (sent with <code>--path-as-is</code>), <code>/.well-known/assetlinks.json/%2e%2e/%2e%2e/health</code></td><td><code>302</code> to login, or <code>404</code></td></tr>
+<tr><td><code>/.well-known/assetlinks.json/</code>, <code>/.well-known/assetlinks.json/x</code>, <code>/.well-known/assetlinks.json/x/y</code></td><td><code>302</code> to the Cloudflare login</td></tr>
+<tr><td><code>/.well-known/assetlinks.json/../../health</code> (sent with <code>--path-as-is</code>), <code>/.well-known/assetlinks.json/%2e%2e/%2e%2e/health</code>, <code>/.well-known/assetlinks.json%2fx</code>, <code>/.well-known/assetlinks.json;x</code>, <code>/.well-known/assetlinks.json?x=1</code></td><td><code>302</code> to login, except a query-only variant of the exact path (<code>?x=1</code>), which may return the same <code>200</code> file</td></tr>
 <tr><td><code>/.well-known/assetlinks.jsonx</code>, <code>/.well-known/</code>, <code>/health</code>, <code>/docs/x</code>, <code>/</code></td><td><code>302</code> to login</td></tr>
 </tbody>
 </table>
-A <code>404</code> from sm-server is acceptable, because sm-server's own exact match holds. A <code>200</code> on any row except the first is a failure: roll back.</li>
+Any other answer on a neighbouring row, including <code>404</code> from sm-server, means a request reached the origin without login, so the Cloudflare guard failed: roll back both applications, then report.</li>
 <li>Google's own check: <code>https://digitalassetlinks.googleapis.com/v1/statements:list?source.web.site=https://sm.rajeshgo.li&amp;relation=delegate_permission/common.handle_all_urls</code> lists the statement.</li>
-<li>Rollback: <code>DELETE /accounts/{account}/access/apps/{app id}</code>, then <code>DELETE /accounts/{account}/access/policies/{policy id}</code>.</li>
+<li>Rollback: <code>DELETE /accounts/{account}/access/apps/{public app id}</code> first (that alone restores login on the file), then the "below" application, then <code>DELETE /accounts/{account}/access/policies/{bypass policy id}</code>.</li>
 </ol>
 
 <h3>C. Android side</h3>
