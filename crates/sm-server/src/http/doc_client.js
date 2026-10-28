@@ -27,8 +27,12 @@
     // The newest review submission sm is still posting, or one that
     // failed (sm#2554): head's review_submission.
     sub: null,
-    sentUntil: 0
+    sentUntil: 0,
+    // The web app's document bar reads the unseen count and calls Read
+    // (showChangedThreads) here (2543 F.9).
+    repliesUnseen: 0
   };
+  S.showChangedThreads = showChangedThreads;
   var coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
   var BLOCK = '[data-sm-line]';
   var INTERACTIVE = 'a,button,input,select,textarea,label,summary,video,audio,[contenteditable],[onclick],[role=button]';
@@ -419,7 +423,10 @@
       lines.push(parts);
     });
     var changed = MSG ? [] : S.changedThreads;
-    if (changed.length && store(repliesSeenKey()) !== '1') {
+    var unseen = changed.length && store(repliesSeenKey()) !== '1' ? changed.length : 0;
+    noteReplies(unseen);
+    // Inside the web app the document bar carries this note (2543 F.9).
+    if (unseen && !framed) {
       lines.push([el('span', { text: 'The agent replied to ' + changed.length + ' comment' + (changed.length === 1 ? '' : 's') + ' on passages it has since changed.' }),
         el('button', { class: 'lk', text: 'Read', onclick: showChangedThreads })]);
     }
@@ -594,6 +601,13 @@
       return !block;
     });
     renderBanner();
+  }
+  function noteReplies(count) {
+    if (S.repliesUnseen === count) return;
+    S.repliesUnseen = count;
+    if (framed) {
+      try { window.parent.postMessage({ type: 'sm-doc-replies', count: count }, location.origin); } catch (_) { /* parent gone */ }
+    }
   }
   function showChangedThreads() {
     clear(sheet);

@@ -90,7 +90,12 @@ test('work threads, reply targets, Archive and the fold at desktop and phone wid
       await page.screenshot({ path:`${screenshots}/${width}-${theme}-thread.png`, fullPage:true });
 
       await page.locator('.thread-doc-card').last().getByRole('button', { name:'Review' }).click();
+      // Documents open full width at /read/… (2543 F.4); Back returns to the thread.
+      await page.waitForURL(/\/read\/docs\/owner\/repo\/memo/);
       await page.frameLocator('.doc-reader iframe').getByText('Review sheet opened').waitFor();
+      assert.equal(await page.locator('.panel .doc-reader, .inbox-reader .doc-reader').count(), 0);
+      await page.getByRole('button', { name:'Back', exact:true }).click();
+      await page.locator('.thread-doc-card').last().waitFor();
 
       await page.getByRole('button', { name:'← Inbox' }).click();
       await page.locator('.inbox-fold-toggle').click();

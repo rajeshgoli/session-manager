@@ -1492,6 +1492,8 @@ async fn view_doc_response(
     let config = json!({
         "docId": doc.id,
         "authorAgent": doc.author_session_name.as_deref().unwrap_or(&doc.author_session_id),
+        // The web document bar's author chip opens this session (2543 C).
+        "authorSessionId": doc.author_session_id,
         "agent": doc_agent(state,doc),
         "mergeHold": doc_hold(state,doc)?,
         "docState": summary.as_ref().map(|summary| summary.state),

@@ -1,6 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { html, api, inboxWrite, bus, usePoll, openPanel, closePanel, registerPanel, navigate, Seg, toast, typingIn, Links, age, stored, store } from './ui.js';
-import { Reader, readerPath } from './reader.js';
+import { html, api, inboxWrite, bus, usePoll, openPanel, closePanel, registerPanel, navigate, Seg, toast, typingIn, Links, age, stored, store, readerPath, openReader } from './ui.js';
 export function safeThreadHtml(source) {
   const doc = new DOMParser().parseFromString(source, 'text/html');
   const tags = new Set('DIV SPAN P H1 H2 H3 H4 H5 H6 BLOCKQUOTE PRE CODE STRONG EM DEL UL OL LI TABLE THEAD TBODY TR TH TD A BR HR IMG SUP SUB INPUT'.split(' '));
@@ -113,15 +112,14 @@ export function InboxPage({ openRef }) {
       if (e.key === 'y' && !e.metaKey && !e.ctrlKey && !e.altKey && !typingIn(e) && selected) { e.preventDefault(); archive(); }
     };
     document.addEventListener('keydown', key);
-    const off = bus.on('inbox-done', done);
-    return () => { document.removeEventListener('keydown', key); off(); };
+    return () => document.removeEventListener('keydown', key);
   }, [selected, busy, data, filter, foldOpen]);
   // Reading the newest revision is what a doc row is for, so it is one click;
   // in the Docs list the row itself opens it (sm#2249).
-  const readLatest = item => openPanel(`doc:${readerPath(item.doc_url)}`);
+  const readLatest = item => openReader(readerPath(item.doc_url));
   const latest = item => item.doc_url && readerPath(item.doc_url);
   const row = item => html`<div class=${`inbox-entry ${item.group === 'earlier' || item.group === 'folded' || item.done ? 'read' : ''}`} key=${item.thread_key}>
-    <button class=${`inbox-row ${rowRef(item) === openRef || (latest(item) && openRef === `doc:${latest(item)}`) ? 'selected' : ''}`}
+    <button class=${`inbox-row ${rowRef(item) === openRef ? 'selected' : ''}`}
       onClick=${() => item.kind === 'board' ? navigate(item.url) : filter === 'docs' && latest(item) ? readLatest(item) : openPanel(rowRef(item))}>
       <span class="inbox-row-head"><strong>${item.title}</strong><time datetime=${item.newest_at} title=${new Date(item.newest_at).toLocaleString()}>${rowAge(item.newest_at)}</time></span>
       <span class="inbox-row-preview">${item.preview}</span>
@@ -135,7 +133,7 @@ export function InboxPage({ openRef }) {
   </div>`;
   const folded = (data?.rows || []).filter(item => item.group === 'folded');
   const foldNames = folded.slice(0, 3).map(item => item.title).join(', ');
-  const inline = openRef?.startsWith('doc:') || openRef?.startsWith('thread:') || !!workKey;
+  const inline = openRef?.startsWith('thread:') || !!workKey;
   return html`<div class=${`inbox-layout ${inline ? 'reading' : ''}`}>
     <section class="inbox-list" aria-label="Inbox threads">
       <div class="inbox-filters"><${Seg} label="Inbox filter" value=${filter} onChange=${setFilter}
@@ -163,8 +161,7 @@ export function InboxPage({ openRef }) {
               <button class="btn sm danger" disabled=${busy} onClick=${retire}>Retire</button>
               <button class="btn sm" onClick=${() => setRetiring(false)}>Cancel</button></span>`
           : html`<button class="btn sm" onClick=${() => setRetiring(true)}>Retire…</button>` : null}</div>
-      ${openRef?.startsWith('doc:') ? html`<${Reader} key=${openRef} id=${openRef.slice(4)} />`
-        : html`<${Thread} key=${openRef} id=${threadId} workKey=${workKey} agent=${agent} />`}
+      <${Thread} key=${openRef} id=${threadId} workKey=${workKey} agent=${agent} />
     </section>` : null}
   </div>`;
 }
@@ -226,7 +223,7 @@ export function Thread({ id, workKey, controls, agent, embedded = false, empty =
     const link = e.target.closest('a');
     if (link) {
       const url = new URL(link.href);
-      if (url.origin === location.origin && url.pathname.startsWith('/docs/')) { e.preventDefault(); openPanel(`doc:${url.pathname}${url.search}`); }
+      if (url.origin === location.origin && url.pathname.startsWith('/docs/')) { e.preventDefault(); openReader(`${url.pathname}${url.search}${url.hash}`); }
       const match = url.href.match(/^https:\/\/github.com\/([^/]+\/[^/]+)\/(?:issues|pull)\/(\d+)/);
       if (match) { e.preventDefault(); openPanel(`ticket:${match[1]}#${match[2]}`); }
       return;
@@ -264,8 +261,8 @@ export function Thread({ id, workKey, controls, agent, embedded = false, empty =
       jobs=${agent.jobs || []} /></div>` : null}
     ${newest ? html`<div class="thread-latest"><span><strong>${newest.doc.title}</strong>
         <small>Revision ${revisions} · ${reviewOpen ? 'review requested' : 'published'} ${rowAge(newest.item.at)} ago</small></span>
-        <button class="btn pri" onClick=${() => openPanel(`doc:${newest.doc.path}`)}>Read latest</button>
-        ${reviewOpen ? html`<button class="btn" onClick=${() => openPanel(`doc:${newest.doc.path}#sm-review`)}>Review</button>` : null}</div>` : null}
+        <button class="btn pri" onClick=${() => openReader(newest.doc.path)}>Read latest</button>
+        ${reviewOpen ? html`<button class="btn" onClick=${() => openReader(`${newest.doc.path}#sm-review`)}>Review</button>` : null}</div>` : null}
     ${error ? html`<p role="alert">${error.message}</p>` : null}
     <div class="thread-items" ref=${items} onClick=${quote}>${(data?.items || []).map((item,i) => {
       if (item.type === 'doc_revision') {
@@ -274,7 +271,7 @@ export function Thread({ id, workKey, controls, agent, embedded = false, empty =
           <span class="thread-sender">${item.sender?.name || 'Document'} · ${new Date(item.at).toLocaleString()}</span>
           <strong>${doc?.title || 'Document revision'}</strong>
           <small>${item.pr ? `PR #${item.pr} · ` : ''}${item.sha?.slice(0, 7) || ''} · ${item.review_state === 'requested' ? 'Review requested' : 'Published'}</small>
-          ${doc?.path ? html`<span class="thread-doc-actions"><button class="btn sm" onClick=${() => openPanel(`doc:${doc.path}`)}>Open</button><button class="btn sm" onClick=${() => openPanel(`doc:${doc.path}#sm-review`)}>Review</button></span>` : null}
+          ${doc?.path ? html`<span class="thread-doc-actions"><button class="btn sm" onClick=${() => openReader(doc.path)}>Open</button><button class="btn sm" onClick=${() => openReader(`${doc.path}#sm-review`)}>Review</button></span>` : null}
         </div>`;
       }
       const sender = item.sender?.name && !/class="[^"]*\bme\b/.test(item.html);

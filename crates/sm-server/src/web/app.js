@@ -6,7 +6,7 @@ import { render } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   html, api, bus, build, network, clientNav, screenFor, pageData, usePoll, useShared, setShared, shared, stored, store, panels, config,
-  openPanel, closePanel, navigate, openItem, toast, typingIn, Icon, basename,
+  openPanel, closePanel, navigate, openItem, openReader, toast, typingIn, Icon, basename,
 } from './ui.js';
 import { BoardPage } from './board.js';
 import { InboxPage } from './inbox.js';
@@ -20,6 +20,7 @@ import { AnalyticsPage } from './analytics.js';
 import { SettingsPage } from './settings.js';
 import { TerminalPage, Switcher, switcherGroups, shortFact, stepRow, landingFor, activeTerminal, retiredIds, IDLE_KEY } from './terminal.js';
 import { NotesView } from './notes.js';
+import { Reader, docPathFrom } from './reader.js';
 import { NewAgentPopover } from './start.js';
 import { BugButton } from './bug.js';
 import { HiddenShells, hiddenShells, isShell } from './shell.js';
@@ -46,6 +47,7 @@ const TABS = [HOME, ...['board', 'inbox', 'queue', 'artifacts', 'notes', 'analyt
 
 function pageFor(path) {
   if (path.startsWith('/terminal/')) return 'terminal';
+  if (path.startsWith('/read/')) return 'doc';
   const page = PAGES.find((p) => path === p.path || path.startsWith(`${p.path}/`));
   return page ? page.key : 'home';
 }
@@ -53,6 +55,12 @@ function pageFor(path) {
 function readLocation() {
   const params = new URLSearchParams(location.search);
   const open = params.get('open');
+  // Documents no longer open in the side panel: an older `?open=doc:<path>` link lands on the document view (2543 F.4).
+  if (open?.startsWith('doc:/')) {
+    const path = open.slice('doc:'.length);
+    history.replaceState(history.state, '', `/read${path}${path.includes('#') ? '' : location.hash}`);
+    return { path: location.pathname, open: null };
+  }
   // `/history` opens on agents now; an older link that filters tickets
   // (`repo`, `agent` or a ticket `open`) keeps landing on the tickets tab.
   if (location.pathname === '/history' && (params.has('repo') || params.has('agent') || (open && !open.includes(':')))) {
@@ -97,8 +105,9 @@ const refreshMs = () => Math.max(1, config.refresh_seconds || 3) * 1000;
 
 // ---- sidebar state (2543 B.4, B.8) ---------------------------------------------
 
-/** Fold and arrangement are remembered per view kind; documents join in a later ticket. */
-const viewKind = (page) => (page === 'terminal' ? 'terminal' : 'pages');
+/** Fold is remembered per view kind; a document uses the pages arrangement when its sidebar is open (B.4). */
+const viewKind = (page) => (page === 'terminal' || page === 'doc' ? page : 'pages');
+const arrangeKind = (kind) => (kind === 'doc' ? 'pages' : kind);
 const SIDEBAR_KEY = 'sm-sidebar';
 const ARRANGE_KEY = 'sm-sidebar-arrangement';
 
@@ -255,14 +264,17 @@ function App() {
 
   useEffect(() => {
     const current = PAGES.find((p) => p.key === page);
+    // The document view titles the tab once its document loads (F.7).
+    if (page === 'doc') return;
     document.title = page === 'terminal' ? `${sessions.find((s) => s.id === termId)?.name || termId} · sm` : `sm · ${current ? current.label : 'Agents'}`;
   }, [page, termId, sessions]);
   // The landing reopens the last terminal you had open (D.5).
   useEffect(() => { if (termId) store('sm-term-last', termId); }, [termId]);
 
   const term = page === 'terminal';
-  const panelOpen = !!loc.open && !inBand(loc.open, page) && !(page === 'inbox' && /^(doc|thread|work):/.test(loc.open));
-  const cls = ['app', term && 'term', folded && 'folded', panelOpen && 'with-panel', panelOpen && layout.panel_mode === 'wide' && 'wide']
+  const docPath = page === 'doc' ? docPathFrom(loc.path, location.search) : null;
+  const panelOpen = !!loc.open && !inBand(loc.open, page) && !(page === 'inbox' && /^(thread|work):/.test(loc.open));
+  const cls = ['app', term && 'term', page === 'doc' && 'doc', folded && 'folded', panelOpen && 'with-panel', panelOpen && layout.panel_mode === 'wide' && 'wide']
     .filter(Boolean).join(' ');
   const termName = termId ? (sessions.find((s) => s.id === termId)?.name || termId) : '';
   const newAgent = (at) => creating && creating.at === at
@@ -272,15 +284,16 @@ function App() {
   const barHost = term || page === 'notes';
   const closePalette = () => { setPalette(false); if (term) setTimeout(() => activeTerminal.focus(), 0); };
   return html`<div class=${cls} style=${`--panel-w:${clampWidth(layout.panel_width_rem)}rem`}>
-      <${Sidebar} page=${page} termId=${termId} watch=${watch} folded=${folded} arrangement=${arrangement[kind]}
+      <${Sidebar} page=${page} termId=${termId} watch=${watch} folded=${folded} arrangement=${arrangement[arrangeKind(kind)]}
         setFolded=${(value) => updateSidebar({ [kind]: value ? 'folded' : 'open' })}
-        swap=${() => updateArrangement({ [kind]: arrangement[kind] === 'pages' ? 'agents' : 'pages' })}
+        swap=${() => updateArrangement({ [arrangeKind(kind)]: arrangement[arrangeKind(kind)] === 'pages' ? 'agents' : 'pages' })}
         onSearch=${() => setPalette(true)} onNew=${() => setCreating(creating ? null : { prefill: {}, at: 'sidebar' })} />
       <main class="main">
         ${mountedId ? html`<div key=${mountedId} hidden=${!term} style="display:flex;flex:1;min-height:0;flex-direction:column">
           <${TerminalPage} id=${mountedId} visible=${term} onEnded=${releaseKept} watch=${watch} moon=${html`<${MoonButton} />`} />
         </div>` : null}
-        ${!term ? html`
+        ${page === 'doc' ? html`<${Reader} key=${docPath} id=${docPath + location.hash} watch=${watch} moon=${html`<${MoonButton} />`} />` : null}
+        ${!term && page !== 'doc' ? html`
           <${TopBar} page=${page} offline=${offline} stale=${stale} onSearch=${() => setPalette(true)}
             creating=${creating} setCreating=${setCreating} newAgent=${newAgent('bar')} watch=${watch} />
           <${NightBanner} />
@@ -737,7 +750,7 @@ function Palette({ onClose }) {
         for (const doc of docs.value.docs || []) {
           out.push({
             kind: 'Doc', label: doc.title || doc.name, detail: doc.author_session_name || '',
-            run: () => openItem('doc', doc.reader_path, doc.reader_path),
+            run: () => openReader(doc.reader_path),
           });
         }
       }

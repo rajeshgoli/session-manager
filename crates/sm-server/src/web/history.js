@@ -1,5 +1,5 @@
 import { useState, useRef, useLayoutEffect } from 'preact/hooks';
-import { html, api, usePoll, openPanel, openDoc, registerPanel, Seg, navigate, toast, Links, LinkedText, linkifyHtml, providerLabel, age, basename } from './ui.js';
+import { html, api, usePoll, openPanel, openDoc, openReader, registerPanel, Seg, navigate, toast, Links, LinkedText, linkifyHtml, providerLabel, age, basename } from './ui.js';
 import { safeThreadHtml } from './inbox.js';
 
 export function WorkLinks({ work = {} }) {
@@ -107,7 +107,7 @@ function Ticket({ id, controls }) {
     if (!link) return;
     const url = new URL(link, location.origin);
     if (url.origin === location.origin && url.pathname.startsWith('/docs/')) {
-      event?.preventDefault(); openPanel(`doc:${url.pathname}${url.search}`);
+      event?.preventDefault(); openReader(`${url.pathname}${url.search}${url.hash}`);
     } else {
       const match = url.href.match(/^https:\/\/github.com\/([^/]+\/[^/]+)\/(?:issues|pull)\/(\d+)/);
       if (match) { event?.preventDefault(); openPanel(`ticket:${match[1]}#${match[2]}`); }
