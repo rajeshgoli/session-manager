@@ -23,7 +23,11 @@
     docState: CONFIG.docState,
     // A posted review no agent received (sm#1580): offer Assign.
     undelivered: CONFIG.undeliveredReview || null,
-    assigned: ''
+    assigned: '',
+    // The newest review submission sm is still posting, or one that
+    // failed (sm#2554): head's review_submission.
+    sub: null,
+    sentUntil: 0
   };
   var coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
   var BLOCK = '[data-sm-line]';
@@ -94,6 +98,7 @@
     '.bar .t{min-width:0;flex:0 1 auto;font-weight:600;max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.bar a{color:#93c5fd;text-decoration:none}',
     '.bar select{background:#1f2937;color:#f9fafb;border:1px solid #374151;border-radius:4px;padding:2px 4px;max-width:46vw}',
+    '.bar .ok{color:#86efac}.bar .bad{color:#fca5a5}.bar .note{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.muted{color:#9ca3af}.ro{color:#fbbf24}.sp{flex:1}',
     'button{cursor:pointer;border:0;border-radius:6px;padding:6px 12px;background:#e5e7eb;color:#111827}',
     'button.p{background:#2563eb;color:#fff}button.d{background:#fee2e2;color:#991b1b}button:disabled{opacity:.5;cursor:default}',
@@ -234,6 +239,7 @@
       CONFIG.prUrl ? el('a', { href: CONFIG.prUrl, target: '_blank', rel: 'noopener', text: 'PR #' + CONFIG.prNumber }) : null,
       el('span', { class: st[1] + ' state', text: st[0] + (S.mergeHold ? ' · ⏸' : ''), title: S.mergeHold ? 'merge hold by ' + S.mergeHold.placed_by : '' }),
       MSG ? null : agentChip(),
+      submissionNote(),
       el('span', { class: 'sp' }),
       S.docState === 'review_requested' ? el('button', { text: 'No review needed', onclick: function (e) {
         var b = e.currentTarget; b.disabled = true;
@@ -292,6 +298,67 @@
     if (path.indexOf(agentPanel)<0 && !path.some(function (e) {return e.classList && e.classList.contains('agent');})) agentPanel.hidden=true;
   });
   document.addEventListener('keydown',function (event) {if (event.key==='Escape') agentPanel.hidden=true;});
+
+  // ---- review submission (sm#2554) ------------------------------------
+  // sm answers a submit as soon as it has saved the review, then posts it
+  // to GitHub in the background. The bar says "Review sent", and speaks
+  // again only if posting runs past a minute or fails.
+  function posting(sub) { return !!sub && (sub.status === 'queued' || sub.status === 'submitting'); }
+  function submissionNote() {
+    var sub = S.sub;
+    if (sub && sub.status === 'failed') {
+      var reason = 'Review not posted: ' + (sub.error || 'GitHub refused it');
+      return el('span', { class: 'note' }, [
+        el('span', { class: 'bad', title: reason, text: reason + ' · ' }),
+        el('a', { href: '#', text: 'Submit again', onclick: function (e) { e.preventDefault(); resubmit(sub); } }),
+        ' · ',
+        el('a', { href: '#', text: 'Discard', onclick: function (e) { e.preventDefault(); discardSubmission(sub); } })
+      ]);
+    }
+    if (Date.now() < S.sentUntil) return el('span', { class: 'ok note', text: 'Review sent' });
+    if (posting(sub) && Date.now() - Date.parse(sub.queued_at) > 60000) return el('span', { class: 'muted note', text: 'Posting review…' });
+    return null;
+  }
+  function reviewSent(res) {
+    S.docState = 'reviewed';
+    S.sub = res.status === 'posted' ? null : { submission_id: res.submission_id, status: res.status, queued_at: new Date().toISOString() };
+    if (res.status === 'posted' && res.delivered_to_session_id == null) { S.undelivered = { id: res.submission_id, url: res.github_review_url }; S.assigned = ''; renderBanner(); }
+    S.sentUntil = Date.now() + 4000;
+    setTimeout(renderBar, 4100);
+    renderBar();
+    pollHead();
+  }
+  var subTimer = null;
+  var subSeen = {};
+  function trackSubmission(sub) {
+    var was = S.sub;
+    S.sub = sub || null;
+    if (sub && sub.status === 'posted') {
+      if (S.attempt && S.attempt.id === sub.submission_id) S.attempt = null;
+      if (!subSeen[sub.submission_id] && was && was.submission_id === sub.submission_id && sub.delivered_to_session_id == null) {
+        S.undelivered = { id: sub.submission_id, url: sub.github_review_url }; S.assigned = '';
+      }
+      subSeen[sub.submission_id] = 1;
+    }
+    // A failed review keeps its drafts on the server: show them again.
+    if (sub && sub.status === 'failed' && !subSeen[sub.submission_id]) {
+      subSeen[sub.submission_id] = 1;
+      refreshDrafts().catch(function () {});
+    }
+    clearTimeout(subTimer);
+    if (posting(sub)) subTimer = setTimeout(pollHead, 3000);
+  }
+  function resubmit(sub) {
+    api('POST', '/review', { submission_id: sub.submission_id, sha: sub.commit_sha, verdict: sub.verdict, body: sub.body })
+      .then(reviewSent, function (err) { alertBar(err.message); });
+  }
+  function discardSubmission(sub) {
+    api('DELETE', '/review/' + sub.submission_id).then(function () {
+      S.sub = null;
+      renderBar();
+      return refreshDrafts();
+    }, function (err) { alertBar(err.message); });
+  }
 
   // ---- banners ---------------------------------------------------------
   var discardArmed = {};
@@ -365,6 +432,7 @@
       if (head.revisions) CONFIG.revisions = head.revisions;
       if (head.pr_state === 'open') S.reopenTarget = null;
       S.agent = head.agent || null; S.mergeHold = head.merge_hold || null;
+      trackSubmission(head.review_submission);
       if (!agentPanel.hidden) renderAgentPanel();
       if (head.pr_state) {
         S.prState = head.pr_state;
@@ -780,14 +848,10 @@
         return api('POST', '/review', { submission_id: S.attempt.id, sha: CONFIG.sha, verdict: S.attempt.verdict, body: S.attempt.body, hold: !!S.attempt.hold })
           .then(function (res) {
             S.attempt = null;
-            S.docState = 'reviewed'; pollHead();
-            if (res.delivered_to_session_id == null) { S.undelivered = { id: res.submission_id, url: res.github_review_url }; S.assigned = ''; renderBanner(); }
             S.drafts = S.drafts.filter(function (d) { return d.commit_sha !== CONFIG.sha; });
-            markers(); renderBar();
-            clear(sheet);
-            sheet.appendChild(el('h3', { class: 'ok', text: 'Review posted' }));
-            sheet.appendChild(el('a', { href: res.github_review_url, target: '_blank', rel: 'noopener', text: 'Open it on GitHub' }));
-            sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
+            markers();
+            closeSheet();
+            reviewSent(res);
           });
       }).catch(function (err) {
         // Another device's submission of this revision takes over: resume

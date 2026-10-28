@@ -102,10 +102,11 @@ pub(super) async fn get_handoff_doc(
 mod reopen;
 mod review;
 mod review_replies;
-pub(super) use review::recover_owner_doc_reviews;
 pub(super) use review::review_wake_recipient;
 #[cfg(test)]
 pub(super) use review::review_wake_target;
+pub(super) use review::spawn_owner_doc_review_worker;
+pub use review::ReviewRetryPolicy;
 pub(super) use review_replies::forward_review_replies;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1827,6 +1828,7 @@ async fn doc_head_response(
         "pr_head_blob_differs": false,
         "pr_head_reader_path": null,
         "pr_state": null,
+        "review_submission": review::review_submission_json(state, &doc.id)?,
     });
     match doc_pull_request_async(state, doc, false).await {
         None => {}
@@ -2215,7 +2217,7 @@ pub(super) async fn post_owner_doc_subpath(
     }
     review::submit_owner_doc_review(&state, &doc, parse_json_body(&body)?)
         .await
-        .map(|review| Json(review).into_response())
+        .map(|(status, review)| (status, Json(review)).into_response())
 }
 
 /// `PATCH /docs/{id}/drafts/{draft_id}`: edit a draft's text.
@@ -2245,7 +2247,7 @@ pub(super) async fn patch_owner_doc_subpath(
     Ok(Json(serde_json::to_value(draft)?))
 }
 
-/// `DELETE /docs/{id}/drafts/{draft_id}`.
+/// `DELETE /docs/{id}/drafts/{draft_id}` and `/docs/{id}/review/{submission_id}`.
 pub(super) async fn delete_owner_doc_subpath(
     State(state): State<Arc<AppState>>,
     Path((doc_id, rest)): Path<(String, String)>,
@@ -2256,6 +2258,17 @@ pub(super) async fn delete_owner_doc_subpath(
     if rest == "merge-hold" {
         let doc = find_doc(&state, &doc_id)?;
         return Ok(Json(change_doc_hold(state, &doc, true).await?));
+    }
+    // Discard on a review that failed to post (sm#2554): its drafts stay.
+    if let Some(submission_id) = rest.strip_prefix("review/") {
+        let doc = find_doc(&state, &doc_id)?;
+        let _guard = state.owner_doc_review_lock.lock().await;
+        if !owner_doc_store(&state).discard_review(&doc.id, submission_id)? {
+            return Err(ApiError::NotFound("No failed review with that id"));
+        }
+        return Ok(Json(
+            json!({ "deleted": true, "submission_id": submission_id }),
+        ));
     }
     let draft_id = draft_subroute(&rest)?;
     let doc = find_doc(&state, &doc_id)?;

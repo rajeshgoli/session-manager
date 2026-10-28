@@ -166,7 +166,8 @@ impl OwnerDocVerdict {
 }
 
 /// One `POST /docs/{id}/review` submission, keyed by the client's
-/// `submission_id`. `status` is `submitting`, `posted` or `failed`.
+/// `submission_id`. `status` is `queued` (saved, not yet sent to GitHub),
+/// `submitting`, `posted` or `failed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OwnerDocReview {
     pub id: String,
@@ -186,6 +187,26 @@ pub struct OwnerDocReview {
     /// When GitHub accepted the review; null before that and on rows older
     /// than sm#1606.
     pub posted_at: Option<String>,
+    /// The last GitHub error: the reason a `failed` row stopped, or what a
+    /// row still retrying last hit (sm#2554).
+    pub error: Option<String>,
+    /// When the submission was last queued; null on rows older than sm#2554.
+    pub queued_at: Option<String>,
+    #[serde(skip)]
+    pub schedule: ReviewSchedule,
+}
+
+/// The background worker's bookkeeping for one submission (sm#2554).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewSchedule {
+    /// The merge hold the owner asked for with the review.
+    pub hold: bool,
+    /// Transient failures since the row was last queued.
+    pub attempts: i64,
+    /// Epoch milliseconds before which the worker leaves the row alone.
+    pub next_attempt_ms: Option<i64>,
+    /// Epoch milliseconds when the row was last queued.
+    pub queued_ms: Option<i64>,
 }
 
 /// What a review submission records once GitHub has the review.
@@ -590,6 +611,16 @@ pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
         ("owner_doc_reviews", "target_base", "TEXT"),
         ("owner_doc_reviews", "target_tip", "TEXT"),
         ("owner_doc_reviews", "target_pr", "INTEGER"),
+        ("owner_doc_reviews", "hold", "INTEGER NOT NULL DEFAULT 0"),
+        ("owner_doc_reviews", "error", "TEXT"),
+        ("owner_doc_reviews", "queued_at", "TEXT"),
+        ("owner_doc_reviews", "queued_ms", "INTEGER"),
+        (
+            "owner_doc_reviews",
+            "attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("owner_doc_reviews", "next_attempt_ms", "INTEGER"),
         ("owner_doc_publishes", "pr_number", "INTEGER"),
     ] {
         if !conn
@@ -1558,19 +1589,150 @@ impl OwnerDocStore {
             }))
     }
 
-    /// Rows a crash or restart left mid-submit.
-    pub fn submitting_reviews(&self) -> Result<Vec<OwnerDocReview>> {
+    /// Rows the review worker still owes GitHub: `queued` or `submitting`,
+    /// oldest first. A restart leaves these for the worker to finish.
+    pub fn pending_reviews(&self) -> Result<Vec<OwnerDocReview>> {
         let Some(conn) = self.open_read()? else {
             return Ok(Vec::new());
         };
         let mut statement = conn.prepare(&format!(
-            "SELECT {REVIEW_COLUMNS} FROM owner_doc_reviews WHERE status = 'submitting'
+            "SELECT {REVIEW_COLUMNS} FROM owner_doc_reviews
+             WHERE status IN ('queued', 'submitting')
              ORDER BY submitted_at, rowid"
         ))?;
         let rows = statement
             .query_map([], review_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Saves a submission as `queued`, before any GitHub or git call
+    /// (sm#2554): the target and blob sha stay empty until the worker
+    /// starts it. Returns the stored row and whether this call inserted it.
+    #[allow(clippy::too_many_arguments)] // The submission's fields, saved together.
+    pub fn queue_review(
+        &self,
+        submission_id: &str,
+        doc_id: &str,
+        commit_sha: &str,
+        verdict: OwnerDocVerdict,
+        body: Option<&str>,
+        hold: bool,
+        now_ms: i64,
+    ) -> Result<(OwnerDocReview, bool)> {
+        let conn = self.open_write()?;
+        let now = now_rfc3339();
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO owner_doc_reviews
+             (id, status, pending_review_node_id, doc_id, commit_sha, blob_sha, verdict, body,
+              line_comment_count, file_comment_count, github_review_id, github_review_url,
+              submitted_at, delivered_to_session_id, hold, queued_at, queued_ms, attempts)
+             VALUES (?1, 'queued', NULL, ?2, ?3, '', ?4, ?5, 0, 0, NULL, NULL, ?6, NULL, ?7, ?6, ?8, 0)",
+            params![
+                submission_id,
+                doc_id,
+                commit_sha,
+                verdict.as_str(),
+                body,
+                now,
+                hold as i64,
+                now_ms,
+            ],
+        )? > 0;
+        let review = get_review_conn(&conn, submission_id)?.context("review row vanished")?;
+        Ok((review, inserted))
+    }
+
+    /// `queued` → `submitting`, with the doc's blob sha and the resolved
+    /// target filled in.
+    pub fn start_review(
+        &self,
+        submission_id: &str,
+        blob_sha: &str,
+        target: Option<&serde_json::Value>,
+    ) -> Result<OwnerDocReview> {
+        let conn = self.open_write()?;
+        conn.execute(
+            "UPDATE owner_doc_reviews
+             SET status = 'submitting', blob_sha = ?2, reopen_target = ?3,
+                 target_base = ?4, target_tip = ?5, target_pr = ?6
+             WHERE id = ?1 AND status = 'queued'",
+            params![
+                submission_id,
+                blob_sha,
+                target.map(serde_json::Value::to_string),
+                target.and_then(|t| t["base"].as_str()),
+                target.and_then(|t| t["tip_sha"].as_str()),
+                target.and_then(|t| t["target_pr"].as_i64()),
+            ],
+        )?;
+        get_review_conn(&conn, submission_id)?.context("review row vanished")
+    }
+
+    /// A transient failure: the row waits until `next_attempt_ms` and keeps
+    /// `error`.
+    pub fn defer_review(
+        &self,
+        submission_id: &str,
+        error: &str,
+        attempts: i64,
+        next_attempt_ms: i64,
+        queued_ms: i64,
+    ) -> Result<()> {
+        // A row left `submitting` from before sm#2554 has no queued time:
+        // its retry hour starts now.
+        self.open_write()?.execute(
+            "UPDATE owner_doc_reviews
+             SET error = ?2, attempts = ?3, next_attempt_ms = ?4,
+                 queued_ms = COALESCE(queued_ms, ?5)
+             WHERE id = ?1 AND status IN ('queued', 'submitting')",
+            params![submission_id, error, attempts, next_attempt_ms, queued_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Ends a submission the worker gave up on, keeping its drafts.
+    pub fn give_up_review(&self, submission_id: &str, error: &str) -> Result<()> {
+        self.open_write()?.execute(
+            "UPDATE owner_doc_reviews
+             SET status = 'failed', pending_review_node_id = NULL, error = ?2,
+                 next_attempt_ms = NULL
+             WHERE id = ?1 AND status IN ('queued', 'submitting')",
+            params![submission_id, error],
+        )?;
+        Ok(())
+    }
+
+    /// Submit again on a `failed` row: queued afresh with its verdict and
+    /// text. A row that never reached GitHub starts from `queued`; one that
+    /// did is reconciled from `submitting`. Other states are returned
+    /// unchanged, and so is a failed row once a newer submission of its doc
+    /// and revision exists: that one (another device's) owns the drafts
+    /// now, and reviving this row would post a second, empty review.
+    pub fn requeue_review(&self, submission_id: &str, now_ms: i64) -> Result<OwnerDocReview> {
+        let conn = self.open_write()?;
+        conn.execute(
+            "UPDATE owner_doc_reviews
+             SET status = CASE blob_sha WHEN '' THEN 'queued' ELSE 'submitting' END,
+                 error = NULL, attempts = 0, next_attempt_ms = NULL,
+                 queued_at = ?2, queued_ms = ?3
+             WHERE id = ?1 AND status = 'failed'
+               AND NOT EXISTS (
+                 SELECT 1 FROM owner_doc_reviews AS newer
+                 WHERE newer.doc_id = owner_doc_reviews.doc_id
+                   AND newer.commit_sha = owner_doc_reviews.commit_sha
+                   AND newer.rowid > owner_doc_reviews.rowid)",
+            params![submission_id, now_rfc3339(), now_ms],
+        )?;
+        get_review_conn(&conn, submission_id)?.context("review row vanished")
+    }
+
+    /// Discard on a failed submission: the row goes, its drafts stay.
+    pub fn discard_review(&self, doc_id: &str, submission_id: &str) -> Result<bool> {
+        Ok(self.open_write()?.execute(
+            "DELETE FROM owner_doc_reviews WHERE id = ?1 AND doc_id = ?2 AND status = 'failed'",
+            params![submission_id, doc_id],
+        )? > 0)
     }
 
     /// Records a submission as `submitting` before any GitHub call. Returns
@@ -1669,7 +1831,7 @@ impl OwnerDocStore {
         Ok(())
     }
 
-    /// The revision's latest unfinished (`submitting`) submission. While it
+    /// The revision's latest unfinished (`queued` or `submitting`) submission. While it
     /// exists its drafts are frozen and new submissions resume it.
     pub fn unfinished_review(
         &self,
@@ -1683,33 +1845,14 @@ impl OwnerDocStore {
             .query_row(
                 &format!(
                     "SELECT {REVIEW_COLUMNS} FROM owner_doc_reviews
-                     WHERE doc_id = ?1 AND commit_sha = ?2 AND status = 'submitting'
+                     WHERE doc_id = ?1 AND commit_sha = ?2
+                       AND status IN ('queued', 'submitting')
                      ORDER BY submitted_at DESC, rowid DESC LIMIT 1"
                 ),
                 params![doc_id, commit_sha],
                 review_from_row,
             )
             .optional()?)
-    }
-
-    /// A retry of a `failed` submission: back to `submitting`, to be
-    /// reconciled against GitHub. Other states are returned unchanged, and
-    /// so is a failed row once a newer submission of its doc and revision
-    /// exists: that one (another device's) owns the drafts now, and reviving
-    /// this row would post a second, empty review.
-    pub fn reopen_review(&self, submission_id: &str) -> Result<OwnerDocReview> {
-        let conn = self.open_write()?;
-        conn.execute(
-            "UPDATE owner_doc_reviews SET status = 'submitting'
-             WHERE id = ?1 AND status = 'failed'
-               AND NOT EXISTS (
-                 SELECT 1 FROM owner_doc_reviews AS newer
-                 WHERE newer.doc_id = owner_doc_reviews.doc_id
-                   AND newer.commit_sha = owner_doc_reviews.commit_sha
-                   AND newer.rowid > owner_doc_reviews.rowid)",
-            params![submission_id],
-        )?;
-        get_review_conn(&conn, submission_id)?.context("review row vanished")
     }
 
     /// `submitting` → `failed`; the drafts stay for a retry.
@@ -1738,7 +1881,7 @@ impl OwnerDocStore {
              SET status = 'posted', pending_review_node_id = NULL,
                  line_comment_count = ?2, file_comment_count = ?3,
                  github_review_id = ?4, github_review_url = ?5,
-                 delivered_to_session_id = ?6, posted_at = ?7
+                 delivered_to_session_id = ?6, posted_at = ?7, error = NULL, next_attempt_ms = NULL
              WHERE id = ?1 AND status = 'submitting'",
             params![
                 submission_id,
@@ -1876,7 +2019,8 @@ impl OwnerDocStore {
 
 const REVIEW_COLUMNS: &str = "id, status, pending_review_node_id, doc_id, commit_sha, blob_sha, \
      verdict, body, line_comment_count, file_comment_count, github_review_id, github_review_url, \
-     submitted_at, delivered_to_session_id, posted_at";
+     submitted_at, delivered_to_session_id, posted_at, error, queued_at, hold, attempts, \
+     next_attempt_ms, queued_ms";
 const DRAFT_COLUMNS: &str = "id, doc_id, commit_sha, line, quote, body, created_at, updated_at";
 
 fn review_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerDocReview> {
@@ -1896,6 +2040,14 @@ fn review_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerDocReview> {
         submitted_at: row.get(12)?,
         delivered_to_session_id: row.get(13)?,
         posted_at: row.get(14)?,
+        error: row.get(15)?,
+        queued_at: row.get(16)?,
+        schedule: ReviewSchedule {
+            hold: row.get::<_, i64>(17)? != 0,
+            attempts: row.get(18)?,
+            next_attempt_ms: row.get(19)?,
+            queued_ms: row.get(20)?,
+        },
     })
 }
 
@@ -2817,7 +2969,7 @@ mod tests {
             )
             .unwrap();
         assert!(!inserted);
-        assert_eq!(store.submitting_reviews().unwrap().len(), 1);
+        assert_eq!(store.pending_reviews().unwrap().len(), 1);
 
         let posted = PostedOwnerDocReview {
             github_review_id: Some(99),
