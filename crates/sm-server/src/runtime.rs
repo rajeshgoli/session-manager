@@ -1253,9 +1253,12 @@ impl TmuxRuntime {
         let _ = self.run_tmux(["set-option", "-g", "status", "off"]);
         // Claude Code and Codex label links with OSC 8; tmux forwards those only to
         // clients whose terminal has the hyperlinks feature, and the web terminal does (#2592).
+        // Only our own wildcard entry covers the web terminal; another terminal's
+        // hyperlinks entry does not.
         if !self
             .server_option("terminal-features")
-            .contains("hyperlinks")
+            .lines()
+            .any(|entry| entry.trim() == "*:hyperlinks")
         {
             let _ = self.run_tmux(["set-option", "-as", "terminal-features", ",*:hyperlinks"]);
         }
