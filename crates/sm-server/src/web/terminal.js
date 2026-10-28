@@ -1,6 +1,6 @@
 // Terminal page (spec 1710; 1782 G1-G4; 2543 C, E.1): session rows, phone keys, route and round-trip time.
 // It renders inside the app frame; the app's sidebar lists the sessions and its side panel holds Details.
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { html, api, openPanel, navigate, openItem, Icon, Ring, stored, toast, age, basename } from './ui.js';
 import { AgentMenus, RetireButton, openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
 import { BugButton } from './bug.js';
@@ -160,9 +160,12 @@ export function Switcher({ groups, currentId, idleOpen, toggleIdle, pick, reload
 // ---- page --------------------------------------------------------------------
 
 /** `watch` is the app's poll of GET /watch/state: `[doc, error, reload]`. `moon` is the app's overnight button. */
-export function TerminalPage({ id, watch, moon }) {
+export function TerminalPage({ id, watch, moon, visible = true, onEnded }) {
   const host = useRef(null);
   const control = useRef(null);
+  const shown = useRef(visible);
+  shown.current = visible;
+  useLayoutEffect(() => { control.current?.visibility(); }, [visible]);
   const [transportConnection, setConnection] = useState('Connecting');
   const [transportError, setError] = useState('');
   const [attempt, setAttempt] = useState(0);
@@ -185,6 +188,9 @@ export function TerminalPage({ id, watch, moon }) {
   const error = lookupFailed ? 'Could not load session information. Retry to check whether this terminal is still available.'
     : unavailable ? 'This terminal has ended or could not be found. The session may have stopped or been retired. Choose another session in the sidebar.'
     : transportError;
+  useEffect(() => {
+    if (!visible && connection === 'Ended') onEnded?.(id);
+  }, [visible, connection, id, onEnded]);
   // The sidebar's order, for Retire's next row.
   const { order } = switcherGroups((doc && doc.sessions) || [], id, stored(IDLE_KEY, false));
   const hidden = hiddenShells(doc?.sessions);
@@ -250,7 +256,11 @@ export function TerminalPage({ id, watch, moon }) {
     const stopDirect = () => { clearTimeout(directTimer); directTimer = null; };
     const pings = new Map();
     const send = (frame) => {
-      if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(frame));
+      if (!shown.current && ['resize', 'input', 'key'].includes(frame.type)) return;
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(frame));
+        if (frame.type === 'resize') sentSize = `${frame.cols}x${frame.rows}`;
+      }
     };
     // Dragging a window edge fires dozens of sizes a second, and each one makes the agent
     // redraw. Claude's renderer rewrites only the cells it thinks changed, so a redraw cut
@@ -259,6 +269,7 @@ export function TerminalPage({ id, watch, moon }) {
     let resizeTimer = null, nudgeTimer = null, sentSize = '';
     const fitNow = () => {
       clearTimeout(resizeTimer);
+      if (!shown.current) return false;
       const size = fit.proposeDimensions();
       if (!size || !Number.isFinite(size.cols) || !Number.isFinite(size.rows)) return false;
       // At least 11 columns, so the nudge stays within the bridge's 10-column floor.
@@ -271,12 +282,13 @@ export function TerminalPage({ id, watch, moon }) {
     };
     const redraw = () => {
       clearTimeout(nudgeTimer);
-      if (!live) return;
+      if (!live || !shown.current) return;
       send({ type: 'resize', cols: terminal.cols - 1, rows: terminal.rows });
       nudgeTimer = setTimeout(() => send({ type: 'resize', cols: terminal.cols, rows: terminal.rows }), REDRAW_NUDGE_MS);
     };
     const resize = () => {
       clearTimeout(resizeTimer);
+      if (!shown.current) return;
       resizeTimer = setTimeout(() => {
         if (fitNow() && live) { clearTimeout(nudgeTimer); nudgeTimer = setTimeout(redraw, REDRAW_SETTLE_MS); }
       }, RESIZE_SETTLE_MS);
@@ -287,12 +299,18 @@ export function TerminalPage({ id, watch, moon }) {
       const chars = Array.from(data);
       for (let i = 0; i < chars.length; i += 4096) send({ type: 'input', data: chars.slice(i, i + 4096).join('') });
     };
+    const focus = () => { if (shown.current) terminal.focus(); };
     control.current = {
-      key: (key) => { if (live) send({ type: 'key', key }); terminal.focus(); },
-      paste: (text) => { if (!live) return false; input(`\x1b[200~${text}\x1b[201~`); terminal.focus(); return true; },
-      model: () => { input('\x1b[200~/model\x1b[201~\r'); terminal.focus(); },
-      focus: () => terminal.focus(),
-      redraw: () => { redraw(); terminal.focus(); },
+      visibility: () => {
+        clearTimeout(resizeTimer); clearTimeout(nudgeTimer);
+        if (shown.current) { fitNow(); focus(); }
+        else terminal.blur();
+      },
+      key: (key) => { if (live) send({ type: 'key', key }); focus(); },
+      paste: (text) => { if (!live || !shown.current) return false; input(`\x1b[200~${text}\x1b[201~`); focus(); return true; },
+      model: () => { input('\x1b[200~/model\x1b[201~\r'); focus(); },
+      focus,
+      redraw: () => { redraw(); focus(); },
     };
     Object.assign(activeTerminal, { id, paste: (text) => !!control.current?.paste(text), focus: () => control.current?.focus() });
     const mouse = installPageMouse(terminal, host.current, input, async (text) => {
@@ -399,7 +417,7 @@ export function TerminalPage({ id, watch, moon }) {
           try { frame = JSON.parse(event.data); } catch { return; }
           if (frame.type === 'status' && frame.state === 'attached') {
             clearTimeout(handshakeTimer);
-            attached = true; live = true; retries = 0; setConnection('Live'); terminal.focus();
+            attached = true; live = true; retries = 0; setConnection('Live'); focus();
             stopPing(); ping(); pinger = setInterval(ping, PING_MS);
             switching = false;
             if (chosen.direct) markDirect(session(), Date.now());
@@ -442,6 +460,7 @@ export function TerminalPage({ id, watch, moon }) {
     };
     const data = terminal.onData(input);
     terminal.attachCustomKeyEventHandler((event) => {
+      if (!shown.current) return false;
       if (event.metaKey && event.key === '[') {
         if (event.type === 'keydown') { event.preventDefault(); back(); }
         return false;
