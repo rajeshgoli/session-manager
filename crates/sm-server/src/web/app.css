@@ -89,7 +89,6 @@ code, .mono { font-family: var(--mono); font-size: .9rem; }
 .sb-head b.magenta { color: var(--magenta); font-weight: 650; font-variant-numeric: tabular-nums; }
 .sb-head .sp { flex: 1; }
 .sb-head .sb-new { font-size: 1.067rem; line-height: 1; padding: 2px 7px; }
-.sb-head .pop { left: auto; }
 /* Only the session list scrolls. */
 .sb-agents { flex: 1; min-height: 0; overflow-y: auto; margin: 0 -7px; scrollbar-width: thin; }
 .sb-agents .term-switch { padding-top: 0; }
@@ -116,7 +115,12 @@ code, .mono { font-family: var(--mono); font-size: .9rem; }
 .home-empty p { margin: 0; font-size: 1.067rem; }
 .home-list { padding: 0; }
 .new-agent-host { position: fixed; top: 40px; right: 12px; z-index: 40; }
-.new-agent-host .pop { right: 0; left: auto; top: 6px !important; }
+.new-agent-host .pop { right: 0; left: auto; top: 6px !important; max-height: calc(100vh - 56px); max-height: calc(100dvh - 56px); overflow-y: auto; }
+/* The sidebar clips its overflow, so its + opens the sheet here, beside the sidebar. */
+.new-agent-host.side { right: auto; left: calc(var(--rail-w) + 8px); top: 40px; }
+.new-agent-host.side .pop { left: 0; right: auto; }
+/* A widened panel covers the terminal, its bar included (the bar stacks at 32). */
+.app.term.wide > .panel { z-index: 33; }
 .dash { display: flex; flex-direction: column; gap: 7px; padding: 8px 7px 10px; margin: 0 -7px 4px; border-top: 1px solid var(--line); font-size: .8rem; font-variant-numeric: tabular-nums; }
 .dash .dh { color: var(--ink-3); font-size: .733rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0 -3px; text-decoration: none; }
 .dash a.dh:hover { color: var(--ink-2); }

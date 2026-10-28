@@ -172,11 +172,15 @@ test('sidebar on every page (2543 B, D): pages first, agents first, hover card, 
           assert.deepEqual(state.answered, ['sm-1726-engineer']);
           // + opens the New session sheet in the sidebar.
           await page.locator('.sb-head').getByRole('button', { name: 'New agent' }).click();
-          await page.locator('.sb-head .pop').getByRole('button', { name: 'Start' }).waitFor();
+          const start = page.locator('.new-agent-host.side .pop').getByRole('button', { name: 'Start' });
+          await start.waitFor();
+          // Not clipped by the sidebar and reachable in the window: the button is what sits under its own centre.
+          await start.scrollIntoViewIfNeeded();
+          assert.ok(await start.evaluate((b) => { const r = b.getBoundingClientRect(); return document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2) === b; }));
           // The fixed test clock slows effect flushes; give the sheet's listeners a moment to attach.
           await page.waitForTimeout(300);
           await page.mouse.click(900, 600);
-          await page.locator('.sb-head .pop').waitFor({ state: 'detached' });
+          await page.locator('.new-agent-host .pop').waitFor({ state: 'detached' });
           // ⌘K searches from any page.
           await page.keyboard.press('Meta+k');
           await page.locator('.palette').waitFor();

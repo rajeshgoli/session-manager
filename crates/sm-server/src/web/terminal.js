@@ -25,6 +25,9 @@ const RESIZE_SETTLE_MS = 150;
 // ...and once the agent has redrawn at that size, a one-column nudge makes it repaint every cell.
 const REDRAW_SETTLE_MS = 400;
 const REDRAW_NUDGE_MS = 120;
+/** Sessions retired from this page, which an older poll may still list as live. */
+export const retiredIds = new Set();
+
 /** The open terminal, for the app's Notes pane ("Type into terminal") and focus after the palette closes. */
 export const activeTerminal = { id: null, paste: () => false, focus: () => {} };
 // Terminal links open in a new tab; web URLs only.
@@ -194,7 +197,9 @@ export function TerminalPage({ id, watch, moon }) {
   // A retired agent's terminal has nothing left to show, so move on to the next agent,
   // or to `/` when none is left (going back could land on one retired earlier).
   const retired = (done) => {
-    if (!done) { reload(); return; }
+    if (!done) { retiredIds.delete(id); reload(); return; }
+    retiredIds.add(id);
+    reload();
     const next = rowAfterRetire(order, id);
     navigate(next ? `/terminal/${encodeURIComponent(next.id)}` : '/');
   };

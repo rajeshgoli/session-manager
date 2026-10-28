@@ -17,7 +17,7 @@ import { QueuePage } from './queue.js';
 import { ArtifactsPage } from './artifacts.js';
 import { AnalyticsPage } from './analytics.js';
 import { SettingsPage } from './settings.js';
-import { TerminalPage, Switcher, switcherGroups, shortFact, stepRow, landingFor, activeTerminal, IDLE_KEY } from './terminal.js';
+import { TerminalPage, Switcher, switcherGroups, shortFact, stepRow, landingFor, activeTerminal, retiredIds, IDLE_KEY } from './terminal.js';
 import { NotesView } from './notes.js';
 import { NewAgentPopover } from './start.js';
 import { BugButton } from './bug.js';
@@ -258,8 +258,7 @@ function App() {
       <${Sidebar} page=${page} termId=${termId} watch=${watch} folded=${folded} arrangement=${arrangement[kind]}
         setFolded=${(value) => updateSidebar({ [kind]: value ? 'folded' : 'open' })}
         swap=${() => updateArrangement({ [kind]: arrangement[kind] === 'pages' ? 'agents' : 'pages' })}
-        onSearch=${() => setPalette(true)} onNew=${() => setCreating(creating ? null : { prefill: {}, at: 'sidebar' })}
-        newAgent=${newAgent('sidebar')} />
+        onSearch=${() => setPalette(true)} onNew=${() => setCreating(creating ? null : { prefill: {}, at: 'sidebar' })} />
       <main class="main">
         ${term ? html`<${TerminalPage} id=${termId} watch=${watch} moon=${html`<${MoonButton} />`} />` : html`
           <${TopBar} page=${page} offline=${offline} stale=${stale} onSearch=${() => setPalette(true)}
@@ -274,6 +273,7 @@ function App() {
       <${TabBar} page=${page} />
     </div>
     ${barHost && creating?.at === 'bar' ? html`<span class="anchor new-agent-host">${newAgent('bar')}</span>` : null}
+    ${creating?.at === 'sidebar' ? html`<span class="anchor new-agent-host side">${newAgent('sidebar')}</span>` : null}
     ${palette ? html`<${Palette} onClose=${closePalette} />` : null}
     <${Toasts} items=${toasts} />`;
 }
@@ -292,7 +292,8 @@ function useLanding(page, loc, doc, setLoc) {
     };
     if (loc.open?.startsWith('agent:')) { go(loc.open.slice('agent:'.length), loc.open); return; }
     if (!doc) return;
-    const target = landingFor(doc.sessions || [], stored('sm-term-last', null));
+    // A poll taken before a retire still lists the retired session; never land on it.
+    const target = landingFor((doc.sessions || []).filter((s) => !retiredIds.has(s.id)), stored('sm-term-last', null));
     if (target) go(target.id, loc.open);
   }, [page, loc, doc]);
 }
@@ -483,7 +484,7 @@ const HOVER_MS = 400;
  * link and one-line session rows; agents first shows the links as icons and today's
  * two-line rows. Folded, it is a 14 px strip with a dot when something needs you.
  */
-function Sidebar({ page, termId, watch, folded, arrangement, setFolded, swap, onSearch, onNew, newAgent }) {
+function Sidebar({ page, termId, watch, folded, arrangement, setFolded, swap, onSearch, onNew }) {
   const [doc, , reload] = watch;
   const [idleOpen, setIdleOpen] = useState(() => stored(IDLE_KEY, false));
   const [card, setCard] = useState(null);
@@ -549,8 +550,8 @@ function Sidebar({ page, termId, watch, folded, arrangement, setFolded, swap, on
           ${agents.length} live ${pagesFirst ? '›' : '⌄'}</button>
         ${needs ? html`<b class="magenta" title=${`${needs} need${needs === 1 ? 's' : ''} you`}>${needs}</b>` : null}
         <span class="sp"></span>
-        <span class="anchor"><button type="button" class="icon-btn sb-new" data-pop-anchor title="New agent or terminal" aria-label="New agent"
-          onClick=${onNew}>+</button>${newAgent}</span>
+        <button type="button" class="icon-btn sb-new" data-pop-anchor title="New agent or terminal" aria-label="New agent"
+          onClick=${onNew}>+</button>
       </div>
       <div class="sb-agents">
         ${pagesFirst

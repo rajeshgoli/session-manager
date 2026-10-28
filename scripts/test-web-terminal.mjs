@@ -408,6 +408,21 @@ test('Retire in the bar: a finished agent retires at once and the page moves to 
   } finally { await browser.close(); }
 });
 
+test('retiring the last session lands on the empty page, not back on its ended terminal', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, state, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    state.sessions = state.sessions.filter((s) => s.id === 'far-1855');
+    await page.goto(`${ORIGIN}/terminal/far-1855`);
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
+    await page.locator('.term-bar').getByRole('button', { name: 'Retire' }).click();
+    await page.locator('.home-empty', { hasText: 'No live agents' }).waitFor();
+    await page.waitForTimeout(3500);
+    assert.equal(new URL(page.url()).pathname, '/');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
 test('Retire confirmation stays usable above details with a long name on a phone', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
