@@ -75,6 +75,9 @@ test('Your move lists what waits on the owner across lanes once each, then start
   assert.equal(items[1].close, true);
   assert.match(items[3].text, /no seat/);
   assert.deepEqual(readyItems([lane1, lane2], other).map((i) => i.ticket.number), [1]);
+  const pm = { id: 9, rank: 3, autopm: true, tickets: [t(10, 'in_progress', { clock: { ball: 'no_agent', text: 'No agent' } }), t(11, 'ready'), t(12, 'close_ready'), t(13, 'needs_you', { needs_you: { text: 'Ask', url: 'v' } })] };
+  assert.deepEqual(attentionItems([pm], []).map((i) => i.ticket.number), [13]);
+  assert.deepEqual(readyItems([pm], []).map((i) => i.ticket.number), []);
   assert.equal(shortGoal('Iteration 12 build (goal): compact chains'), 'Iteration 12 build');
   assert.equal(shortGoal('Bugs'), 'Bugs');
 });
