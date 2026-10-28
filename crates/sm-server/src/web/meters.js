@@ -5,7 +5,7 @@
 import { html, api, usePoll, navigate, gigabytes, meterBand } from './ui.js';
 
 const WEEK_MS = 7 * 86400000;
-const WINDOW = { five_hour: ['5-hour', '5h'], week: ['Week', 'wk'] };
+const WINDOW = { five_hour: ['5-hour', '5 hours'], week: ['Week', 'Week'] };
 
 /** Today: the time; within a week: weekday and time; else the date. "3:00 pm" reads "3 pm". */
 export function when(iso, now = Date.now()) {
@@ -47,8 +47,8 @@ export function usageRows(usage, now = Date.now()) {
     const named = (m) => {
       const [long, short] = WINDOW[m.window] || [m.window, m.window];
       const account = several ? (m.label || m.account_key).split('@')[0] : '';
-      const base = m.scope ? { long: `${m.scope} ${m.window === 'five_hour' ? '5-hour' : 'week'}`, short: m.scope.slice(0, 2) } : { long, short };
-      return account ? { long: `${base.long} · ${account}`, short: `${base.short} ${account}` } : base;
+      const base = m.scope ? { long: `${m.scope} ${m.window === 'five_hour' ? '5-hour' : 'week'}`, short: m.window === 'five_hour' ? `${m.scope} 5 hours` : m.scope } : { long, short };
+      return account ? { long: `${base.long} · ${account}`, short: `${base.short} · ${account}` } : base;
     };
     const windows = meters.filter(shown).map((m) => {
       const name = named(m);
@@ -63,7 +63,7 @@ export function usageRows(usage, now = Date.now()) {
     });
     if (!meters.some((m) => m.window === 'week' && !m.scope)) {
       windows.splice(meters.filter((m) => m.window === 'five_hour' && shown(m)).length, 0,
-        { key: 'week:none', short: 'wk', percent: 0, text: '–', band: 'green', title: 'Week: no reading' });
+        { key: 'week:none', short: 'Week', percent: 0, text: '–', band: 'green', title: 'Week: no reading' });
     }
     const out = meters.filter((m) => m.pace?.kind === 'runs_out');
     const notes = out.length
@@ -93,7 +93,7 @@ export function macReadings(host) {
   const memText = `${gigabytes(host.memory_used_bytes)}/${gigabytes(total)}G`;
   const all = [
     { key: 'cpu', short: 'CPU', percent: host.cpu_percent || 0, text: `${Math.round(host.cpu_percent || 0)}%` },
-    { key: 'memory', short: 'Mem', percent: memPct, text: memText },
+    { key: 'memory', short: 'Memory', percent: memPct, text: `${Math.round(memPct)}%` },
     { key: 'gpu', short: 'GPU', percent: gpu || 0, text: gpu === null ? '–' : `${Math.round(gpu)}%` },
   ].map((r) => ({ ...r, band: meterBand(r.percent / 100, r.key) }));
   return {
@@ -102,8 +102,11 @@ export function macReadings(host) {
   };
 }
 
-function Window({ short, percent, text, band, title }) {
-  return html`<span class="dw" title=${title}><i>${short}</i><u><s class=${band} style=${`width:${Math.max(0, Math.min(100, percent || 0))}%`}></s></u><b class=${band === 'green' || band === 'cyan' ? '' : band}>${text}</b></span>`;
+/** One aligned row: provider (first row of its group only), window, bar, value. */
+function Row({ head, short, percent, text, band, title, first }) {
+  return html`<div class=${first ? 'dr first' : 'dr'} title=${title}>${head}<span class="dw">${short}</span>
+    <u><s class=${band} style=${`width:${Math.max(0, Math.min(100, percent || 0))}%`}></s></u>
+    <b class=${band === 'green' || band === 'cyan' ? '' : band}>${text}</b></div>`;
 }
 
 export function Dash() {
@@ -112,15 +115,14 @@ export function Dash() {
   const [usage] = usePoll(() => api('/client/usage/meters'), 30000, [], { background: true });
   const mac = macReadings(host);
   const open = (e) => { e.preventDefault(); navigate('/analytics/spend'); };
+  const blank = html`<span></span>`;
   return html`<div class="dash" aria-label="Usage">
     ${usageRows(usage).map(({ provider, label, windows, notes }) => html`
-      <div class="dr" key=${provider}>
-        <a class="dk" href="/analytics/spend" title=${`${label} usage · open Analytics`} onClick=${open}>${label}</a>
-        ${windows.map((w) => html`<${Window} key=${w.key} ...${w} />`)}
-      </div>
+      ${windows.map((w, i) => html`<${Row} key=${`${provider}:${w.key}`} ...${w} first=${i === 0} head=${i ? blank
+        : html`<a class="dk" href="/analytics/spend" title=${`${label} usage · open Analytics`} onClick=${open}>${label}</a>`} />`)}
       ${notes.map((n) => html`<div class=${`dn ${n.tone}`}>${n.text}</div>`)}`)}
     ${mac ? (mac.readings.length
-      ? mac.readings.map((r, i) => html`<div class="dr" key=${r.key} title=${mac.title}><span class="dk">${i ? '' : 'Mac'}</span><${Window} ...${r} title=${mac.title} /></div>`)
-      : html`<div class="dr" title=${mac.title}><span class="dk">Mac</span><span class="quiet">quiet</span></div>`) : null}
+      ? mac.readings.map((r, i) => html`<${Row} key=${r.key} ...${r} title=${mac.title} first=${i === 0} head=${i ? blank : html`<span class="dk">Mac</span>`} />`)
+      : html`<div class="dr first" title=${mac.title}><span class="dk">Mac</span><span class="quiet">Quiet</span></div>`) : null}
   </div>`;
 }
