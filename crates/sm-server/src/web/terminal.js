@@ -1,7 +1,7 @@
 // Terminal page (spec 1710; 1782 G1-G4; 2543 C, E.1): session rows, phone keys, route and round-trip time.
 // It renders inside the app frame; the app's sidebar lists the sessions and its side panel holds Details.
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { html, api, openPanel, navigate, openItem, Icon, Ring, stored, toast, age, basename, readerPath, openReader } from './ui.js';
+import { html, api, openPanel, navigate, Icon, Ring, stored, toast, age, basename, readerPath, openReader } from './ui.js';
 import { AgentMenus, RetireButton, openInClaude, sectionAgents, SECTION_LABEL, SECTION_TONE, youFact, jobsFact, agentFact, pairedText, markAnswered } from './agents.js';
 import { BugButton } from './bug.js';
 import { chooseRoute, shellBrowserAllowed, relayRoute, rememberRoute, routeText, findDirect, markDirect, recentlyDirect, DIRECT_RETRY_MS } from './terminal-route.js';
@@ -519,13 +519,17 @@ export function TerminalPage({ id, watch, moon, visible = true, onEnded }) {
   const hide = shell && targetKind === 'shell' ? html`<button type="button" class="btn sm" title=${agent.hidden ? 'Put this shell back in the lists' : 'Hide this shell from the lists; it keeps running'}
     onClick=${() => hideShell(!agent.hidden)}>${agent.hidden ? 'Unhide' : 'Hide'}</button>` : null;
   const notes = html`<button type="button" class="btn sm" onClick=${() => openPanel('notes:view')}>Notes ⌘J</button>`;
-  // The agent's ticket fills the bar's empty middle (2543 C): number, title, repo.
-  const claim = !shell && agent ? ((agent.claims || []).find((c) => c.kind === 'ticket') || (agent.claims || [])[0]) : null;
-  const ticket = claim ? html`<span class="term-ticket">
-      ${claim.kind === 'ticket' ? html`<button type="button" class="plain-btn tk" title="Open the ticket"
-        onClick=${(event) => { event.stopPropagation(); openItem('ticket', `${claim.repo}#${claim.number}`, claim.url); }}>#${claim.number}</button>` : null}
+  // The agent's ticket fills the bar's empty middle (2543 C): number, title, repo. After the agent
+  // releases it, the last ticket stays, marked released (#2579). Number and title open it on GitHub.
+  const held = !shell && agent ? ((agent.claims || []).find((c) => c.kind === 'ticket') || (agent.claims || [])[0]) : null;
+  const claim = held || (!shell && agent?.last_ticket?.number ? agent.last_ticket : null);
+  const claimUrl = claim && (claim.url || `https://github.com/${claim.repo}/${claim.kind === 'pr' ? 'pull' : 'issues'}/${claim.number}`);
+  const ticket = claim ? html`<a class="term-ticket" href=${claimUrl} target="_blank" rel="noopener"
+      title=${`Open ${claim.kind === 'pr' ? 'the PR' : 'the ticket'} on GitHub`} onClick=${(event) => event.stopPropagation()}>
+      <span class="tk">#${claim.number}</span>
       ${claim.title ? html`<span class="ttl">${claim.title}</span>` : null}
-      ${claim.kind === 'ticket' && claim.repo ? html`<span class="repo">${basename(claim.repo)}</span>` : null}</span>` : null;
+      ${claim.repo ? html`<span class="repo">${basename(claim.repo)}</span>` : null}
+      ${held ? null : html`<span class="repo">released</span>`}</a>` : null;
   // Desktop (#2242, 2543 C): who and how full on the left, then the ticket; connection words only when
   // not live, with the route in the dot's tooltip; actions on the right, then Moon, Bug and Retire last.
   const desktopBar = () => html`<div class="term-bar wide" onClick=${refocus}>

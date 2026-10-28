@@ -506,6 +506,30 @@ test('Details opens beside the terminal on desktop and below it on a phone; a ti
   } finally { await browser.close(); }
 });
 
+test('the bar keeps the last ticket after release and opens tickets and PRs on GitHub (#2579)', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, state, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    const released = { kind: 'ticket', repo: 'owner/repo', number: 2200, title: 'Three issues', url: 'https://github.com/owner/repo/issues/2200', ended_at: '2026-10-28T19:00:00Z' };
+    state.sessions = state.sessions.map((agent) => agent.id === 'sm-1776' ? { ...agent, claims: [], last_ticket: released } : agent);
+    await page.goto(`${ORIGIN}/terminal/sm-1776`);
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
+    const link = page.locator('.term-bar a.term-ticket');
+    await link.waitFor();
+    assert.equal((await link.innerText()).replace(/\s+/g, ' ').trim(), '#2200 Three issues repo released');
+    assert.equal(await link.getAttribute('href'), released.url);
+    assert.equal(await link.getAttribute('target'), '_blank');
+    // A held PR without a cached URL still links to GitHub, and is not marked released.
+    state.sessions = state.sessions.map((agent) => agent.id === 'sm-1776'
+      ? { ...agent, claims: [{ kind: 'pr', repo: 'owner/repo', number: 2201, title: 'Fix three issues' }] } : agent);
+    await page.locator('.term-bar a.term-ticket', { hasText: '#2201' }).waitFor();
+    assert.equal(await link.getAttribute('href'), 'https://github.com/owner/repo/pull/2201');
+    assert.equal(await link.locator('.repo', { hasText: 'released' }).count(), 0);
+    assert.deepEqual(errors, []);
+    await page.context().close();
+  } finally { await browser.close(); }
+});
+
 test('Report a bug: typing goes to the dialog, not the terminal', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
