@@ -2263,7 +2263,25 @@ pub(super) async fn delete_owner_doc_subpath(
     if let Some(submission_id) = rest.strip_prefix("review/") {
         let doc = find_doc(&state, &doc_id)?;
         let _guard = state.owner_doc_review_lock.lock().await;
-        if !owner_doc_store(&state).discard_review(&doc.id, submission_id)? {
+        let store = owner_doc_store(&state);
+        // A pending review sm could not delete would block every later
+        // review of the PR: remove it from GitHub before forgetting it.
+        let stale = store
+            .review(submission_id)?
+            .filter(|review| review.doc_id == doc.id && review.status == "failed")
+            .and_then(|review| review.pending_review_node_id);
+        if let Some(node_id) = stale {
+            let source = state.owner_doc_source.clone();
+            tokio::task::spawn_blocking(move || source.delete_pending_review(&node_id))
+                .await
+                .map_err(|error| anyhow::anyhow!("pending review delete task failed: {error}"))?
+                .map_err(|error| {
+                    github_failure(format!(
+                        "GitHub still holds this review's unfinished draft and sm could not remove it: {error}. Try again."
+                    ))
+                })?;
+        }
+        if !store.discard_review(&doc.id, submission_id)? {
             return Err(ApiError::NotFound("No failed review with that id"));
         }
         return Ok(Json(

@@ -417,7 +417,18 @@ async fn start_queued(state: &Arc<AppState>, review: OwnerDocReview) -> Result<(
         None => None,
     };
     let mut target = if pr.is_none() {
-        Some(super::reopen::target(state, &doc).await?)
+        // A lookup GitHub could not answer is retried; a target that
+        // refuses the review is not.
+        Some(
+            super::reopen::target(state, &doc)
+                .await
+                .map_err(|error| match error {
+                    ApiError::Status { detail, .. } if transient_github_error(&detail) => {
+                        github_failure(detail)
+                    }
+                    other => other,
+                })?,
+        )
     } else {
         None
     };
@@ -942,10 +953,14 @@ fn abort(
             "Owner doc review {}: could not delete pending review {pending_id}: {delete_error}",
             review.id
         );
-        return Err(github_failure(format!(
-            "GitHub refused the review: {error}. Submitting again resumes it."
+        // The pending review may still be on GitHub, holding the PR's one
+        // pending slot: keep retrying, so a later attempt resumes or
+        // deletes it, rather than releasing the submission now.
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "GitHub refused the review: {error}. Its unfinished draft on GitHub could not be removed yet."
         )));
     }
+    owner_doc_store(state).set_pending_review_node_id(&review.id, None)?;
     Err(github_failure(format!(
         "GitHub refused the review: {error}"
     )))

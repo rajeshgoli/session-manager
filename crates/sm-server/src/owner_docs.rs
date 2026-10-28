@@ -1691,11 +1691,13 @@ impl OwnerDocStore {
         Ok(())
     }
 
-    /// Ends a submission the worker gave up on, keeping its drafts.
+    /// Ends a submission the worker gave up on, keeping its drafts. A
+    /// pending review id still recorded is one sm could not delete: Submit
+    /// again resumes it, and Discard deletes it first.
     pub fn give_up_review(&self, submission_id: &str, error: &str) -> Result<()> {
         self.open_write()?.execute(
             "UPDATE owner_doc_reviews
-             SET status = 'failed', pending_review_node_id = NULL, error = ?2,
+             SET status = 'failed', error = ?2,
                  next_attempt_ms = NULL
              WHERE id = ?1 AND status IN ('queued', 'submitting')",
             params![submission_id, error],

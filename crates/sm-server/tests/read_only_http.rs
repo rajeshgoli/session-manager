@@ -22540,6 +22540,8 @@ struct StubDocSource {
 #[derive(Default)]
 struct FakeGitHub {
     reopen_info: Option<Value>,
+    /// The PR history lookup fails this way, as GitHub being down does.
+    reopen_error: Option<String>,
     branch_state: Option<Value>,
     open_prs: Option<Value>,
     review_target: Option<(i64, String)>,
@@ -22621,9 +22623,11 @@ impl StubDocSource {
 
 impl OwnerDocSource for StubDocSource {
     fn doc_pr_info(&self, _: &str, _: i64) -> Result<Value, String> {
-        self.github
-            .lock()
-            .unwrap()
+        let github = self.github.lock().unwrap();
+        if let Some(error) = &github.reopen_error {
+            return Err(error.clone());
+        }
+        github
             .reopen_info
             .clone()
             .ok_or("history unavailable".into())
@@ -25012,6 +25016,110 @@ async fn owner_doc_review_retries_transient_failures_and_ends_refusals_at_once()
         StatusCode::NOT_FOUND,
         "a posted review is not discarded"
     );
+}
+
+/// Review findings on #2556: a GitHub outage while resolving a closed PR's
+/// target is retried, and a pending review sm could not delete keeps the
+/// submission open until it is resumed or deleted.
+#[tokio::test]
+async fn owner_doc_review_never_strands_a_pending_review_or_a_target_outage() {
+    let c1 = "a".repeat(40);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app_retrying(source.clone(), parked_review_retry());
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+
+    // Refused, and the pending review cannot be deleted: still submitting.
+    {
+        let mut github = source.github.lock().unwrap();
+        github.refuse_submit = true;
+        github.fail_delete = true;
+    }
+    let stuck = json!({"submission_id": "sub-orphan01", "sha": c1, "verdict": "comment"});
+    let (status, _) = post_json(app.clone(), &format!("/docs/{id}/review"), stuck.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(parked(&dir, "sub-orphan01").await["status"], "submitting");
+    // Once the delete works, the retry resumes it, is refused again, and
+    // cleans up before failing.
+    source.github.lock().unwrap().fail_delete = false;
+    let (_, failed) = retry_review_now(&app, &dir, &id, stuck).await;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert!(source.github.lock().unwrap().reviews.is_empty());
+    let row = store.review("sub-orphan01").unwrap().unwrap();
+    assert_eq!(row.pending_review_node_id, None);
+    let (status, _) = delete_json(
+        app.clone(),
+        &format!("/docs/{id}/review/sub-orphan01"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Given up on with the pending review still there (the retry hour ran
+    // out): Discard deletes it from GitHub first, or refuses.
+    let (app, dir) = owner_docs_app(source.clone());
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+    source.github.lock().unwrap().fail_delete = true;
+    let (_, failed) = submit_review(
+        &app,
+        &id,
+        json!({"submission_id": "sub-orphan02", "sha": c1, "verdict": "comment"}),
+    )
+    .await;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert!(store
+        .review("sub-orphan02")
+        .unwrap()
+        .unwrap()
+        .pending_review_node_id
+        .is_some());
+    let discard = format!("/docs/{id}/review/sub-orphan02");
+    let (status, _) = delete_json(app.clone(), &discard, json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(store.review("sub-orphan02").unwrap().is_some());
+    {
+        let mut github = source.github.lock().unwrap();
+        github.fail_delete = false;
+        github.refuse_submit = false;
+    }
+    let (status, _) = delete_json(app.clone(), &discard, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(source.github.lock().unwrap().reviews.is_empty());
+
+    // A closed PR whose history lookup hits a GitHub outage waits and
+    // retries instead of failing.
+    let (app, dir) = owner_docs_app_retrying(source.clone(), parked_review_retry());
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    {
+        let mut github = source.github.lock().unwrap();
+        github.set_pr(12, "closed", &c1);
+        github.reopen_error = Some("gh api graphql failed: HTTP 502 Bad Gateway".into());
+        github.branch_state = Some(json!({"tip": c1, "prs": []}));
+    }
+    let closed = json!({"submission_id": "sub-outage01", "sha": c1, "verdict": "comment"});
+    let (status, _) = post_json(app.clone(), &format!("/docs/{id}/review"), closed.clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let waiting = parked(&dir, "sub-outage01").await;
+    assert_eq!(waiting["status"], "queued", "{waiting}");
+    {
+        let mut github = source.github.lock().unwrap();
+        github.reopen_error = None;
+        github.reopen_info = Some(json!({"state": "CLOSED", "headRefName": "topic"}));
+    }
+    let (status, posted) = retry_review_now(&app, &dir, &id, closed).await;
+    assert_eq!(status, StatusCode::OK, "{posted}");
 }
 
 #[tokio::test]
