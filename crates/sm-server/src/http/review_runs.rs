@@ -614,7 +614,9 @@ fn poll_run_blocking(
     RetainedQueueStore::attach_review_job(db, &r.id, r.step_index, &job)?;
     let current = RetainedQueueStore::get_codex_review_request_from_path(db, &r.id)?
         .context("request disappeared")?;
-    if !current.is_active {
+    // Skipped while it was being prepared (#2586): the request has left this
+    // step, so the run never starts and its job and worktree go.
+    if !current.is_active || current.step_index != r.step_index {
         cleanup_step(state, r)?;
         return Ok(true);
     }

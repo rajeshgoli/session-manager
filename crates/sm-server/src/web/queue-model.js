@@ -104,7 +104,7 @@ export function reviewRowText(review, now = Date.now()) {
     ? (state === 'picked_up' ? 'Reviewing' : state === 'error_wait' || state === 'retry_posting' ? 'Retrying after a Codex error' : 'Waiting for Codex to start')
     : review.kind === 'paired'
       ? (state === 'waiting_reviewer' ? 'Starting the reviewer' : state === 'nudged' ? 'Reviewing · reminded' : 'Reviewing')
-      : (review.job_id ? 'Reviewing' : 'Starting');
+      : !review.job_id ? 'Starting' : state === 'queued' ? 'Waiting for a review slot' : 'Reviewing';
   const split = (label) => {
     const match = /^(.*?) \((.*)\)$/.exec(label || '');
     return match ? [match[1], match[2].replace(', ', ' · ')] : [label || 'Reviewer', null];

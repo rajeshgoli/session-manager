@@ -49,6 +49,7 @@ test('review rows say who holds the review, for how long, and what Next reviewer
   assert.equal(tmux.ask, 'No one is left to review. End it and tell sm-2575?');
   assert.equal(tmux.confirm, 'End review');
   assert.equal(reviewRowText({ ...reviews()[0], step_state: 'posted', since: minutesAgo(0) }, now).status, 'Waiting for Codex to start · just now');
+  assert.equal(reviewRowText({ ...reviews()[1], step_state: 'queued' }, now).status, 'Waiting for a review slot · 3 min');
 });
 
 for (const width of [390, 1440]) test(`Next reviewer asks in place, names the step, and handles a review that moved on at ${width}px`, async () => {
