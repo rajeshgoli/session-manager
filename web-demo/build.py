@@ -36,12 +36,15 @@ PAGE_PATHS = ["board", "queue", "inbox", "notes", "analytics", "history", "histo
               "history/tickets", "guestbook", "settings", "watch"]
 # Words the demo's copy of the app changes: the visitor's machine is not
 # necessarily a Mac, and Studio SSH is the owner's own setup. Each must match
-# exactly once, so a change in the app fails the build instead of passing silently.
+# exactly the stated number of times, so a change in the app fails the build
+# instead of passing silently.
 PATCHES = [
-    ("queue.js", "<h2>Mac usage</h2>", "<h2>Dev machine usage</h2>"),
-    ("queue.js", "The Mac had room to run", "The machine had room to run"),
-    ("app.js", '<span class="dh">Mac</span>', '<span class="dh">Dev machine</span>'),
-    ("settings.js", re.compile(r"<h3>Studio SSH</h3><\$\{Resource\} state=\$\{ssh\}.*?</\$\{Resource\}>", re.S), ""),
+    ("queue.js", "<h2>Mac usage</h2>", "<h2>Dev machine usage</h2>", 1),
+    ("queue.js", "The Mac had room to run", "The machine had room to run", 1),
+    # The sidebar meters' row label: one for the readings rows, one for "Quiet".
+    # Its column is 48px wide, so the label stays one short word.
+    ("meters.js", '<span class="dk">Mac</span>', '<span class="dk">Host</span>', 2),
+    ("settings.js", re.compile(r"<h3>Studio SSH</h3><\$\{Resource\} state=\$\{ssh\}.*?</\$\{Resource\}>", re.S), "", 1),
 ]
 
 
@@ -113,13 +116,14 @@ def shell(build, timeline):
 
 
 def patch(assets):
-    for name, old, new in PATCHES:
+    for name, old, new, count in PATCHES:
         path = os.path.join(assets, name)
         with open(path) as f:
             text = f.read()
         pattern = old if isinstance(old, re.Pattern) else re.compile(re.escape(old))
-        if len(pattern.findall(text)) != 1:
-            sys.exit(f"build.py PATCHES: {name} no longer has exactly one {pattern.pattern[:60]!r}")
+        found = len(pattern.findall(text))
+        if found != count:
+            sys.exit(f"build.py PATCHES: {name} has {found}, not {count}, of {pattern.pattern[:60]!r}")
         with open(path, "w") as f:
             f.write(pattern.sub(lambda _: new, text))
 
