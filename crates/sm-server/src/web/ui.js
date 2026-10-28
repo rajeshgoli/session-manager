@@ -603,6 +603,12 @@ const ICONS = {
   inbox: '<path d="M2 9.5l1.8-6h8.4L14 9.5v3.5H2z"/><path d="M2 9.5h3.5l1 1.6h3l1-1.6H14"/>',
   analytics: '<path d="M3 13.5V8M8 13.5V3M13 13.5V6"/>',
   history: '<circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.3 1.6"/>',
+  // A document with a folded corner: files agents publish.
+  artifacts: '<path d="M4 1.8h5l3 3v9.4H4z"/><path d="M9 1.8v3h3"/>',
+  // A notepad: spiral rings over ruled lines.
+  notes: '<rect x="3" y="2.8" width="10" height="11.4" rx="1.2"/><path d="M5.5 1.8v2M8 1.8v2M10.5 1.8v2M5.5 7.5h5M5.5 10.5h3.5"/>',
+  // An open book: the visitors' log.
+  guestbook: '<path d="M8 4.2c-1.6-1.2-3.6-1.4-5.8-1v9.6c2.2-.4 4.2-.2 5.8 1 1.6-1.2 3.6-1.4 5.8-1V3.2c-2.2-.4-4.2-.2-5.8 1zM8 4.2v9.6"/>',
   settings:
     '<circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6 5 5M11 11l1.4 1.4M3.6 12.4 5 11M11 5l1.4-1.4"/>',
   fold: '<path d="M9.5 4 5.5 8l4 4"/>',

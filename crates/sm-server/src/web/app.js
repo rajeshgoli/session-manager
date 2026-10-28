@@ -32,11 +32,11 @@ const PAGES = [
   { key: 'inbox', label: 'Inbox', icon: 'inbox', path: '/inbox', key_hint: 'i' },
   { key: 'board', label: 'Board', icon: 'board', path: '/board', key_hint: 'b' },
   { key: 'queue', label: 'Queue', icon: 'queue', path: '/queue', key_hint: 'q' },
-  { key: 'artifacts', label: 'Artifacts', icon: 'history', path: '/artifacts' },
-  { key: 'notes', label: 'Notes', icon: 'history', path: '/notes', key_hint: 'n' },
+  { key: 'artifacts', label: 'Artifacts', icon: 'artifacts', path: '/artifacts' },
+  { key: 'notes', label: 'Notes', icon: 'notes', path: '/notes', key_hint: 'n' },
   { key: 'analytics', label: 'Analytics', icon: 'analytics', path: '/analytics', minor: true },
   { key: 'history', label: 'History', icon: 'history', path: '/history', minor: true },
-  { key: 'guestbook', label: 'Guestbook', icon: 'history', path: '/guestbook', minor: true },
+  { key: 'guestbook', label: 'Guestbook', icon: 'guestbook', path: '/guestbook', minor: true },
   { key: 'settings', label: 'Settings', icon: 'settings', path: '/settings', key_hint: 's', bottom: true },
 ];
 
