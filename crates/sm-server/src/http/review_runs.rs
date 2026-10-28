@@ -198,8 +198,15 @@ pub(super) async fn start_github(
     }
     // An interrupted post is not repeated: the watcher falls through to the
     // next provider if a restart finds no recorded request comment.
-    RetainedQueueStore::mark_github_review_step_in_path(db, &r.id, "posting", 0, &now)
-        .map_err(|e| e.to_string())?;
+    RetainedQueueStore::mark_github_review_step_in_path(
+        db,
+        &r.id,
+        r.step_index,
+        "posting",
+        0,
+        &now,
+    )
+    .map_err(|e| e.to_string())?;
     match github_post_review_request(
         state.github_review_poster.clone(),
         &r.repo,
@@ -212,6 +219,7 @@ pub(super) async fn start_github(
             RetainedQueueStore::mark_github_review_posted_in_path(
                 db,
                 &r.id,
+                r.step_index,
                 c.comment_id,
                 c.comment_url.as_deref(),
                 &c.posted_at,

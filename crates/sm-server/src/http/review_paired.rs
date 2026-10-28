@@ -280,8 +280,18 @@ async fn start(
         },
     )
     .map_err(|e| e.to_string())?;
-    RetainedQueueStore::attach_paired_reviewer(db, &r.id, r.step_index, &session.id, &name)
-        .map_err(|e| e.to_string())?;
+    let attached =
+        RetainedQueueStore::attach_paired_reviewer(db, &r.id, r.step_index, &session.id, &name)
+            .map_err(|e| e.to_string())?;
+    if !attached {
+        // The owner moved the review on while this reviewer was starting (#2586):
+        // it never got a round, so retire it rather than leave it idle.
+        let (state, db, id) = (state.clone(), db.to_path_buf(), session.id.clone());
+        tokio::task::spawn_blocking(move || retire_reviewer(&state, &db, &id, &id))
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(true);
+    }
     Ok(false)
 }
 
@@ -499,6 +509,7 @@ fn watch(
         RetainedQueueStore::mark_github_review_step_in_path(
             db,
             &r.id,
+            r.step_index,
             "nudged",
             r.step_failures,
             &now_rfc3339(),

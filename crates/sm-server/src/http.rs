@@ -6462,6 +6462,7 @@ async fn poll_github_review_step(
         RetainedQueueStore::mark_github_review_step_in_path(
             db_path,
             &request.id,
+            request.step_index,
             "picked_up",
             request.step_failures,
             &now,
@@ -6482,6 +6483,7 @@ async fn poll_github_review_step(
             RetainedQueueStore::mark_github_review_step_in_path(
                 db_path,
                 &request.id,
+                request.step_index,
                 "retry_posting",
                 request.step_failures,
                 &now,
@@ -6510,6 +6512,7 @@ async fn poll_github_review_step(
             RetainedQueueStore::mark_github_review_posted_in_path(
                 db_path,
                 &request.id,
+                request.step_index,
                 comment.comment_id,
                 comment.comment_url.as_deref(),
                 &comment.posted_at,
@@ -6553,6 +6556,7 @@ async fn poll_github_review_step(
             RetainedQueueStore::mark_github_review_step_in_path(
                 db_path,
                 &request.id,
+                request.step_index,
                 "error_wait",
                 1,
                 &failure.created_at,

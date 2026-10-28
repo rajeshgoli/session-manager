@@ -751,15 +751,19 @@ impl RetainedQueueStore {
         Ok(())
     }
 
+    /// Records the reviewer's request comment, only while the request is still
+    /// on `step`: a post that finishes after an owner skip leaves the next
+    /// reviewer's step alone (#2586).
     pub fn mark_github_review_posted_in_path(
         db_path: &Path,
         request_id: &str,
+        step: i64,
         comment_id: Option<i64>,
         comment_url: Option<&str>,
         posted_at: &str,
     ) -> Result<Option<CodexReviewRequestRegistration>> {
         let conn = Connection::open(db_path)?;
-        conn.execute("UPDATE codex_review_request_registrations SET latest_request_comment_id = ?2, latest_request_comment_url = ?3, latest_request_posted_at = ?4, step_state = 'posted', step_started_at = ?4, attempt_count = attempt_count + 1 WHERE id = ?1 AND is_active = 1", params![request_id, comment_id, comment_url, posted_at])?;
+        conn.execute("UPDATE codex_review_request_registrations SET latest_request_comment_id = ?2, latest_request_comment_url = ?3, latest_request_posted_at = ?4, step_state = 'posted', step_started_at = ?4, attempt_count = attempt_count + 1 WHERE id = ?1 AND is_active = 1 AND step_index = ?5", params![request_id, comment_id, comment_url, posted_at, step])?;
         get_codex_review_request_conn(&conn, request_id)
     }
 
@@ -802,10 +806,10 @@ impl RetainedQueueStore {
         index: i64,
         session_id: &str,
         label: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let conn = Connection::open(db_path)?;
-        conn.execute("UPDATE codex_review_request_registrations SET reviewer_session_id=?3, reviewer_label=?4, step_state='waiting_reviewer' WHERE id=?1 AND step_index=?2 AND is_active=1",params![id,index,session_id,label])?;
-        Ok(())
+        let attached = conn.execute("UPDATE codex_review_request_registrations SET reviewer_session_id=?3, reviewer_label=?4, step_state='waiting_reviewer' WHERE id=?1 AND step_index=?2 AND is_active=1",params![id,index,session_id,label])?;
+        Ok(attached == 1)
     }
 
     /// The round goes to the reviewer with its snapshot, in one transaction:
@@ -846,15 +850,17 @@ impl RetainedQueueStore {
         Ok(())
     }
 
+    /// Sets the state of the request's current step, only while it is still `step`.
     pub fn mark_github_review_step_in_path(
         db_path: &Path,
         request_id: &str,
+        step: i64,
         step_state: &str,
         failures: i64,
         now: &str,
     ) -> Result<Option<CodexReviewRequestRegistration>> {
         let conn = Connection::open(db_path)?;
-        conn.execute("UPDATE codex_review_request_registrations SET step_state = ?2, step_failures = ?3, last_polled_at = ?4 WHERE id = ?1 AND is_active = 1", params![request_id, step_state, failures, now])?;
+        conn.execute("UPDATE codex_review_request_registrations SET step_state = ?2, step_failures = ?3, last_polled_at = ?4 WHERE id = ?1 AND is_active = 1 AND step_index = ?5", params![request_id, step_state, failures, now, step])?;
         get_codex_review_request_conn(&conn, request_id)
     }
 
