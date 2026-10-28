@@ -32,9 +32,9 @@ const host = (cpu, usedG, gpu = 5) => ({ cpu_percent: cpu, memory_used_bytes: us
 test('nothing to know: week windows only, no notes, Mac quiet', () => {
   const usage = [meter('claude', 'five_hour', 20, { kind: 'on_pace', percent: 40 }), meter('claude', 'week', 25, { kind: 'on_pace', percent: 55 }, 48),
     meter('codex', 'week', 6, { kind: 'on_pace', percent: 20 }, 120)];
-  assert.deepEqual(shorts(row(usage, 'claude')), ['wk']);
+  assert.deepEqual(shorts(row(usage, 'claude')), ['Week']);
   assert.deepEqual(row(usage, 'claude').notes, []);
-  assert.deepEqual(shorts(row(usage, 'codex')), ['wk']);
+  assert.deepEqual(shorts(row(usage, 'codex')), ['Week']);
   // Codex is on pace for 20% but less than half the week has gone: no note.
   assert.deepEqual(row(usage, 'codex').notes, []);
   assert.deepEqual(macReadings(host(10, 100)).readings, []);
@@ -43,7 +43,7 @@ test('nothing to know: week windows only, no notes, Mac quiet', () => {
 test('Claude will run out: five-hour shows, amber note names the week', () => {
   const usage = [meter('claude', 'five_hour', 64, { kind: 'on_pace', percent: 90 }), meter('claude', 'week', 81, { kind: 'runs_out', at: hours(27) })];
   const claude = row(usage, 'claude');
-  assert.deepEqual(shorts(claude), ['5h', 'wk']);
+  assert.deepEqual(shorts(claude), ['5 hours', 'Week']);
   assert.deepEqual(claude.windows.map((w) => w.band), ['amber', 'amber']);
   assert.equal(claude.notes.length, 1);
   assert.equal(claude.notes[0].tone, 'amber');
@@ -60,25 +60,25 @@ test('Codex will be left over: teal note once half the week has gone', () => {
   assert.deepEqual(row([meter('codex', 'week', 18, { kind: 'on_pace', percent: 50 }, 48)], 'codex').notes, []);
 });
 
-test('Mac under load: only amber or red readings, memory as used/total', () => {
+test('Mac under load: only amber or red readings, memory as a percent, GB in the hover', () => {
   const mac = macReadings(host(100, 200));
-  assert.deepEqual(mac.readings.map((r) => [r.short, r.band, r.text]), [['CPU', 'red', '100%'], ['Mem', 'amber', '200/256G']]);
+  assert.deepEqual(mac.readings.map((r) => [r.short, r.band, r.text]), [['CPU', 'red', '100%'], ['Memory', 'amber', '78%']]);
   assert.match(mac.title, /CPU 100% · Memory 200\/256G · GPU 5%/);
 });
 
 test('no readings: Claude and Codex show an empty week window', () => {
   const rows = usageRows({ meters: [] }, now);
-  assert.deepEqual(rows.map((r) => [r.provider, shorts(r), r.windows[0].text]), [['claude', ['wk'], '–'], ['codex', ['wk'], '–']]);
+  assert.deepEqual(rows.map((r) => [r.provider, shorts(r), r.windows[0].text]), [['claude', ['Week'], '–'], ['codex', ['Week'], '–']]);
 });
 
 test('five-hour at 59% is hidden, at 60% shown', () => {
-  assert.deepEqual(shorts(row([meter('claude', 'five_hour', 59), meter('claude', 'week', 10)], 'claude')), ['wk']);
-  assert.deepEqual(shorts(row([meter('claude', 'five_hour', 60), meter('claude', 'week', 10)], 'claude')), ['5h', 'wk']);
+  assert.deepEqual(shorts(row([meter('claude', 'five_hour', 59), meter('claude', 'week', 10)], 'claude')), ['Week']);
+  assert.deepEqual(shorts(row([meter('claude', 'five_hour', 60), meter('claude', 'week', 10)], 'claude')), ['5 hours', 'Week']);
 });
 
 test('a five-hour window that runs out shows with its note, below 60%', () => {
   const claude = row([meter('claude', 'five_hour', 40, { kind: 'runs_out', at: hours(1) }), meter('claude', 'week', 10)], 'claude');
-  assert.deepEqual(shorts(claude), ['5h', 'wk']);
+  assert.deepEqual(shorts(claude), ['5 hours', 'Week']);
   assert.match(claude.notes[0].text, /^5-hour runs out /);
 });
 
@@ -100,5 +100,5 @@ test('no host reading: no Mac row', () => {
 test('several accounts name their windows', () => {
   const usage = [meter('codex', 'week', 30, null, 48, { account_key: 'a', label: 'work@x' }),
     meter('codex', 'week', 40, null, 48, { account_key: 'b', label: 'home@x' })];
-  assert.deepEqual(shorts(row(usage, 'codex')), ['wk work', 'wk home']);
+  assert.deepEqual(shorts(row(usage, 'codex')), ['Week · work', 'Week · home']);
 });

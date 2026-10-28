@@ -121,21 +121,21 @@ code, .mono { font-family: var(--mono); font-size: .9rem; }
 .new-agent-host.side .pop { left: 0; right: auto; }
 /* A widened panel covers the terminal, its bar included (the bar stacks at 32). */
 .app.term.wide > .panel { z-index: 33; }
-/* Usage meters (2543 B.6): a row per provider, a note only when it matters, the Mac only when high. */
-.dash { display: flex; flex-direction: column; gap: 3px; padding: 8px 7px 8px; margin: 0 -7px 4px; border-top: 1px solid var(--line); font-size: .8rem; font-variant-numeric: tabular-nums; flex: none; }
-.dash .dr { display: flex; align-items: center; flex-wrap: wrap; column-gap: 6px; min-height: 20px; }
-.dash .dk { width: 50px; flex: none; color: var(--ink-3); font-size: .733rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; text-decoration: none; }
-.dash a.dk:hover { color: var(--ink-2); }
-.dash .dw { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; color: var(--ink-2); }
-.dash .dw i { font-style: normal; color: var(--ink-3); }
-.dash .dw u { display: block; width: 26px; height: 5px; border-radius: 3px; background: var(--panel-2); position: relative; overflow: hidden; }
-.dash .dw s { position: absolute; top: 0; bottom: 0; left: 0; background: var(--green); }
-.dash .dw s.amber { background: var(--amber); } .dash .dw s.red { background: var(--red); } .dash .dw s.cyan { background: var(--cyan); }
-.dash .dw b { font-weight: 600; color: var(--ink); }
-.dash .dw b.amber { color: var(--amber); } .dash .dw b.red { color: var(--red); }
-.dash .dn { font-size: .733rem; line-height: 16px; padding-left: 56px; margin-top: -2px; }
+/* Usage meters (2543 B.6): aligned rows of provider, window, bar and value; a note only when it matters. */
+.dash { --dk: 46px; --dw: 50px; --dv: 36px; display: flex; flex-direction: column; padding: 10px 7px 8px; margin: 0 -7px 4px; border-top: 1px solid var(--line); font-size: .8rem; font-variant-numeric: tabular-nums; flex: none; }
+.dash .dr { display: grid; grid-template-columns: var(--dk) var(--dw) minmax(0, 1fr) var(--dv); column-gap: 6px; align-items: center; height: 22px; }
+.dash .dr.first:not(:first-child) { margin-top: 6px; }
+.dash .dk { color: var(--ink); font-weight: 600; text-decoration: none; white-space: nowrap; }
+.dash a.dk:hover { color: var(--accent); }
+.dash .dw { color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dash .dr u { display: block; height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--ink) 10%, transparent); position: relative; overflow: hidden; }
+.dash .dr s { position: absolute; top: 0; bottom: 0; left: 0; border-radius: 3px; background: var(--green); }
+.dash .dr s.amber { background: var(--amber); } .dash .dr s.red { background: var(--red); } .dash .dr s.cyan { background: var(--cyan); }
+.dash .dr b { font-weight: 600; color: var(--ink); text-align: right; white-space: nowrap; }
+.dash .dr b.amber { color: var(--amber); } .dash .dr b.red { color: var(--red); }
+.dash .dn { font-size: .733rem; line-height: 16px; padding: 1px 0 2px calc(var(--dk) + 6px); }
 .dash .dn.amber { color: var(--amber); } .dash .dn.red { color: var(--red); } .dash .dn.cyan { color: var(--cyan); }
-.dash .quiet { color: var(--ink-3); }
+.dash .quiet { grid-column: 2 / -1; color: var(--ink-3); }
 
 /* ---- top bar ---------------------------------------------------------------- */
 /* 40 px on every view (2543 C), level with the sidebar's search row. */
