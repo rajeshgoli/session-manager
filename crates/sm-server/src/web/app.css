@@ -390,6 +390,8 @@ button.sw-sec { cursor: pointer; }
 .term-ticket .tk { color: var(--ink); font-weight: 600; flex: none; }
 .term-ticket .ttl { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .term-ticket .repo { color: var(--ink-3); flex: none; }
+a.term-ticket { text-decoration: none; color: inherit; }
+a.term-ticket:hover .tk, a.term-ticket:hover .ttl { text-decoration: underline; }
 .term-bar.wide > * { flex: none; }
 .term-bar.wide > .term-ticket { flex: 0 1 auto; }
 .term-icons { display: flex; align-items: center; gap: 2px; }
