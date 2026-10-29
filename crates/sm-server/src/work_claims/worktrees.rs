@@ -1097,9 +1097,9 @@ fn count(n: usize, thing: &str) -> String {
 
 /// Condition 5: HEAD is a managed worktree's base (nothing was ever
 /// committed), the head of any merged PR sm knows in the repo (a squash
-/// merge whose branch is deleted), or reachable from a remote-tracking ref
-/// after a fetch (`fetched` is `None` when the repository is unconfirmed,
-/// which skips that). `Ok` is the removal reason, `Err` why it is kept.
+/// merge whose branch is deleted), reachable from a remote-tracking ref
+/// after a fetch, or a closed PR's head that origin still serves (`fetched`
+/// is `None` when the repository is unconfirmed, which skips both). `Ok` is the removal reason, `Err` why it is kept.
 fn safe_head(
     conn: &Connection,
     candidate: &Candidate,
@@ -1119,7 +1119,7 @@ fn safe_head(
         .iter()
         .map(|source| source.repo.as_str())
         .collect::<BTreeSet<_>>();
-    for repo in repos {
+    for repo in &repos {
         let merged = conn
             .query_row(
                 "SELECT number FROM work_items
@@ -1144,6 +1144,28 @@ fn safe_head(
     }
     if let Some(remote) = remote_ref_containing(common_dir, head) {
         return Ok(Ok(format!("pushed to {remote}")));
+    }
+    // A PR closed unmerged keeps its head at `refs/pull/<N>/head` after its
+    // branch is deleted (sm#2609); origin must still serve it there.
+    for repo in &repos {
+        let mut closed = conn.prepare_cached(
+            "SELECT number FROM work_items
+              WHERE repo = ?1 AND kind = 'pr' AND state = 'closed' AND head_sha = ?2
+              ORDER BY number",
+        )?;
+        let numbers = closed
+            .query_map(params![repo, head], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for number in numbers {
+            let pull = format!("refs/pull/{number}/head");
+            let served = git_in(common_dir, &["ls-remote", "origin", &pull]).is_ok_and(|out| {
+                out.lines()
+                    .any(|line| line.split_whitespace().next() == Some(head))
+            });
+            if served {
+                return Ok(Ok(format!("PR #{number} closed; GitHub keeps its commits")));
+            }
+        }
     }
     let local = git_in(
         common_dir,

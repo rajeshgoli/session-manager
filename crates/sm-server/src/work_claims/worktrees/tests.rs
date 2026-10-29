@@ -95,12 +95,16 @@ impl Repo {
     }
 
     fn merged_pr(&self, number: i64, head_ref: &str, head_sha: &str) {
+        self.pr(number, "merged", head_ref, head_sha);
+    }
+
+    fn pr(&self, number: i64, state: &str, head_ref: &str, head_sha: &str) {
         self.conn()
             .execute(
                 "INSERT INTO work_items (repo, number, kind, title, state, url, head_ref, head_sha,
                                          synced_at)
-                 VALUES (?1, ?2, 'pr', 'PR', 'merged', '', ?3, ?4, ?5)",
-                params![REPO, number, head_ref, head_sha, retired_at()],
+                 VALUES (?1, ?2, 'pr', 'PR', ?3, '', ?4, ?5, ?6)",
+                params![REPO, number, state, head_ref, head_sha, retired_at()],
             )
             .unwrap();
     }
@@ -292,6 +296,47 @@ fn kept_with_commits_only_on_this_mac_until_they_are_pushed() {
         vec![outcome(&path, true, "pushed to origin/5-feature")]
     );
     assert!(!Path::new(&path).exists());
+}
+
+#[test]
+fn removed_when_a_closed_prs_head_is_still_served_by_origin() {
+    let repo = Repo::new();
+    repo.origin();
+    let (path, head) = repo.worktree("wt", "5-feature");
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        5,
+        Some(&path),
+        Some("5-feature"),
+        Some(&head),
+    );
+    fs::write(Path::new(&path).join("new.txt"), "work").unwrap();
+    run_git(Path::new(&path), &["add", "new.txt"]);
+    run_git(Path::new(&path), &["commit", "-q", "-m", "work"]);
+    let tip = run_git(Path::new(&path), &["rev-parse", "HEAD"]);
+    repo.pr(7, "closed", "5-feature", &tip);
+    let sessions = [session("eng1", "/elsewhere", true)];
+    assert_eq!(
+        repo.pass(&sessions),
+        vec![outcome(&path, false, "1 commit only on this Mac")],
+        "a closed PR alone is not proof: origin must serve its head"
+    );
+    run_git(
+        Path::new(&path),
+        &["push", "-q", "origin", "HEAD:refs/pull/7/head"],
+    );
+    assert_eq!(
+        repo.recheck(&sessions),
+        vec![outcome(
+            &path,
+            true,
+            "PR #7 closed; GitHub keeps its commits"
+        )]
+    );
+    assert!(!Path::new(&path).exists());
+    assert!(!repo.branch_exists("5-feature"));
 }
 
 #[test]
