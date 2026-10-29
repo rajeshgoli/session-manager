@@ -63,8 +63,16 @@ merge.</p>
     docState: CONFIG.docState,
     // A posted review no agent received (sm#1580): offer Assign.
     undelivered: CONFIG.undeliveredReview || null,
-    assigned: ''
+    assigned: '',
+    // The newest review submission sm is still posting, or one that
+    // failed (sm#2554): head's review_submission.
+    sub: null,
+    sentUntil: 0,
+    // The web app's document bar reads the unseen count and calls Read
+    // (showChangedThreads) here (2543 F.9).
+    repliesUnseen: 0
   };
+  S.showChangedThreads = showChangedThreads;
   var coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
   var BLOCK = '[data-sm-line]';
   var INTERACTIVE = 'a,button,input,select,textarea,label,summary,video,audio,[contenteditable],[onclick],[role=button]';
@@ -91,10 +99,11 @@ merge.</p>
     (window.crypto || { getRandomValues: function (b) { for (var i = 0; i < b.length; i++) b[i] = Math.random() * 256; return b; } }).getRandomValues(bytes);
     return Array.prototype.map.call(bytes, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
   }
-  function api(method, suffix, body) {
+  function api(method, suffix, body, background) {
     var headers = { Accept: 'application/json' };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     if (CONFIG.token) headers['X-SM-Doc-Token'] = CONFIG.token;
+    if (background) headers['x-sm-bg'] = '1';
     return fetch((CONFIG.apiBase || '/docs/' + CONFIG.docId) + suffix, {
       method: method, headers: headers, credentials: 'same-origin',
       body: body === undefined ? undefined : JSON.stringify(body)
@@ -133,6 +142,7 @@ merge.</p>
     '.bar .t{min-width:0;flex:0 1 auto;font-weight:600;max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.bar a{color:#93c5fd;text-decoration:none}',
     '.bar select{background:#1f2937;color:#f9fafb;border:1px solid #374151;border-radius:4px;padding:2px 4px;max-width:46vw}',
+    '.bar .ok{color:#86efac}.bar .bad{color:#fca5a5}.bar .note{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.muted{color:#9ca3af}.ro{color:#fbbf24}.sp{flex:1}',
     'button{cursor:pointer;border:0;border-radius:6px;padding:6px 12px;background:#e5e7eb;color:#111827}',
     'button.p{background:#2563eb;color:#fff}button.d{background:#fee2e2;color:#991b1b}button:disabled{opacity:.5;cursor:default}',
@@ -150,6 +160,9 @@ merge.</p>
     '.row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;align-items:center}',
     '.item{border:1px solid #e5e7eb;border-radius:6px;padding:8px;display:flex;flex-direction:column;gap:4px}',
     '.err{color:#b91c1c}.ok{color:#15803d}h3{margin:0;font-weight:600;font-size:15px}',
+    '.tag{font-size:12px;font-weight:600;color:#9a6700;background:#fff8c5;border-radius:10px;padding:1px 8px;align-self:flex-start}.tag.r{color:#0550ae;background:#ddf4ff}',
+    '.b{white-space:pre-wrap;word-break:break-word}.item a{color:#1d4ed8}',
+    '.md strong,.md b,.md th{font-weight:600}.md em{font-style:italic}.md{word-break:break-word}.md p,.md ul,.md ol{margin:6px 0}.md ul,.md ol{padding-left:20px}.md table{border-collapse:collapse;display:block;overflow-x:auto}.md th,.md td{border:1px solid #e5e7eb;padding:3px 6px}',
     'label{display:flex;gap:6px;align-items:center}',
     // Touch: 16px text (no zoom on focus) and finger-sized controls.
     '.touch .sheet,.touch .sheet *{font-size:16px}',
@@ -180,6 +193,13 @@ merge.</p>
     layout();
   }
   function layout() {
+    // Inside the web app its document bar carries all of this (sm#2568).
+    if (framed) {
+      bar.hidden = pill.hidden = true;
+      document.documentElement.classList.remove('sm-doc-bar-open');
+      banner.style.top = '0px';
+      return;
+    }
     bar.hidden = collapsed;
     pill.hidden = !collapsed;
     // offsetHeight: the bar's size before the zoom compensation below.
@@ -236,8 +256,43 @@ merge.</p>
   }
 
   S.openReview = openReview;
+  // What the web app's document bar shows in place of this bar (sm#2568).
+  S.barState = barState;
+  S.dismissReview = dismissReview;
+  S.toggleHold = toggleHold;
+  S.resubmit = function () { if (S.sub) resubmit(S.sub); };
+  S.discardSubmission = function () { if (S.sub) discardSubmission(S.sub); };
+  function barState() {
+    var sub = S.sub, note = null;
+    if (sub && sub.status === 'failed') note = { kind: 'failed', text: 'Review not posted: ' + (sub.error || 'GitHub refused it') };
+    else if (Date.now() < S.sentUntil) note = { kind: 'sent', text: 'Review sent' };
+    else if (posting(sub) && Date.now() - Date.parse(sub.queued_at) > 60000) note = { kind: 'posting', text: 'Posting review…' };
+    return {
+      drafts: currentDrafts().length,
+      canReview: !MSG && (S.canComment || currentDrafts().length > 0),
+      reviewRequested: !MSG && S.docState === 'review_requested',
+      mergeHold: S.mergeHold ? { placed_by: S.mergeHold.placed_by, reason: S.mergeHold.reason || '' } : null,
+      prNumber: CONFIG.prNumber || null, prUrl: CONFIG.prUrl || null, prState: S.prState || null,
+      revisions: CONFIG.revisions || [],
+      note: note
+    };
+  }
+  function postBar() {
+    try { window.parent.postMessage({ type: 'sm-doc-bar', state: barState() }, location.origin); } catch (_) { /* parent gone */ }
+  }
+  function dismissReview() {
+    return api('POST', '/dismiss-review').then(function () { S.docState = 'read'; renderBar(); },
+      function (err) { alertBar(err.message); renderBar(); });
+  }
+  function toggleHold() {
+    return api(S.mergeHold ? 'DELETE' : 'POST', '/merge-hold', {}).then(function (res) {
+      if (res && res.error) throw new Error(res.error);
+      pollHead();
+    }).catch(function (err) { alertBar(err.message); if (err.status === 409) pollHead(); });
+  }
   function renderBar() {
     clear(bar);
+    if (framed) { layout(); postBar(); return; }
     if (MSG) {
       var ms = stateText();
       [el('span', { class: 't', title: CONFIG.title, text: CONFIG.title }),
@@ -270,11 +325,10 @@ merge.</p>
       CONFIG.prUrl ? el('a', { href: CONFIG.prUrl, target: '_blank', rel: 'noopener', text: 'PR #' + CONFIG.prNumber }) : null,
       el('span', { class: st[1] + ' state', text: st[0] + (S.mergeHold ? ' · ⏸' : ''), title: S.mergeHold ? 'merge hold by ' + S.mergeHold.placed_by : '' }),
       MSG ? null : agentChip(),
+      submissionNote(),
       el('span', { class: 'sp' }),
       S.docState === 'review_requested' ? el('button', { text: 'No review needed', onclick: function (e) {
-        var b = e.currentTarget; b.disabled = true;
-        api('POST', '/dismiss-review').then(function () { S.docState = 'read'; renderBar(); },
-          function (err) { b.disabled = false; alertBar(err.message); });
+        e.currentTarget.disabled = true; dismissReview();
       } }) : null,
       (S.canComment || n) ? el('button', { class: 'p', text: 'Review (' + n + ')', onclick: openReview }) : null,
       el('button', { title: 'Hide', text: '▴', onclick: function () { setCollapsed(true); } })
@@ -328,6 +382,71 @@ merge.</p>
     if (path.indexOf(agentPanel)<0 && !path.some(function (e) {return e.classList && e.classList.contains('agent');})) agentPanel.hidden=true;
   });
   document.addEventListener('keydown',function (event) {if (event.key==='Escape') agentPanel.hidden=true;});
+
+  // ---- review submission (sm#2554) ------------------------------------
+  // sm answers a submit as soon as it has saved the review, then posts it
+  // to GitHub in the background. The bar says "Review sent", and speaks
+  // again only if posting runs past a minute or fails.
+  function posting(sub) { return !!sub && (sub.status === 'queued' || sub.status === 'submitting'); }
+  function submissionNote() {
+    var sub = S.sub;
+    if (sub && sub.status === 'failed') {
+      var reason = 'Review not posted: ' + (sub.error || 'GitHub refused it');
+      return el('span', { class: 'note' }, [
+        el('span', { class: 'bad', title: reason, text: reason + ' · ' }),
+        el('a', { href: '#', text: 'Submit again', onclick: function (e) { e.preventDefault(); resubmit(sub); } }),
+        ' · ',
+        el('a', { href: '#', text: 'Discard', onclick: function (e) { e.preventDefault(); discardSubmission(sub); } })
+      ]);
+    }
+    if (Date.now() < S.sentUntil) return el('span', { class: 'ok note', text: 'Review sent' });
+    if (posting(sub) && Date.now() - Date.parse(sub.queued_at) > 60000) return el('span', { class: 'muted note', text: 'Posting review…' });
+    return null;
+  }
+  function reviewSent(res) {
+    S.docState = 'reviewed';
+    S.sub = res.status === 'posted' ? null : { submission_id: res.submission_id, status: res.status, queued_at: new Date().toISOString() };
+    if (res.status === 'posted' && res.delivered_to_session_id == null) { S.undelivered = { id: res.submission_id, url: res.github_review_url }; S.assigned = ''; renderBanner(); }
+    S.sentUntil = Date.now() + 4000;
+    setTimeout(renderBar, 4100);
+    renderBar();
+    pollHead();
+  }
+  var subTimer = null;
+  // Per submission id: posted already handled, failure already refreshed.
+  var subPosted = {};
+  var subFailed = {};
+  function trackSubmission(sub) {
+    var was = S.sub;
+    S.sub = sub || null;
+    if (sub && sub.status === 'posted') {
+      if (S.attempt && S.attempt.id === sub.submission_id) S.attempt = null;
+      if (!subPosted[sub.submission_id] && was && was.submission_id === sub.submission_id && sub.delivered_to_session_id == null) {
+        S.undelivered = { id: sub.submission_id, url: sub.github_review_url }; S.assigned = '';
+      }
+      subPosted[sub.submission_id] = 1;
+    }
+    // A failed review keeps its drafts on the server: show them again,
+    // once per failure (Submit again can fail anew).
+    if (sub && sub.status === 'failed' && !subFailed[sub.submission_id]) {
+      subFailed[sub.submission_id] = 1;
+      refreshDrafts().catch(function () {});
+    }
+    if (sub && sub.status !== 'failed') delete subFailed[sub.submission_id];
+    clearTimeout(subTimer);
+    if (posting(sub)) subTimer = setTimeout(pollHead, 3000);
+  }
+  function resubmit(sub) {
+    api('POST', '/review', { submission_id: sub.submission_id, sha: sub.commit_sha, verdict: sub.verdict, body: sub.body })
+      .then(reviewSent, function (err) { alertBar(err.message); });
+  }
+  function discardSubmission(sub) {
+    api('DELETE', '/review/' + sub.submission_id).then(function () {
+      S.sub = null;
+      renderBar();
+      return refreshDrafts();
+    }, function (err) { alertBar(err.message); });
+  }
 
   // ---- banners ---------------------------------------------------------
   var discardArmed = {};
@@ -383,6 +502,14 @@ merge.</p>
       } }));
       lines.push(parts);
     });
+    var changed = MSG ? [] : S.changedThreads;
+    var unseen = changed.length && store(repliesSeenKey()) !== '1' ? changed.length : 0;
+    noteReplies(unseen);
+    // Inside the web app the document bar carries this note (2543 F.9).
+    if (unseen && !framed) {
+      lines.push([el('span', { text: 'The agent replied to ' + changed.length + ' comment' + (changed.length === 1 ? '' : 's') + ' on passages it has since changed.' }),
+        el('button', { class: 'lk', text: 'Read', onclick: showChangedThreads })]);
+    }
     lines.forEach(function (parts) { var row = el('div', {}, parts); row.style.cssText = 'display:flex;gap:6px 12px;flex-wrap:wrap;width:100%'; banner.appendChild(row); });
     banner.hidden = !lines.length;
     layout();
@@ -390,12 +517,13 @@ merge.</p>
 
   function pollHead() {
     if (MSG || document.visibilityState === 'hidden') return;
-    api('GET', '/head?sha=' + CONFIG.sha).then(function (head) {
+    api('GET', '/head?sha=' + CONFIG.sha, undefined, true).then(function (head) {
       S.head = head;
       if (head.pr_number) {CONFIG.prNumber = head.pr_number; CONFIG.prUrl = head.pr_url;}
       if (head.revisions) CONFIG.revisions = head.revisions;
       if (head.pr_state === 'open') S.reopenTarget = null;
       S.agent = head.agent || null; S.mergeHold = head.merge_hold || null;
+      trackSubmission(head.review_submission);
       if (!agentPanel.hidden) renderAgentPanel();
       if (head.pr_state) {
         S.prState = head.pr_state;
@@ -425,7 +553,10 @@ merge.</p>
     '.row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;align-items:center}',
     'button{cursor:pointer;border:1px solid #d0d7de;border-radius:6px;padding:' + (coarse ? '9px 16px' : '5px 12px') + ';background:#f6f8fa;color:#1f2328}',
     'button.p{background:#1f883d;border-color:#1f883d;color:#fff}button.d{color:#cf222e}button:disabled{opacity:.5}',
-    '.err{color:#cf222e}.m{color:#59636e;font-size:13px}'
+    '.err{color:#cf222e}.m{color:#59636e;font-size:13px}',
+    '.tag.r{color:#0550ae;background:#ddf4ff}.card.r{border-left-color:#8250df}a{color:#0969da}',
+    '.md strong,.md b,.md th{font-weight:600}.md em{font-style:italic}.md{word-break:break-word}.md>:first-child{margin-top:0}.md>:last-child{margin-bottom:0}.md p,.md ul,.md ol{margin:6px 0}.md ul,.md ol{padding-left:20px}',
+    '.md table{border-collapse:collapse;display:block;overflow-x:auto}.md th,.md td{border:1px solid #d0d7de;padding:3px 6px;font-size:13px}.md code{font-family:ui-monospace,Menlo,monospace;font-size:12px;background:#f6f8fa;padding:0 3px;border-radius:4px}'
   ].join('\n');
   function blocksFor(line) { return document.querySelectorAll('[data-sm-line="' + line + '"]'); }
   function blockForDraft(d) {
@@ -503,6 +634,79 @@ merge.</p>
         ]));
       });
     });
+  }
+
+  // ---- agent replies to the last review (sm#2305) -----------------------
+  // A reply sits open under the passage it answers while that passage is
+  // still in the doc word for word: the agent answered in words, not in the
+  // doc. Replies on passages that changed are counted in the banner instead.
+  S.threads = [];
+  S.changedThreads = [];
+  S.threadsReview = null;
+  function repliesSeenKey() {
+    // Every reply's id, so a later reply brings the banner back.
+    var ids = [];
+    S.changedThreads.forEach(function (t) { t.replies.forEach(function (r) { ids.push((r.url || '').replace(/^.*\D/, '')); }); });
+    return 'sm-doc-replies-seen:' + CONFIG.docId + ':' + sha7(S.threadsReview && S.threadsReview.commit_sha) + ':' + ids.join(',');
+  }
+  // The innermost block holding the whole quote; a quote spanning blocks
+  // falls back to the block where its start is.
+  function blockForQuote(quote) {
+    var blocks = document.querySelectorAll(BLOCK);
+    var i;
+    for (i = blocks.length - 1; i >= 0; i--) if (collapse(blocks[i].textContent).indexOf(quote) >= 0) return blocks[i];
+    var probe = quote.slice(0, 40);
+    for (i = blocks.length - 1; i >= 0; i--) if (collapse(blocks[i].textContent).indexOf(probe) >= 0) return blocks[i];
+    return null;
+  }
+  function threadParts(t) {
+    var parts = [el('span', { class: 'tag', text: 'You commented' }), el('div', { class: 'b', text: t.comment })];
+    t.replies.forEach(function (r) {
+      // `html` is the server's sanitized Markdown rendering of the reply.
+      var body = el('div', { class: 'md' });
+      if (r.html) body.innerHTML = r.html; else body.textContent = r.body;
+      parts.push(el('span', { class: 'tag r', text: 'Agent replied' }), body);
+    });
+    var last = t.replies[t.replies.length - 1];
+    parts.push(el('div', { class: 'row' }, [el('a', { href: (last && last.url) || t.url, target: '_blank', rel: 'noopener', text: 'Open on GitHub' })]));
+    return parts;
+  }
+  function renderThreads() {
+    removeBubbles('thread');
+    var text = collapse(document.body ? document.body.textContent : '');
+    S.changedThreads = S.threads.filter(function (t) {
+      var quote = collapse(t.quote);
+      var block = quote && text.indexOf(quote) >= 0 ? blockForQuote(quote) : null;
+      if (block) bubble(block, 'thread').root.appendChild(el('div', { class: 'card r' }, threadParts(t)));
+      return !block;
+    });
+    renderBanner();
+  }
+  function noteReplies(count) {
+    if (S.repliesUnseen === count) return;
+    S.repliesUnseen = count;
+    if (framed) {
+      try { window.parent.postMessage({ type: 'sm-doc-replies', count: count }, location.origin); } catch (_) { /* parent gone */ }
+    }
+  }
+  function showChangedThreads() {
+    clear(sheet);
+    sheet.appendChild(el('h3', { text: 'Replies on passages since changed' }));
+    S.changedThreads.forEach(function (t) {
+      sheet.appendChild(el('div', { class: 'item' }, [t.quote ? el('div', { class: 'q', text: t.quote }) : null].concat(threadParts(t))));
+    });
+    sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
+    sheet.hidden = false;
+    store(repliesSeenKey(), '1');
+    renderBanner();
+  }
+  function loadThreads() {
+    if (MSG) return;
+    api('GET', '/review-replies').then(function (res) {
+      S.threads = (res && res.threads) || [];
+      S.threadsReview = (res && res.review) || null;
+      renderThreads();
+    }).catch(function () { /* offline or GitHub down: show none */ });
   }
 
   // ---- selecting what to comment on -------------------------------------
@@ -742,14 +946,10 @@ merge.</p>
         return api('POST', '/review', { submission_id: S.attempt.id, sha: CONFIG.sha, verdict: S.attempt.verdict, body: S.attempt.body, hold: !!S.attempt.hold })
           .then(function (res) {
             S.attempt = null;
-            S.docState = 'reviewed'; pollHead();
-            if (res.delivered_to_session_id == null) { S.undelivered = { id: res.submission_id, url: res.github_review_url }; S.assigned = ''; renderBanner(); }
             S.drafts = S.drafts.filter(function (d) { return d.commit_sha !== CONFIG.sha; });
-            markers(); renderBar();
-            clear(sheet);
-            sheet.appendChild(el('h3', { class: 'ok', text: 'Review posted' }));
-            sheet.appendChild(el('a', { href: res.github_review_url, target: '_blank', rel: 'noopener', text: 'Open it on GitHub' }));
-            sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
+            markers();
+            closeSheet();
+            reviewSent(res);
           });
       }).catch(function (err) {
         // Another device's submission of this revision takes over: resume
@@ -891,8 +1091,9 @@ merge.</p>
   renderBanner();
   markers();
   pollHead();
+  loadThreads();
   setInterval(pollHead, 60000);
   document.addEventListener('visibilitychange', pollHead);
 })
-({"agent":{"context_percent":11.2,"name":"lead","session_id":"a0000001","state":"idle","task_completed_at":"2026-10-07T21:12:45.887334Z","turns":0,"via":"author"},"authorAgent":"lead","canComment":true,"docId":"d0c5e7a1","docState":"reviewed","drafts":[],"latestSha":"a57276c57eb6a2832e9399bf8a6e99d2bc83e68a","mergeHold":null,"name":"shop/docs/checkout_v2_plan.html","prNumber":null,"prState":null,"prUrl":null,"revisions":[{"blobSha":"83fa8b61d7bf8e8c5c9c0ec74ea5ca76c9088a24","path":"/docs/shop/docs/checkout_v2_plan.html?version=a57276c57eb6","prNumber":null,"publishedAt":"2026-10-07T21:07:53Z","reviewRequested":true,"sha":"a57276c57eb6a2832e9399bf8a6e99d2bc83e68a"},{"blobSha":"5036f3c2d26f4bd5845e501d797c57291ccf002e","path":"/docs/shop/docs/checkout_v2_plan.html?version=610cc95b3c72","prNumber":null,"publishedAt":"2026-10-07T21:03:25Z","reviewRequested":true,"sha":"610cc95b3c7298aa7f76f34202e0bb047e458a4b"}],"sha":"610cc95b3c7298aa7f76f34202e0bb047e458a4b","title":"Checkout v2 plan","token":null,"undeliveredReview":null,"unfinishedReview":null});</script><script defer src="/assets/reader-bar.js?v=eb5e9759665a"></script></body>
+({"agent":{"context_percent":11.2,"name":"lead","session_id":"a0000001","state":"idle","task_completed_at":"2026-10-29T00:30:24.975792Z","turns":0,"via":"author"},"authorAgent":"lead","authorSessionId":"a0000001","canComment":true,"docId":"d0c5e7a1","docState":"reviewed","drafts":[],"latestSha":"a57276c57eb6a2832e9399bf8a6e99d2bc83e68a","mergeHold":null,"name":"shop/docs/checkout_v2_plan.html","prNumber":null,"prState":null,"prUrl":null,"revisions":[{"blobSha":"83fa8b61d7bf8e8c5c9c0ec74ea5ca76c9088a24","path":"/docs/shop/docs/checkout_v2_plan.html?version=a57276c57eb6","prNumber":null,"publishedAt":"2026-10-29T00:25:24Z","reviewRequested":true,"sha":"a57276c57eb6a2832e9399bf8a6e99d2bc83e68a"},{"blobSha":"5036f3c2d26f4bd5845e501d797c57291ccf002e","path":"/docs/shop/docs/checkout_v2_plan.html?version=610cc95b3c72","prNumber":null,"publishedAt":"2026-10-29T00:21:04Z","reviewRequested":true,"sha":"610cc95b3c7298aa7f76f34202e0bb047e458a4b"}],"sha":"610cc95b3c7298aa7f76f34202e0bb047e458a4b","title":"Checkout v2 plan","token":null,"undeliveredReview":null,"unfinishedReview":null});</script><script defer src="/assets/reader-bar.js?v=975fd8e96510"></script></body>
 </html>
