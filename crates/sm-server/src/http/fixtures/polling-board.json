@@ -5,6 +5,7 @@
     {
       "added_at": "2100-01-01T00:00:00Z",
       "added_by_name": "Fixture",
+      "autopm": false,
       "changes": [],
       "counts": {
         "blocked": 0,
