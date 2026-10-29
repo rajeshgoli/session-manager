@@ -669,6 +669,7 @@ pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
     // Waits end before Check C reads the feed, so an ended wait no longer
     // shields its seat in this pass.
     notified.extend(store.run_wait_endings(&answered, &sessions, now)?);
+    notified.extend(run_check_d(state, &store, &sessions, now));
     notified.extend(store.run_check_c(
         &answered,
         &idle_sessions(state)?,
@@ -681,6 +682,96 @@ pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
     deliver_claim_notices(state, &notified);
     worktrees::run_cleanup_pass(state)?;
     Ok(())
+}
+
+/// Check D (#2605): each PR that merged recently is read once from GitHub.
+/// Open P0/P1 findings go to the sessions whose claim ended with the merge,
+/// or to the owner when none of them is live. A PR whose read fails is
+/// retried next pass. Returns the sessions sent a message.
+fn run_check_d(
+    state: &AppState,
+    store: &WorkClaimStore,
+    sessions: &SessionDirectory,
+    now: time::OffsetDateTime,
+) -> Vec<String> {
+    let Some(source) = state.review_findings_source.as_ref() else {
+        return Vec::new();
+    };
+    let due = match store.merged_prs_due_findings_check(now) {
+        Ok(due) => due,
+        Err(error) => {
+            eprintln!("merge findings check failed: {error:#}");
+            return Vec::new();
+        }
+    };
+    let mut notified = Vec::new();
+    for (repo, pr) in due {
+        let result = (|| -> anyhow::Result<Vec<String>> {
+            let found = source
+                .findings(&repo, pr)
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let text = crate::work_claims::merge_findings::findings_check_text(pr, &found.open);
+            let holders = if found.open.is_empty() {
+                Vec::new()
+            } else {
+                store.merged_pr_holders(&repo, pr, sessions)?
+            };
+            if !found.open.is_empty() && holders.is_empty() {
+                notify_owner_of_merged_findings(state, &repo, pr, &found)?;
+            }
+            store.record_findings_check(&repo, pr, &found.open, &text, &holders, now)
+        })();
+        match result {
+            Ok(sent) => notified.extend(sent),
+            Err(error) => eprintln!("merge findings check of {repo}#{pr} failed: {error:#}"),
+        }
+    }
+    notified
+}
+
+/// The owner's copy of Check D when no holder is live; keyed, so a retry
+/// after a failed record does not send it twice.
+fn notify_owner_of_merged_findings(
+    state: &AppState,
+    repo: &str,
+    pr: i64,
+    found: &crate::review::findings::PrFindings,
+) -> anyhow::Result<()> {
+    use crate::owner_messages::{CreateOwnerMessage, NewOwnerMessage};
+    let mut body = format!(
+        "[PR #{pr}]({}) in {repo} merged with {} P0/P1 review finding{} nobody answered, and \
+         the agent that held it is gone.\n",
+        found.url,
+        found.open.len(),
+        if found.open.len() == 1 { "" } else { "s" }
+    );
+    for finding in &found.open {
+        body.push_str(&format!(
+            "\n- [{}]({})",
+            crate::review::findings::finding_line(finding),
+            finding.url
+        ));
+    }
+    let result = messages::owner_message_store(state).create_once(
+        NewOwnerMessage {
+            human: state.config.owner_name.clone(),
+            sender_session_id: "sm".into(),
+            sender_session_name: "Session Manager".into(),
+            title: format!("PR #{pr} merged with unanswered review findings"),
+            body_markdown: body,
+            blocking: false,
+            blocked: false,
+        },
+        Some(&format!("merge-findings:{repo}#{pr}")),
+    )?;
+    match result {
+        CreateOwnerMessage::Created(message) => {
+            follows::notice_new_message(state, &message);
+            Ok(())
+        }
+        // Retried next pass, while the merge is inside the check window.
+        CreateOwnerMessage::UnreadCapReached => anyhow::bail!("owner unread message cap reached"),
+    }
 }
 
 /// Schema at startup, then (live server only) the sync loop.

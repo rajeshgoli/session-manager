@@ -143,7 +143,7 @@ enum Command {
     Ticket(claims::TicketArgs),
     /// Place, release, or list PR merge holds
     MergeHold(merge_holds::MergeHoldArgs),
-    /// Claim the PR you work on; no number uses the current branch's PR
+    /// Claim the PR you work on (no number: the current branch's PR); list its findings; merge it
     Pr(claims::PrArgs),
     /// Keep, list or delete worktrees of retired agents
     Worktree(claims::worktree::WorktreeArgs),

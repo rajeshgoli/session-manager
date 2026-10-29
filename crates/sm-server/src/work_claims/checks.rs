@@ -5,6 +5,8 @@
 //! - Check A: a PR merged while a linked ticket is still open.
 //! - Check B: at `sm task-complete`, the agent holds open work.
 //! - Check C: idle for `idle_nudge_minutes` with nothing pending.
+//! - Check D (`merge_findings`): a PR merged with P0/P1 review findings
+//!   nobody answered.
 //!
 //! Every message is an `important` queue message in the `work_claim`
 //! category and writes a `claim.nudge` event on each item it names. What the
@@ -472,7 +474,7 @@ fn nudge(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn nudge_event(
+pub(super) fn nudge_event(
     conn: &Connection,
     check: &str,
     session_id: Option<&str>,

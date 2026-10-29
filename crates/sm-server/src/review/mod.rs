@@ -4,6 +4,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::{Component, Path};
 
+pub mod findings;
 pub mod paired;
 pub mod policy;
 

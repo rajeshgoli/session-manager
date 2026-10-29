@@ -1,0 +1,196 @@
+{
+ "data": {
+  "repository": {
+   "pullRequest": {
+    "author": {
+     "login": "owner"
+    },
+    "state": "MERGED",
+    "mergedAt": "2026-10-28T17:16:00Z",
+    "url": "https://github.com/acme/widgets/pull/7",
+    "comments": {
+     "nodes": [
+      {
+       "author": {
+        "login": "owner"
+       },
+       "body": "@codex review",
+       "createdAt": "2026-10-28T16:34:06Z"
+      },
+      {
+       "author": {
+        "login": "owner"
+       },
+       "body": "@codex review",
+       "createdAt": "2026-10-28T16:53:16Z"
+      },
+      {
+       "author": {
+        "login": "owner"
+       },
+       "body": "**Review of bbbb222 \u2014 one P1, valid. Fixed in cccc3333.**\n\nDetails.",
+       "createdAt": "2026-10-28T17:01:36Z"
+      },
+      {
+       "author": {
+        "login": "owner"
+       },
+       "body": "@codex review",
+       "createdAt": "2026-10-28T17:01:40Z"
+      },
+      {
+       "author": {
+        "login": "owner"
+       },
+       "body": "**Review of cccc333 \u2014 one P1 raised; I classify it invalid as a P1 for this PR.**",
+       "createdAt": "2026-10-28T17:05:47Z"
+      },
+      {
+       "author": {
+        "login": "owner"
+       },
+       "body": "**Smoke run passed.**",
+       "createdAt": "2026-10-28T18:40:07Z"
+      }
+     ]
+    },
+    "reviews": {
+     "nodes": [
+      {
+       "databaseId": 101,
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "body": "<!-- codex-review-receipt:v1 -->\n\n### Codex Review\n\n**Reviewed commit:** `aaaa111100`",
+       "url": "https://github.com/acme/widgets/pull/7#pullrequestreview-101",
+       "submittedAt": "2026-10-28T16:40:01Z",
+       "commit": {
+        "oid": "aaaa111100000000000000000000000000000000"
+       }
+      },
+      {
+       "databaseId": 102,
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "body": "<!-- codex-review-receipt:v1 -->\n\n### Codex Review\n\n**Reviewed commit:** `bbbb222200`",
+       "url": "https://github.com/acme/widgets/pull/7#pullrequestreview-102",
+       "submittedAt": "2026-10-28T16:57:11Z",
+       "commit": {
+        "oid": "bbbb222200000000000000000000000000000000"
+       }
+      },
+      {
+       "databaseId": 103,
+       "author": {
+        "login": "chatgpt-codex-connector"
+       },
+       "body": "<!-- codex-review-receipt:v1 -->\n\n### Codex Review\n\n**Reviewed commit:** `cccc333300`",
+       "url": "https://github.com/acme/widgets/pull/7#pullrequestreview-103",
+       "submittedAt": "2026-10-28T17:04:39Z",
+       "commit": {
+        "oid": "cccc333300000000000000000000000000000000"
+       }
+      }
+     ]
+    },
+    "reviewThreads": {
+     "pageInfo": {
+      "hasNextPage": false,
+      "endCursor": null
+     },
+     "nodes": [
+      {
+       "isResolved": false,
+       "path": "src/store/reader.py",
+       "line": 683,
+       "originalLine": 683,
+       "comments": {
+        "nodes": [
+         {
+          "databaseId": 1001,
+          "author": {
+           "login": "chatgpt-codex-connector"
+          },
+          "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Never-filled orders are read as filled**\n\nExplanation of the defect.",
+          "url": "https://github.com/acme/widgets/pull/7#discussion_r1001",
+          "createdAt": "2026-10-28T16:40:01Z",
+          "originalCommit": {
+           "oid": "aaaa111100000000000000000000000000000000"
+          }
+         }
+        ]
+       }
+      },
+      {
+       "isResolved": false,
+       "path": "scripts/run.py",
+       "line": 194,
+       "originalLine": 194,
+       "comments": {
+        "nodes": [
+         {
+          "databaseId": 1002,
+          "author": {
+           "login": "chatgpt-codex-connector"
+          },
+          "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Keep the alignment check for live runs**\n\nExplanation of the defect.",
+          "url": "https://github.com/acme/widgets/pull/7#discussion_r1002",
+          "createdAt": "2026-10-28T16:40:01Z",
+          "originalCommit": {
+           "oid": "aaaa111100000000000000000000000000000000"
+          }
+         }
+        ]
+       }
+      },
+      {
+       "isResolved": false,
+       "path": "src/store/reader.py",
+       "line": null,
+       "originalLine": 120,
+       "comments": {
+        "nodes": [
+         {
+          "databaseId": 1003,
+          "author": {
+           "login": "chatgpt-codex-connector"
+          },
+          "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Keep each leg's ladder independent of the cut**\n\nExplanation of the defect.",
+          "url": "https://github.com/acme/widgets/pull/7#discussion_r1003",
+          "createdAt": "2026-10-28T16:57:11Z",
+          "originalCommit": {
+           "oid": "bbbb222200000000000000000000000000000000"
+          }
+         }
+        ]
+       }
+      },
+      {
+       "isResolved": false,
+       "path": "scripts/run.py",
+       "line": 1437,
+       "originalLine": 1437,
+       "comments": {
+        "nodes": [
+         {
+          "databaseId": 1004,
+          "author": {
+           "login": "chatgpt-codex-connector"
+          },
+          "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Update the verdict readers for the new identity**\n\nExplanation of the defect.",
+          "url": "https://github.com/acme/widgets/pull/7#discussion_r1004",
+          "createdAt": "2026-10-28T17:04:40Z",
+          "originalCommit": {
+           "oid": "cccc333300000000000000000000000000000000"
+          }
+         }
+        ]
+       }
+      }
+     ]
+    }
+   }
+  }
+ }
+}

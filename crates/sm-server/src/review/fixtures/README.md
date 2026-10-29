@@ -1,1 +1,3 @@
 Provider outputs recorded on 30 September 2026 from temporary PR #1802, request 8495b6c48bb2. The Codex file retains its completed review item; the Claude file retains its result type, error flag and structured output. Checkout paths are normalized to `/fixture/checkout`. No prompts, credentials or usage records are included.
+
+`pr_findings_timeline.json` is a synthetic `findings::PR_QUERY` response (#2605) with the timeline of the PR that motivated it: review requested at commit `aaaa111`, two P1s posted on it after the author had pushed `bbbb222`, and later rounds on `bbbb222` and `cccc333` triaged in PR comments naming those commits. Its text, paths and ids are invented.

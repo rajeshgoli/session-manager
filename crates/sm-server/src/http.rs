@@ -714,6 +714,8 @@ pub struct AppState {
     owner_answered_at: Arc<Mutex<BTreeMap<String, std::time::Instant>>>,
     /// Ticket and PR state for work claims (sm#1452).
     work_item_source: Arc<dyn crate::work_claims::WorkItemSource>,
+    /// Check D's findings reader; `None` (no agent runtime) skips Check D.
+    review_findings_source: Option<Arc<dyn crate::review::findings::FindingsSource>>,
     merge_hold_source: Arc<dyn crate::work_claims::merge_holds::MergeHoldSource>,
     /// GitHub for the board (sm#1665).
     board_source: Arc<dyn crate::board::sync::BoardSource>,
@@ -948,6 +950,10 @@ impl AppState {
         } else {
             None
         };
+        let review_findings_source = config.rust_core.runtime_enabled.then(|| {
+            Arc::new(crate::review::findings::GhFindingsSource)
+                as Arc<dyn crate::review::findings::FindingsSource>
+        });
         let state = Self {
             managed_artifacts,
             #[cfg(target_os = "macos")]
@@ -975,6 +981,7 @@ impl AppState {
             owner_message_lock: Arc::new(AsyncMutex::new(())),
             owner_answered_at: Arc::new(Mutex::new(BTreeMap::new())),
             work_item_source: Arc::new(claims::GhCliWorkItemSource),
+            review_findings_source,
             merge_hold_source: Arc::new(merge_holds::GhMergeHoldSource),
             board_source: Arc::new(board::GhCliBoardSource),
             board_lock: Arc::new(Mutex::new(())),
@@ -1128,6 +1135,14 @@ impl AppState {
         source: Arc<dyn crate::work_claims::WorkItemSource>,
     ) -> Self {
         self.work_item_source = source;
+        self
+    }
+
+    pub fn with_review_findings_source(
+        mut self,
+        source: Arc<dyn crate::review::findings::FindingsSource>,
+    ) -> Self {
+        self.review_findings_source = Some(source);
         self
     }
 
