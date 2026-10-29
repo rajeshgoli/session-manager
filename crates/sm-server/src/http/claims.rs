@@ -671,11 +671,25 @@ pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
     let jobs = super::agent_waits::ended_jobs(state, &store.open_waits()?);
     notified.extend(store.run_wait_endings(&answered, &jobs, &sessions, now)?);
     notified.extend(run_check_d(state, &store, &sessions, now));
+    let idle = idle_sessions(state)?;
     notified.extend(store.run_check_c(
         &answered,
-        &idle_sessions(state)?,
+        &idle,
         &sessions,
         state.config.work_claims.idle_nudge(),
+        now,
+    )?);
+    // The board shows an owner-pinned note in place of Stalled (sm#1851).
+    let noted: BTreeSet<String> =
+        crate::agent_notes::AgentNoteStore::new(expand_home(&state.config.sm_send.db_path))
+            .all()?
+            .into_keys()
+            .collect();
+    notified.extend(store.run_check_e(
+        &idle,
+        &noted,
+        &sessions,
+        std::time::Duration::from_secs(u64::from(state.config.board.stall_minutes) * 60),
         now,
     )?);
     notified.sort();
