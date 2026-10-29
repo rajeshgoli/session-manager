@@ -452,21 +452,19 @@ fn sm2611_a_queue_job_wait_ends_when_the_job_ends() {
         .unwrap()
         .is_empty());
     assert_eq!(store.deliver_waits(TARGET, WAITER, at(11)).unwrap(), 0);
-    // It ended; the queue already woke the waiter, so only holder01 hears.
+    // It ended: both waiters hear, whether or not the queue woke one.
     let ended = BTreeMap::from([(
         "job_071682aa6be6".to_owned(),
         EndedJob {
             text: "2611-check (job_071682aa6be6) succeeded".into(),
-            woken: Some(WAITER.into()),
         },
     )]);
-    assert_eq!(
-        store
-            .run_wait_endings(&answered(&[]), &ended, &dir, at(20))
-            .unwrap(),
-        ["holder01"]
-    );
-    assert!(queued(&db, WAITER).is_empty());
+    let mut notified = store
+        .run_wait_endings(&answered(&[]), &ended, &dir, at(20))
+        .unwrap();
+    notified.sort();
+    assert_eq!(notified, [WAITER, "holder01"]);
+    assert_eq!(queued(&db, WAITER).len(), 1);
     assert_eq!(
         queued(&db, "holder01"),
         ["[sm await] Queue job 2611-check (job_071682aa6be6) succeeded. Your wait on it for \"proof run\" ended."]

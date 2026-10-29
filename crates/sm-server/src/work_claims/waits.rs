@@ -218,9 +218,6 @@ fn target_name(sessions: &SessionDirectory, wait: &AgentWait) -> String {
 pub struct EndedJob {
     /// `2611-check (job_071682aa6be6) succeeded`, or `job_x was not found`.
     pub text: String,
-    /// The job's notify target, which the queue already woke with the
-    /// result; its wait ends without a second message.
-    pub woken: Option<String>,
 }
 
 impl WorkClaimStore {
@@ -425,7 +422,7 @@ impl WorkClaimStore {
     /// (`answered`, as for Check A) or whose cached state is already closed,
     /// whose seat retired, whose queue job ended (`jobs`), or whose ETA
     /// passed, in that order of precedence; all but the first message the
-    /// waiter, except a job's end to the session the queue already woke.
+    /// waiter.
     /// Returns the sessions sent a message.
     pub fn run_wait_endings(
         &self,
@@ -476,14 +473,16 @@ impl WorkClaimStore {
                         seat_label(sessions, &seat)
                     ),
                 )),
+                // Every waiter is told: not every job's end wakes its
+                // notify target (a shell job that ends normally does not).
                 WaitTarget::Job(id) => jobs.get(&id).map(|job| {
-                    let text = (job.woken.as_deref() != Some(&wait.waiter_session_id)).then(|| {
+                    (
+                        WaitEnd::JobEnded,
                         format!(
                             "[sm await] Queue job {}. Your wait on it for \"{deliverable}\" ended.",
                             job.text
-                        )
-                    });
-                    (WaitEnd::JobEnded, text.unwrap_or_default())
+                        ),
+                    )
                 }),
                 _ => None,
             };
@@ -500,10 +499,6 @@ impl WorkClaimStore {
             let Some((reason, text)) = ending else {
                 continue;
             };
-            if text.is_empty() {
-                end_wait(&tx, &wait, reason, None, &stamp)?;
-                continue;
-            }
             let message_id = crate::queue::enqueue_important_in_conn(
                 &tx,
                 &wait.waiter_session_id,
