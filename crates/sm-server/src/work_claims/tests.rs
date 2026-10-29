@@ -905,6 +905,60 @@ fn closing_ref_links_follow_the_body_and_claim_links_survive() {
 }
 
 #[test]
+fn closing_ref_notes_follow_github_propagation_and_incomplete_fetches() {
+    let (store, _) = new_store();
+    let dir = directory();
+    claim_ticket(&store, "eng1", &dir);
+    let request = request(WorkKind::Pr, 9, "eng1", &dir);
+    let ClaimOutcome::Claimed { notes, .. } = claim_pr(&store, &request, &[(9, pr("open", &[]))])
+    else {
+        panic!()
+    };
+    assert!(notes[0].contains("may still be updating"));
+
+    // Re-running sm pr after GitHub catches up clears the note.
+    let ClaimOutcome::AlreadyHeld { notes, .. } =
+        claim_pr(&store, &request, &[(9, pr("open", &[1]))])
+    else {
+        panic!()
+    };
+    assert!(notes.is_empty(), "{notes:?}");
+
+    // An incomplete response must not use retained links as current evidence.
+    let mut incomplete = pr("open", &[]);
+    if let ItemFetch::Found(item) = &mut incomplete {
+        item.closing_refs = None;
+    }
+    let ClaimOutcome::AlreadyHeld { notes, .. } = claim_pr(&store, &request, &[(9, incomplete)])
+    else {
+        panic!()
+    };
+    assert_eq!(notes, vec!["Note: Could not verify whether PR #9 closes ticket #1: GitHub's closing-reference data is unavailable or incomplete."]);
+    assert!(store
+        .links_for_pr(REPO, 9)
+        .unwrap()
+        .contains(&(1, "closing_ref".to_owned())));
+}
+
+#[test]
+fn missing_closing_reference_data_is_not_an_empty_set() {
+    let mut node = json!({
+        "__typename": "PullRequest", "state": "OPEN",
+        "closingIssuesReferences": {
+            "nodes": [], "pageInfo": {"hasNextPage": false}
+        }
+    });
+    assert_eq!(parse_item(&node).unwrap().closing_refs, Some(vec![]));
+    node["closingIssuesReferences"]["nodes"] = Value::Null;
+    assert_eq!(parse_item(&node).unwrap().closing_refs, None);
+    node["closingIssuesReferences"]["nodes"] = json!([]);
+    node["closingIssuesReferences"]["pageInfo"] = json!({"hasNextPage": true});
+    assert_eq!(parse_item(&node).unwrap().closing_refs, None);
+    node["closingIssuesReferences"] = Value::Null;
+    assert_eq!(parse_item(&node).unwrap().closing_refs, None);
+}
+
+#[test]
 fn pr_claims_link_held_tickets_and_note_missing_closing_refs() {
     let (store, _) = new_store();
     let dir = directory();
@@ -919,7 +973,7 @@ fn pr_claims_link_held_tickets_and_note_missing_closing_refs() {
     };
     assert_eq!(
         notes,
-        vec!["Note: PR #9's closing references don't include ticket #1."]
+        vec!["Note: GitHub has not yet confirmed that PR #9 closes ticket #1. Check that the PR body contains `Closes #1`; GitHub's closing-reference data may still be updating."]
     );
     assert_eq!(
         store.links_for_pr(REPO, 9).unwrap(),

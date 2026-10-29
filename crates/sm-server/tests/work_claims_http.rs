@@ -785,7 +785,7 @@ async fn the_sync_pass_runs_check_a_after_a_merge_without_closes() {
     let (_, body) = claim(&f, "eng00001", "pr", 9, json!({})).await;
     assert_eq!(
         body["notes"],
-        json!(["Note: PR #9's closing references don't include ticket #1."])
+        json!(["Note: GitHub has not yet confirmed that PR #9 closes ticket #1. Check that the PR body contains `Closes #1`; GitHub's closing-reference data may still be updating."])
     );
     f.items.merge(9, 3);
     f.state.run_work_claims_sync_pass().unwrap();

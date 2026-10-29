@@ -563,8 +563,19 @@ fn parse_item(node: &Value) -> Option<GhItem> {
         _ => return None,
     };
     let state = node["state"].as_str()?.to_ascii_lowercase();
-    let closing_refs =
-        (kind == WorkKind::Pr).then(|| parse_ref_nodes(&node["closingIssuesReferences"]["nodes"]));
+    let refs = &node["closingIssuesReferences"];
+    let page_available = match refs["pageInfo"]["hasNextPage"].as_bool() {
+        Some(false) => true,
+        Some(true) => refs["pageInfo"]["endCursor"].is_string(),
+        None => false,
+    };
+    let closing_refs = (kind == WorkKind::Pr && page_available)
+        .then(|| {
+            refs["nodes"]
+                .as_array()
+                .map(|_| parse_ref_nodes(&refs["nodes"]))
+        })
+        .flatten();
     Some(GhItem {
         is_draft: node["isDraft"].as_bool().unwrap_or(false),
         kind,
@@ -1255,7 +1266,11 @@ impl WorkClaimStore {
                 return Ok(rejected(detail));
             }
         }
-        let result = apply_claim_rules(&tx, request, sessions)?;
+        let closing_refs_available = matches!(
+            batch.get(&request.number),
+            Some(ItemFetch::Found(item)) if item.closing_refs.is_some()
+        );
+        let result = apply_claim_rules(&tx, request, sessions, closing_refs_available)?;
         tx.commit()?;
         Ok(result)
     }
@@ -1872,6 +1887,7 @@ fn apply_claim_rules(
     conn: &Connection,
     request: &ClaimRequest,
     sessions: &SessionDirectory,
+    closing_refs_available: bool,
 ) -> Result<ClaimResult> {
     let now = now_rfc3339();
     let claimant = &request.claimant;
@@ -1924,7 +1940,12 @@ fn apply_claim_rules(
                     notes.push(format!("Linked PR #{number} to ticket #{ticket}."));
                 }
             }
-            notes.extend(closing_ref_notes(conn, &request.repo, number)?);
+            notes.extend(closing_ref_notes(
+                conn,
+                &request.repo,
+                number,
+                closing_refs_available,
+            )?);
         }
         let claim = get_claim(conn, &own.id)?.context("held claim vanished")?;
         return Ok(ClaimResult {
@@ -2032,7 +2053,12 @@ fn apply_claim_rules(
         )?;
     }
     if request.kind == WorkKind::Pr && request.source == ClaimSource::Explicit {
-        notes.extend(closing_ref_notes(conn, &request.repo, number)?);
+        notes.extend(closing_ref_notes(
+            conn,
+            &request.repo,
+            number,
+            closing_refs_available,
+        )?);
     }
     let claim = get_claim(conn, &claim_id)?.context("inserted claim vanished")?;
     Ok(ClaimResult {
@@ -2188,27 +2214,39 @@ fn link_targets(
     }
 }
 
-/// A warning per claim-linked ticket missing from the PR's closing
-/// references (appendix F's `sm pr` note). Only when the PR was fetched.
-fn closing_ref_notes(conn: &Connection, repo: &str, pr: i64) -> Result<Vec<String>> {
+/// A note per claim-linked ticket not confirmed by GitHub. Even a complete
+/// response can lag a newly created or edited PR; absence is not proof that
+/// the body lacks a closing keyword. Incomplete fetches cannot confirm absence.
+fn closing_ref_notes(
+    conn: &Connection,
+    repo: &str,
+    pr: i64,
+    closing_refs_available: bool,
+) -> Result<Vec<String>> {
     if get_item(conn, repo, pr)?.is_none_or(|item| item.synced_at.is_none()) {
         return Ok(Vec::new());
     }
     let mut statement = conn.prepare(
         "SELECT ticket_number FROM work_links l
           WHERE repo = ?1 AND pr_number = ?2 AND source = 'claim'
-            AND NOT EXISTS (SELECT 1 FROM work_links c
+            AND (?3 = 0 OR NOT EXISTS (SELECT 1 FROM work_links c
                              WHERE c.repo = l.repo AND c.pr_number = l.pr_number
-                               AND c.ticket_number = l.ticket_number AND c.source = 'closing_ref')
+                               AND c.ticket_number = l.ticket_number AND c.source = 'closing_ref'))
           ORDER BY ticket_number",
     )?;
     let tickets = statement
-        .query_map(params![repo, pr], |row| row.get::<_, i64>(0))?
+        .query_map(params![repo, pr, closing_refs_available], |row| {
+            row.get::<_, i64>(0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(tickets
         .into_iter()
         .map(|ticket| {
-            format!("Note: PR #{pr}'s closing references don't include ticket #{ticket}.")
+            if closing_refs_available {
+                format!("Note: GitHub has not yet confirmed that PR #{pr} closes ticket #{ticket}. Check that the PR body contains `Closes #{ticket}`; GitHub's closing-reference data may still be updating.")
+            } else {
+                format!("Note: Could not verify whether PR #{pr} closes ticket #{ticket}: GitHub's closing-reference data is unavailable or incomplete.")
+            }
         })
         .collect())
 }
@@ -2275,7 +2313,7 @@ fn implicit_claim_conn(
         tickets: Vec::new(),
         reserve: false,
     };
-    match apply_claim_rules(conn, &request, sessions)?.outcome {
+    match apply_claim_rules(conn, &request, sessions, false)?.outcome {
         ClaimOutcome::Claimed { warnings, .. } => Ok(Some(warnings)),
         _ => Ok(None),
     }
