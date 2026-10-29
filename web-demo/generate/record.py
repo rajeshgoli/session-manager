@@ -975,7 +975,11 @@ def seed(w):
         subprocess.run(["git", "-C", w.worktree(agent_id), "remote", "add", "origin",
                         f"https://github.com/{REPO}.git"], check=False)
     w.save_gh()
-    w.write_sessions({"sessions": [], "owner_settings": owner_settings()})
+    # Mark the legacy handoff-note import done. Otherwise the server's startup
+    # import rewrites this file from its own read and drops agents the recorder
+    # appended in between.
+    w.write_sessions({"sessions": [], "owner_settings": owner_settings(),
+                      "handoff_notes_imported_at": iso(), "handoff_note_sources_pending": []})
     # The message db must exist before start, or the server skips creating its tables.
     sqlite3.connect(w.mq).close()
     with sqlite3.connect(w.tool_db) as conn:
@@ -1018,19 +1022,19 @@ def main():
     w = World(args)
     write_config(args)
     seed(w)
-    start_server(w, args)
-    # The lead was already planning when the recording starts.
-    prologue(w)
-    w.spawn("a0000001", minutes_ago=18)
     # Record beside the destination and swap it in only after the leak scan.
     final_out, args.out = args.out, args.out.rstrip("/") + ".partial"
-    shutil.rmtree(args.out, ignore_errors=True)
-    os.makedirs(args.out)
-    events = storyline(w)
     step = 5  # storyline seconds per tick; --tick only changes how long a tick takes to play
     ticks, chapter, done = [], None, 0
-    start = time.monotonic()
     try:
+        start_server(w, args)
+        # The lead was already planning when the recording starts.
+        prologue(w)
+        w.spawn("a0000001", minutes_ago=18)
+        shutil.rmtree(args.out, ignore_errors=True)
+        os.makedirs(args.out)
+        events = storyline(w)
+        start = time.monotonic()
         for index in range(args.duration // step):
             t = index * step
             while done < len(events) and events[done][0] <= t:
@@ -1048,8 +1052,11 @@ def main():
             if delay > 0:
                 time.sleep(delay)
     finally:
-        w.server.terminate()
-        w.server.wait(timeout=30)
+        # Stop the scratch server even when the script fails, or a queue job
+        # that ran it never finishes.
+        if getattr(w, "server", None):
+            w.server.terminate()
+            w.server.wait(timeout=30)
 
     timeline = {
         "schema_version": 1, "tick_seconds": step, "play_seconds_per_tick": args.tick,
