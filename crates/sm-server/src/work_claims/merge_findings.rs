@@ -60,7 +60,7 @@ impl WorkClaimStore {
             .collect())
     }
 
-    /// The live or stopped sessions whose claim on `pr` ended with its merge.
+    /// The working or idle sessions whose claim on `pr` ended with its merge.
     pub fn merged_pr_holders(
         &self,
         repo: &str,
@@ -77,10 +77,11 @@ impl WorkClaimStore {
         )?
         .into_iter()
         .map(|claim| claim.session_id)
+        // A stopped session may never resume to read the message.
         .filter(|id| {
-            sessions
-                .get(id)
-                .is_some_and(|session| session.state != HolderState::Retired)
+            sessions.get(id).is_some_and(|session| {
+                matches!(session.state, HolderState::Working | HolderState::Idle)
+            })
         })
         .collect();
         holders.sort();

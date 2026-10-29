@@ -876,6 +876,26 @@ async fn check_d_retries_a_failed_read_and_tells_the_owner_when_the_holder_retir
 }
 
 #[tokio::test]
+async fn check_d_tells_the_owner_when_the_holder_is_stopped() {
+    let f = fixture();
+    let (status, body) = claim(&f, "asleep01", "pr", 9, json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    f.findings.0.lock().unwrap().insert(9, Some(vec![p1("11")]));
+    f.items.merge(9, 3);
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert!(claim_texts(&f, "asleep01").is_empty());
+    let conn = rusqlite::Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM owner_messages WHERE title = 'PR #9 merged with unanswered review findings'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
 async fn the_sync_pass_runs_check_c_for_an_idle_holder_waiting_on_nothing() {
     // lead0001 is idle, last active long ago.
     let f = fixture();
