@@ -141,7 +141,10 @@ pub(super) fn direct_ticket_email(
     Ok(ticket.actor_email.clone())
 }
 
-pub(super) async fn probe(State(state): State<Arc<AppState>>) -> Response {
+pub(super) async fn probe(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if let Err(error) = super::ensure_identity_on_public_host(&state, &request) {
+        return error.into_response();
+    }
     let origin = state
         .config
         .cloudflare_access

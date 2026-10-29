@@ -38,6 +38,7 @@ async fn assetlinks_is_public_exact_and_absent_until_configured() {
         "/.well-known/assetlinks.json/%2e%2e/%2e%2e/health",
     ] {
         let (status, _, body) = get(config.clone(), path).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+        // 403: the public hostname refuses anything but the exact file without a login (#2603).
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
     }
 }

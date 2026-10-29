@@ -9680,7 +9680,7 @@ async fn auth_session_reports_local_bypass_for_localhost_when_auth_is_misconfigu
 }
 
 #[tokio::test]
-async fn auth_session_reports_misconfigured_on_public_host_without_ready_google_auth() {
+async fn auth_session_refuses_public_host_without_ready_google_auth() {
     let app = router(AppState::new(AppConfig {
         google_auth: GoogleAuthConfig {
             enabled: true,
@@ -9690,20 +9690,11 @@ async fn auth_session_reports_misconfigured_on_public_host_without_ready_google_
         ..AppConfig::default()
     }));
 
+    // The public host answers only a login, which incomplete Google auth cannot give (#2603).
     let (status, payload) = get_json_with_host(app, "/auth/session", "sm.example.com").await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        payload,
-        json!({
-            "enabled": true,
-            "authenticated": false,
-            "bypass": false,
-            "email": null,
-            "name": null,
-            "error": "misconfigured"
-        })
-    );
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{payload}");
+    assert_eq!(payload["detail"], "Google auth is enabled but incomplete");
 }
 
 #[tokio::test]

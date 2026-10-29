@@ -2598,6 +2598,13 @@ pub fn router(state: AppState) -> Router {
         owner_events::record,
     ))
     .layer(axum::middleware::from_fn_with_state(
+        (
+            state.clone(),
+            Arc::<str>::from(inbound_email_alias.as_str()),
+        ),
+        require_access_assertion,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
         state.clone(),
         local_agent::authenticate,
     ))
@@ -2622,6 +2629,38 @@ async fn mark_in_app(
         .await
 }
 
+/// On a Cloudflare Access hostname, refuses any request without an Access
+/// assertion that verifies for that hostname's application, so a misconfigured
+/// Access policy cannot open a route. Each route's own owner and device checks
+/// still run after this one (#2603).
+async fn require_access_assertion(
+    State((state, inbound_email_alias)): State<(Arc<AppState>, Arc<str>)>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    // Android verifies App Links without signing in (#2594); the email worker
+    // proves itself with its own secret on any hostname (#1464).
+    if path == "/.well-known/assetlinks.json"
+        || path == DEFAULT_EMAIL_WEBHOOK_PATH
+        || path == &*inbound_email_alias
+        || is_request_local_bypass(&state, &request)
+    {
+        return next.run(request).await;
+    }
+    let Some(application) = request_cloudflare_access_application(&state, &request) else {
+        return next.run(request).await;
+    };
+    let Some(assertion) = header_text(request.headers(), "cf-access-jwt-assertion") else {
+        return cloudflare_access_required_application(Some(application)).into_response();
+    };
+    if let Err(error) = classify_cloudflare_access_assertion_cached(&state, application, &assertion)
+    {
+        return cloudflare_access_error(error).into_response();
+    }
+    next.run(request).await
+}
+
 /// Every response names the web build this server embeds, so an open tab
 /// can tell it is running code from before a deploy (sm#1829).
 async fn stamp_build(mut response: Response) -> Response {
@@ -2632,11 +2671,19 @@ async fn stamp_build(mut response: Response) -> Response {
     response
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({ "status": "healthy" }))
+async fn health(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_identity_on_public_host(&state, &request)?;
+    Ok(Json(json!({ "status": "healthy" })))
 }
 
-async fn health_detailed(State(state): State<Arc<AppState>>) -> Json<HealthDetailedResponse> {
+async fn health_detailed(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<HealthDetailedResponse>, ApiError> {
+    ensure_identity_on_public_host(&state, &request)?;
     let mut checks = BTreeMap::new();
     checks.insert(
         "rust_server".to_owned(),
@@ -2676,35 +2723,36 @@ async fn health_detailed(State(state): State<Arc<AppState>>) -> Json<HealthDetai
     };
     checks.insert("studio_ssh".to_owned(), studio_check);
 
-    Json(HealthDetailedResponse {
+    Ok(Json(HealthDetailedResponse {
         status: "healthy",
         checks,
         resources: BTreeMap::new(),
         timestamp: now_rfc3339(),
-    })
+    }))
 }
 
 async fn auth_session(
     State(state): State<Arc<AppState>>,
     request: Request,
-) -> Json<AuthSessionResponse> {
+) -> Result<Json<AuthSessionResponse>, ApiError> {
+    ensure_identity_on_public_host(&state, &request)?;
     let auth = &state.config.google_auth;
     if !auth.requested() {
-        return Json(AuthSessionResponse::disabled_bypass());
+        return Ok(Json(AuthSessionResponse::disabled_bypass()));
     }
     let peer_addr = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|value| value.0);
     if is_local_bypass_request(request.headers(), peer_addr, &state.config) {
-        return Json(AuthSessionResponse::enabled_bypass());
+        return Ok(Json(AuthSessionResponse::enabled_bypass()));
     }
     if !auth.ready() {
-        return Json(AuthSessionResponse::misconfigured());
+        return Ok(Json(AuthSessionResponse::misconfigured()));
     }
 
     if let Some(user) = authenticated_user(request.headers(), &state.config) {
-        return Json(AuthSessionResponse {
+        return Ok(Json(AuthSessionResponse {
             enabled: true,
             authenticated: true,
             bypass: false,
@@ -2712,10 +2760,10 @@ async fn auth_session(
             name: user.name,
             auth_type: Some(user.auth_type),
             error: None,
-        });
+        }));
     }
 
-    Json(AuthSessionResponse {
+    Ok(Json(AuthSessionResponse {
         enabled: true,
         authenticated: false,
         bypass: false,
@@ -2723,7 +2771,7 @@ async fn auth_session(
         name: None,
         auth_type: None,
         error: None,
-    })
+    }))
 }
 
 async fn auth_device_google(
@@ -3530,6 +3578,25 @@ struct UtilizationHoursQuery {
 
 /// The owner-read checks every `/client/...` read shares, returning the
 /// actor's email. The owner's browser login also passes (spec 1710 D3).
+/// Refuses a request that reached a public hostname (a Cloudflare Access
+/// application or the Google-auth public host) without the login every other
+/// read needs. Localhost and the LAN terminal route answer as before (#2603).
+fn ensure_identity_on_public_host(state: &AppState, request: &Request) -> Result<(), ApiError> {
+    if !is_public_hostname(&state.config, request.headers()) {
+        return Ok(());
+    }
+    ensure_client_read(state, request).map(|_| ())
+}
+
+fn is_public_hostname(config: &AppConfig, headers: &HeaderMap) -> bool {
+    let Some(hostname) = request_hostname(headers) else {
+        return false;
+    };
+    cloudflare_access_application_for_host(&config.cloudflare_access, &hostname).is_some()
+        || trimmed(&config.google_auth.public_host)
+            .is_some_and(|public_host| public_host.eq_ignore_ascii_case(&hostname))
+}
+
 fn ensure_client_read(state: &AppState, request: &Request) -> Result<Option<String>, ApiError> {
     if let Some(email) =
         owner_web_guard(state, request.headers(), request_peer_addr(request), "GET")?
@@ -22099,10 +22166,14 @@ mod tests {
         // back to the Google session, which this request does not carry.
         let stranger =
             test_browser_access_assertion("sm-browser-aud", "stranger@example.com", 4_102_444_800);
-        for assertion in [Some(stranger.as_str()), None] {
+        for (assertion, expected) in [
+            (Some(stranger.as_str()), StatusCode::UNAUTHORIZED),
+            // No Access assertion at all is refused before the route (#2603).
+            (None, StatusCode::FORBIDDEN),
+        ] {
             for uri in ["/docs/zzzzzzzz/view", "/docs/widgets/memo.md"] {
                 let (status, body) = browser_host_get(&app, uri, assertion).await;
-                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+                assert_eq!(status, expected, "{uri}: {body}");
             }
         }
     }
@@ -22146,10 +22217,11 @@ mod tests {
         ] {
             let (status, _) = browser_host_get(&app, uri, Some(&expired)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
-            for assertion in [Some(stranger.as_str()), None] {
-                let (status, _) = browser_host_get(&app, uri, assertion).await;
-                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
-            }
+            let (status, _) = browser_host_get(&app, uri, Some(&stranger)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+            // No Access assertion at all is refused before the route (#2603).
+            let (status, _) = browser_host_get(&app, uri, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
         }
     }
 
@@ -22182,10 +22254,11 @@ mod tests {
         for uri in ["/", "/watch", "/watch/state"] {
             let (status, _) = browser_host_get(&app, uri, Some(&expired)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
-            for assertion in [Some(stranger.as_str()), None] {
-                let (status, _) = browser_host_get(&app, uri, assertion).await;
-                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
-            }
+            let (status, _) = browser_host_get(&app, uri, Some(&stranger)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+            // No Access assertion at all is refused before the route (#2603).
+            let (status, _) = browser_host_get(&app, uri, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
         }
     }
 
@@ -22290,7 +22363,7 @@ mod tests {
         }
         // The shell still needs the owner's login.
         let (status, _) = browser_host_get(&app, "/queue", None).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::FORBIDDEN);
 
         // Every response names the build, so an open tab can see a deploy.
         let response = app
@@ -22331,6 +22404,7 @@ mod tests {
         // The phone app's hostname keeps today's page at `/`, and has no
         // shell-only pages; its Board is the app's own tab.
         let cookie = owner_session_cookie();
+        let app_assertion = test_mobile_access_assertion("pixel-device");
         let app_host = |uri: &str| {
             let mut request =
                 public_request_with_host(Method::GET, uri, Body::empty(), "sm-app.example.com");
@@ -22338,6 +22412,9 @@ mod tests {
                 COOKIE,
                 format!("{SESSION_COOKIE_NAME}={cookie}").parse().unwrap(),
             );
+            request
+                .headers_mut()
+                .insert("cf-access-jwt-assertion", app_assertion.parse().unwrap());
             request
         };
         let response = app.clone().oneshot(app_host("/")).await.unwrap();
@@ -23461,8 +23538,10 @@ mod tests {
         request
             .headers_mut()
             .insert("cf-access-jwt-assertion", owner.parse().unwrap());
+        // The app hostname rejects a browser-audience assertion outright (#2603).
         let (status, body) = response_json(app.oneshot(request).await.unwrap()).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["detail"], "Invalid Cloudflare Access assertion");
     }
 
     #[tokio::test]
@@ -24094,9 +24173,12 @@ mod tests {
                 .unwrap();
             let (status, body) = response_json(response).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{host}");
-            assert_eq!(
-                body["detail"],
-                "Cloudflare Access mobile app assertion is required"
+            // Each Access hostname first asks for its own application's assertion (#2603).
+            let detail = body["detail"].as_str().unwrap();
+            assert!(
+                detail.starts_with("Cloudflare Access ")
+                    && detail.ends_with(" assertion is required"),
+                "{host}: {detail}"
             );
         }
     }
@@ -24403,7 +24485,7 @@ mod tests {
             Method::GET,
             "/apps/session-manager-android/meta.json",
             Body::empty(),
-            "sm.example.com",
+            "sm.rajeshgo.li",
         );
         session_only.headers_mut().insert(
             COOKIE,
@@ -24418,7 +24500,7 @@ mod tests {
             Method::GET,
             "/apps/session-manager-android/meta.json",
             Body::empty(),
-            "sm.example.com",
+            "sm.rajeshgo.li",
         );
         edge_proven.headers_mut().insert(
             COOKIE,
@@ -24475,10 +24557,8 @@ mod tests {
         let (status, body) = response_json(response).await;
 
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(
-            body["detail"],
-            "Cloudflare Access mobile app assertion is required"
-        );
+        // The browser hostname's own check rejects the bad assertion first (#2603).
+        assert_eq!(body["detail"], "Invalid Cloudflare Access assertion");
     }
 
     #[tokio::test]
@@ -27865,6 +27945,12 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             COOKIE,
             format!("{SESSION_COOKIE_NAME}={cookie}").parse().unwrap(),
         );
+        request.headers_mut().insert(
+            "cf-access-jwt-assertion",
+            test_mobile_access_assertion("pixel-device")
+                .parse()
+                .unwrap(),
+        );
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -27876,4 +27962,5 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
     include!("http/browser_terminal_tests.rs");
     include!("http/plain_terminal_tests.rs");
     include!("http/ssh_transport_tests.rs");
+    include!("http/public_host_tests.rs");
 }
