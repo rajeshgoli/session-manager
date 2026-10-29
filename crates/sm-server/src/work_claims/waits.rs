@@ -218,8 +218,8 @@ fn target_name(sessions: &SessionDirectory, wait: &AgentWait) -> String {
 pub struct EndedJob {
     /// `2611-check (job_071682aa6be6) succeeded`, or `job_x was not found`.
     pub text: String,
-    /// The session the queue already woke with the job's result; its wait
-    /// ends without a second message.
+    /// The job's notify target, which the queue already woke with the
+    /// result; its wait ends without a second message.
     pub woken: Option<String>,
 }
 

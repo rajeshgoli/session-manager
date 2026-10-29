@@ -230,7 +230,9 @@ pub(super) fn ended_jobs(state: &AppState, waits: &[AgentWait]) -> BTreeMap<Stri
             Ok(Some(job)) if matches!(job.state.as_str(), "pending" | "running") => continue,
             Ok(Some(job)) => EndedJob {
                 text: format!("{} ({id}) {}", job.label, job.state),
-                woken: job.notify_session_id.or(job.requester_session_id),
+                // Only the notify target gets a completion wake; an
+                // application-owned job's requester gets none.
+                woken: job.notify_session_id,
             },
             Ok(None) => EndedJob {
                 text: format!("{id} was not found"),
