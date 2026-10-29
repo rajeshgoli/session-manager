@@ -252,9 +252,18 @@ fn cached_intervals(
     Ok(intervals)
 }
 
+/// Whether the board counts `record` for its tickets. A service job counts
+/// only when it carries tickets (`rank_tickets`, set at enqueue from the
+/// requester's claims): a training run started as a service while holding
+/// #N is #N's work, as the agent list and the idle checks already treat it
+/// (sm#2611). A service with no tickets runs for good and is left out.
+pub(super) fn counts_for_board(record: &crate::queue::QueueJobRecord) -> bool {
+    record.job_type != "service" || record.rank_tickets.as_ref().is_some_and(|t| !t.is_empty())
+}
+
 /// Queue jobs by ticket (D7): active ones, and those that ended in the
 /// window. A job's tickets are its `rank_tickets`, or else its requester's
-/// active claims. Service jobs run for good and are left out.
+/// active claims. Service jobs count only as `counts_for_board` allows.
 fn ticket_jobs(
     state: &AppState,
     input: &ModelInput,
@@ -284,7 +293,7 @@ fn ticket_jobs(
 
     let mut jobs: BTreeMap<Key, Vec<ClockJob>> = BTreeMap::new();
     for record in &records {
-        if record.job_type == "service" {
+        if !counts_for_board(record) {
             continue;
         }
         let Some(queued_at) = parse_time(&record.queued_at) else {
