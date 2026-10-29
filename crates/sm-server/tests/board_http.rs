@@ -955,6 +955,29 @@ async fn clocked_tickets_carry_ball_text_and_segments() {
     let clock = f.ticket(3).await["clock"].clone();
     assert_eq!(clock["ball"], "queue", "{clock}");
     assert_eq!(clock["text"], "Job waiting 0m · 1st in line");
+
+    // sm#2611: a running service job carrying the ticket (a training run)
+    // is the ticket's work, not a stall.
+    let queue = Connection::open(f.dir.join("queue/queue_runner.db")).unwrap();
+    let id = job["id"].as_str().unwrap();
+    queue
+        .execute(
+            "UPDATE queue_jobs SET type = 'service', state = 'running', started_at = queued_at,
+                rank_tickets = '[{\"repo\":\"acme/widgets\",\"number\":3}]' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    let clock = f.ticket(3).await["clock"].clone();
+    assert_eq!(clock["ball"], "job_running", "{clock}");
+    assert_eq!(clock["text"], "Service running 0m of 1h");
+    // Without tickets it runs for good and stays out.
+    queue
+        .execute(
+            "UPDATE queue_jobs SET rank_tickets = '[]' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    assert_eq!(f.ticket(3).await["clock"]["ball"], "stalled");
 }
 
 struct BoardClaimItems;

@@ -77,7 +77,9 @@ impl BoardLinks {
         for job in
             RetainedQueueStore::list_queue_jobs_from_path(&queue_path, QueueJobFilters::default())?
         {
-            if !matches!(job.state.as_str(), "pending" | "running") || job.job_type == "service" {
+            if !matches!(job.state.as_str(), "pending" | "running")
+                || !super::board_clock::counts_for_board(&job)
+            {
                 continue;
             }
             let keys = super::board_clock::job_tickets(&job, &held);

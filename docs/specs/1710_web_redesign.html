@@ -958,7 +958,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
   "text": "2 jobs waiting 1h 55m for a slot",
   "segments": [ { "kind": "working" | "job_running" | "queue" | "review" | "you" | "idle", "from": "…", "to": "…" } ]
 }</code></pre>
-<p>The window is set by the query <code>clock_hours</code> (3, 6 or 24; default 3). <b>The ticket's jobs</b> are the queue jobs whose <code>rank_tickets</code> contain the ticket (<code>queue.rs:308</code>). A job with no <code>rank_tickets</code> falls back to its requester's claims.</p>
+<p>The window is set by the query <code>clock_hours</code> (3, 6 or 24; default 3). <b>The ticket's jobs</b> are the queue jobs whose <code>rank_tickets</code> contain the ticket (<code>queue.rs:308</code>). A job with no <code>rank_tickets</code> falls back to its requester's claims. A <code>service</code> job counts only when its <code>rank_tickets</code> name tickets (sm#2611: a training run started as a service is its ticket's work, as the agent list already treats it); one with none runs for good and is left out.</p>
 <p><b>Ball.</b> Take the first rule that matches, at the time of the request:</p>
 <table>
 <thead><tr><th>#</th><th>Condition</th><th>Ball</th><th>Since</th><th>Text</th></tr></thead>
