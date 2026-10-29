@@ -184,6 +184,7 @@
 </figure>
 
 <p>A wait names either a <b>seat</b> or a <b>ticket</b>. Wait on a seat when a specific agent promised you something (the 2139 case). Wait on a ticket when you need it finished but do not care which agent finishes it; then a message from any seat that holds the ticket counts as delivery, and the ticket closing ends the wait too.</p>
+<p>A wait may also name a <b>queue job</b>, as <code>queue:&lt;job id&gt;</code> or the bare <code>job_…</code> id: it must be pending or running when the wait opens, and it ends (<code>job_ended</code>) at the first claim sync pass after the job ends or leaves the queue, with <code>[sm await] Queue job &lt;label&gt; (&lt;id&gt;) &lt;state&gt;. Your wait on it for "&lt;for&gt;" ended.</code> to every waiter (not every job's end wakes its notify target, so sm does not assume it did). Or it may name <b>work outside sm</b> as <code>&lt;kind&gt;:&lt;id&gt;</code>, at most 100 characters with no spaces (<code>modal:ap-12</code>, <code>gh-run:4567</code>, <code>cron:3fa9</code>); sm cannot see that work, so only the ETA, <code>sm await --cancel &lt;kind&gt;:&lt;id&gt;</code> or the waiter's retire ends it (sm#2611). Neither kind is ever delivered by a message, and neither has an <code>awaited_by</code>. A target with a colon is never read as a seat.</p>
 
 <h3>The 2139 case, end to end</h3>
 <pre><code>far-2139$ sm await far-2171 --for "#2171 end.pt and fitted.pkl hashes" --until 2026-10-22T05:30:00Z
@@ -211,7 +212,7 @@ Waiting on far-2171 (4c1d2e3f) for "#2171 end.pt and fitted.pkl hashes" until Th
 <tr><td>5. Add a line to this repo's standing contract (AGENTS.md, which CLAUDE.md links to)?</td><td><b>Yes, one bullet</b> in section 3 next to the <code>[sm claim]</code> rules: <i>"Blocked on another agent's deliverable: run <code>sm await &lt;agent or #ticket&gt; --for "&lt;what&gt;" --until &lt;ETA&gt;</code>, then go idle."</i></td><td>Agents learn commands from that file; without the line, seats keep answering idle reminders.</td></tr>
 </tbody>
 </table>
-<p>I made two smaller calls myself. The command is <code>sm await</code> because <code>sm wait</code> already means the blocking shell poll and I do not want to change its meaning. Board ticket cards do not show agent waits: the board is about tickets, and the seat's row on the agent list already shows the wait. I can add it later if you want it there.</p>
+<p>I made two smaller calls myself. The command is <code>sm await</code> because <code>sm wait</code> already means the blocking shell poll and I do not want to change its meaning. The board shows a holder's open wait in place of Idle or Stalled on its ticket (sm#2611; rule 5a of the ticket clock in <code>1710_web_redesign.html</code>), and the idle reminder ends with the <code>sm await</code> command.</p>
 
 <h3>What ships, and what you can try</h3>
 <p>One PR: the command, the stored wait record, the five ways a wait ends, the waiting-on list entry (browser watch page, <code>sm watch</code>, and a one-line phone app change that ships with the next app build), the task-complete listing, and tests. After it deploys, you can run <code>sm await</code> from any seat against another and watch the seat turn amber on your phone; Appendix F lists what I verify live myself.</p>
@@ -244,21 +245,22 @@ sm await --cancel [&lt;target&gt;]                              # end one wait, 
 <pre><code>CREATE TABLE IF NOT EXISTS agent_waits (
     id                TEXT PRIMARY KEY,     -- "wait_" + 12 lowercase hex
     waiter_session_id TEXT NOT NULL,
-    target_kind       TEXT NOT NULL CHECK (target_kind IN ('seat','ticket')),
+    target_kind       TEXT NOT NULL CHECK (target_kind IN ('seat','ticket','job','external')),
     target_session_id TEXT,                 -- seat waits only
     repo              TEXT,                 -- ticket waits only, canonical slug
     number            INTEGER,              -- ticket waits only
+    target_ref        TEXT,                 -- job id, or the outside reference (sm#2611; a table from before it is rebuilt once)
     deliverable       TEXT NOT NULL,
     created_at        TEXT NOT NULL,        -- RFC 3339 UTC
     updated_at        TEXT NOT NULL,
     until_at          TEXT NOT NULL,
     ended_at          TEXT,
     end_reason        TEXT CHECK (end_reason IN
-        ('delivered','ticket_closed','target_retired','expired','cancelled','waiter_retired')),
+        ('delivered','ticket_closed','target_retired','job_ended','expired','cancelled','waiter_retired')),
     end_message_id    TEXT                  -- queue message sm sent at the end, if any
 );
 CREATE UNIQUE INDEX IF NOT EXISTS agent_waits_open ON agent_waits
-    (waiter_session_id, target_kind, IFNULL(target_session_id,''), IFNULL(repo,''), IFNULL(number,0))
+    (waiter_session_id, target_kind, IFNULL(target_session_id,''), IFNULL(repo,''), IFNULL(number,0), IFNULL(target_ref,''))
     WHERE ended_at IS NULL;</code></pre>
 <p>A ticket wait inserts an unsynced <code>work_items</code> row for the ticket if none exists, and the tracked set<sup>2</sup> gains <code>SELECT repo, number FROM agent_waits WHERE ended_at IS NULL AND target_kind = 'ticket'</code>, so the claim sync fetches the ticket every pass while the wait is open. Every change writes an event in the existing <code>events</code> table: <code>wait.opened</code>, <code>wait.updated</code>, <code>wait.ended</code> (payload: wait id, target, deliverable, until, and for <code>wait.ended</code> the reason and message id), on the waiter's session and, for ticket waits, the ticket.</p>
 

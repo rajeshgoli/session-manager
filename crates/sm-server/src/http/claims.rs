@@ -668,7 +668,8 @@ pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
     }
     // Waits end before Check C reads the feed, so an ended wait no longer
     // shields its seat in this pass.
-    notified.extend(store.run_wait_endings(&answered, &sessions, now)?);
+    let jobs = super::agent_waits::ended_jobs(state, &store.open_waits()?);
+    notified.extend(store.run_wait_endings(&answered, &jobs, &sessions, now)?);
     notified.extend(run_check_d(state, &store, &sessions, now));
     notified.extend(store.run_check_c(
         &answered,

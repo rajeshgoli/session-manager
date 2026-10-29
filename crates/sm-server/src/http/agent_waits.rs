@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::work_claims::waits::{
-    until_text, validate_deliverable, validate_until, AgentWait, WaitTarget,
+    until_text, validate_deliverable, validate_until, AgentWait, EndedJob, WaitTarget,
 };
 use crate::work_claims::{ClaimView, HolderState, SessionDirectory};
 
@@ -127,8 +127,13 @@ pub(super) async fn cancel_wait(
     Ok(Json(json!({ "cancelled": cancelled })))
 }
 
-/// `owner/repo#N` is a ticket; anything else is a seat, resolved like an
-/// `sm send` recipient. A cancel may name a seat that has since retired.
+/// The longest reference to work outside sm, in characters.
+const MAX_REFERENCE_CHARS: usize = 100;
+
+/// `owner/repo#N` is a ticket; `queue:<job id>` or a bare `job_…` id a
+/// queue job; any other `<kind>:<id>` work outside sm (sm#2611); anything
+/// else a seat, resolved like an `sm send` recipient. A cancel may name a
+/// seat that has since retired, or a job that has ended.
 fn parse_target(
     state: &AppState,
     waiter: &str,
@@ -136,6 +141,37 @@ fn parse_target(
     allow_retired: bool,
 ) -> Result<WaitTarget, ApiError> {
     let raw = raw.trim();
+    let job = raw
+        .strip_prefix("queue:")
+        .map(str::trim)
+        .or_else(|| raw.starts_with("job_").then_some(raw));
+    if let Some(id) = job {
+        if !allow_retired {
+            let path = queue_db(state);
+            match RetainedQueueStore::get_queue_job_strict_from_path(&path, id) {
+                Ok(Some(job)) if matches!(job.state.as_str(), "pending" | "running") => {}
+                Ok(Some(job)) => {
+                    return Err(claims::bad_request(format!(
+                        "queue job {id} already {}",
+                        job.state
+                    )))
+                }
+                _ => return Err(claims::bad_request(format!("queue job {id} not found"))),
+            }
+        }
+        return Ok(WaitTarget::Job(id.to_owned()));
+    }
+    if let Some((kind, id)) = raw.split_once(':') {
+        let valid = |part: &str| {
+            !part.is_empty() && !part.chars().any(|c| c.is_whitespace() || c.is_control())
+        };
+        if !valid(kind) || !valid(id) || raw.chars().count() > MAX_REFERENCE_CHARS {
+            return Err(claims::bad_request(format!(
+                "an outside reference is <kind>:<id> with no spaces, at most {MAX_REFERENCE_CHARS} characters"
+            )));
+        }
+        return Ok(WaitTarget::External(raw.to_owned()));
+    }
     if raw.starts_with('#') {
         return Err(claims::bad_request(
             "a ticket target needs its repo: owner/repo#N",
@@ -169,7 +205,43 @@ fn awaits(wait: &AgentWait, session_id: &str, held: &[ClaimView]) -> bool {
         WaitTarget::Ticket { repo, number } => held.iter().any(|view| {
             view.claim.kind == "ticket" && view.claim.repo == repo && view.claim.number == number
         }),
+        WaitTarget::Job(_) | WaitTarget::External(_) => false,
     }
+}
+
+fn queue_db(state: &AppState) -> std::path::PathBuf {
+    expand_home(&state.config.queue_runner_state_dir().to_string_lossy()).join("queue_runner.db")
+}
+
+/// The queue jobs the open waits name that are no longer pending or
+/// running, or that the queue no longer has. A job the queue cannot read
+/// now is left for the next pass.
+pub(super) fn ended_jobs(state: &AppState, waits: &[AgentWait]) -> BTreeMap<String, EndedJob> {
+    let path = queue_db(state);
+    let mut ended = BTreeMap::new();
+    for wait in waits {
+        let WaitTarget::Job(id) = wait.target() else {
+            continue;
+        };
+        if ended.contains_key(&id) {
+            continue;
+        }
+        let job = match RetainedQueueStore::get_queue_job_strict_from_path(&path, &id) {
+            Ok(Some(job)) if matches!(job.state.as_str(), "pending" | "running") => continue,
+            Ok(Some(job)) => EndedJob {
+                text: format!("{} ({id}) {}", job.label, job.state),
+            },
+            Ok(None) => EndedJob {
+                text: format!("{id} was not found"),
+            },
+            Err(error) => {
+                eprintln!("agent wait on queue job {id}: {error:#}");
+                continue;
+            }
+        };
+        ended.insert(id, job);
+    }
+    ended
 }
 
 /// Cached titles of the tickets the waits name, by `(repo, number)`.
@@ -215,6 +287,7 @@ fn wait_view(
                 .filter(|t| !t.is_empty())
                 .cloned(),
         ),
+        WaitTarget::Job(id) | WaitTarget::External(id) => (id, None, None),
     };
     json!({
         "kind": "agent_wait", "id": wait.id,
@@ -223,6 +296,7 @@ fn wait_view(
         "until_text": until_text(wait),
         "target_kind": wait.target_kind, "target_session_id": wait.target_session_id,
         "target_name": target_name, "repo": wait.repo, "number": wait.number, "title": title,
+        "target_ref": wait.target_ref,
         "waiter_session_id": wait.waiter_session_id,
         "waiter_name": name_of(&wait.waiter_session_id),
         "for": wait.deliverable,
@@ -264,6 +338,7 @@ pub(super) fn project_waits(
                 })
                 .map(|claim| claim.claim.session_id.clone())
                 .collect(),
+            WaitTarget::Job(_) | WaitTarget::External(_) => Vec::new(),
         };
         sessions
             .entry(waiter.clone())

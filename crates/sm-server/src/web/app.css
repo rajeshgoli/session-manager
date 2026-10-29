@@ -606,7 +606,7 @@ a.term-ticket:hover .tk, a.term-ticket:hover .ttl { text-decoration: underline; 
 .clock-segment { position: absolute; height: 100%; background: var(--ink-3); }
 .clock-segment.working, .clock-segment.job_running { background: var(--green); }
 .clock-segment.job_running { background: repeating-linear-gradient(120deg, var(--green) 0 3px, color-mix(in srgb, var(--green) 40%, var(--panel)) 3px 5px); }
-.clock-segment.queue, .clock-segment.review { background: var(--amber); }
+.clock-segment.queue, .clock-segment.review, .clock-segment.awaiting { background: var(--amber); }
 .clock-segment.you { background: var(--magenta); }
 .clock-segment.quiet, .clock-segment.stalled, .clock-segment.no_agent, .clock-segment.job_quiet { background: var(--red); }
 .lane-folds { border-top: 1px solid var(--line); }

@@ -38,7 +38,7 @@ pub const MESSAGE_CATEGORY: &str = "work_claim";
 
 // Bump when this initializer or its merge-hold, loose-worktree, or board
 // schema dependencies change. The marker is published with the whole schema.
-const WORK_CLAIMS_SCHEMA_VERSION: &str = "3";
+const WORK_CLAIMS_SCHEMA_VERSION: &str = "4";
 
 fn work_claims_schema_is_current(conn: &Connection) -> Result<bool> {
     if !table_exists(conn, "work_claims_meta")? {

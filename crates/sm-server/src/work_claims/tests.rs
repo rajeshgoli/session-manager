@@ -1614,7 +1614,10 @@ fn check_c_fires_at_thirty_idle_minutes_once_per_stretch() {
     assert_eq!(run(&store, &idle_lead(0, false), 30), vec!["lead"]);
     assert_eq!(
         queued(&db, "lead"),
-        vec!["[sm claim] Idle 30m, nothing pending. You hold: ticket #1 (open)."]
+        vec![format!(
+            "[sm claim] Idle 30m, nothing pending. You hold: ticket #1 (open). {}",
+            checks::AWAIT_HINT
+        )]
     );
     assert_eq!(nudges(&store)[0].3["check"], "C");
     // Not twice in one stretch.
@@ -1628,7 +1631,10 @@ fn check_c_fires_at_thirty_idle_minutes_once_per_stretch() {
     assert_eq!(run(&restarted, &idle_lead(61, false), 95), vec!["lead"]);
     assert_eq!(
         queued(&db, "lead")[1],
-        "[sm claim] Idle 34m, nothing pending. You hold: ticket #1 (open)."
+        format!(
+            "[sm claim] Idle 34m, nothing pending. You hold: ticket #1 (open). {}",
+            checks::AWAIT_HINT
+        )
     );
 }
 

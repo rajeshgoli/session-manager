@@ -222,7 +222,7 @@ fn sync_endings_message_the_waiter_once() {
     assert_eq!(store.tracked_items().unwrap()[REPO], vec![7, 8]);
     // Nothing is due yet.
     assert!(store
-        .run_wait_endings(&answered(&[]), &dir, at(30))
+        .run_wait_endings(&answered(&[]), &BTreeMap::new(), &dir, at(30))
         .unwrap()
         .is_empty());
     // #7 closed, #8 vanished; the holder's ETA passed.
@@ -231,7 +231,7 @@ fn sync_endings_message_the_waiter_once() {
         .collect());
     store.record_fetch(REPO, &[7, 8], &fetched).unwrap();
     let mut notified = store
-        .run_wait_endings(&answered(&[7, 8]), &dir, at(60))
+        .run_wait_endings(&answered(&[7, 8]), &BTreeMap::new(), &dir, at(60))
         .unwrap();
     notified.sort();
     assert_eq!(notified, ["7e317fcd", "holder01"]);
@@ -250,7 +250,7 @@ fn sync_endings_message_the_waiter_once() {
     dir.insert(session(TARGET, "far-2171", HolderState::Retired));
     assert_eq!(
         store
-            .run_wait_endings(&answered(&[]), &dir, at(61))
+            .run_wait_endings(&answered(&[]), &BTreeMap::new(), &dir, at(61))
             .unwrap(),
         [WAITER]
     );
@@ -286,7 +286,7 @@ fn precedence_waiter_retired_then_target_retired_then_expired() {
     dir.insert(session(WAITER, "far-2139", HolderState::Retired));
     assert_eq!(
         store
-            .run_wait_endings(&answered(&[]), &dir, at(60))
+            .run_wait_endings(&answered(&[]), &BTreeMap::new(), &dir, at(60))
             .unwrap(),
         ["holder01"]
     );
@@ -425,7 +425,7 @@ fn a_wait_on_a_ticket_already_cached_closed_ends_at_the_next_pass() {
     assert!(store.tracked_items().unwrap().is_empty());
     assert_eq!(
         store
-            .run_wait_endings(&answered(&[]), &directory(), at(5))
+            .run_wait_endings(&answered(&[]), &BTreeMap::new(), &directory(), at(5))
             .unwrap(),
         [WAITER]
     );
@@ -433,4 +433,129 @@ fn a_wait_on_a_ticket_already_cached_closed_ends_at_the_next_pass() {
         queued(&db, WAITER),
         ["[sm await] #7 \"Final weights\" closed. Your wait on it for \"weights\" ended."]
     );
+}
+
+#[test]
+fn sm2611_a_queue_job_wait_ends_when_the_job_ends() {
+    let (store, db) = new_store();
+    let dir = directory();
+    let job = WaitTarget::Job("job_071682aa6be6".into());
+    store
+        .open_wait(WAITER, &job, "proof run", at(300), at(0))
+        .unwrap();
+    store
+        .open_wait("holder01", &job, "proof run", at(300), at(0))
+        .unwrap();
+    // Still running: not in the map, nothing ends. A send never delivers it.
+    assert!(store
+        .run_wait_endings(&answered(&[]), &BTreeMap::new(), &dir, at(10))
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.deliver_waits(TARGET, WAITER, at(11)).unwrap(), 0);
+    // It ended: both waiters hear, whether or not the queue woke one.
+    let ended = BTreeMap::from([(
+        "job_071682aa6be6".to_owned(),
+        EndedJob {
+            text: "2611-check (job_071682aa6be6) succeeded".into(),
+        },
+    )]);
+    let mut notified = store
+        .run_wait_endings(&answered(&[]), &ended, &dir, at(20))
+        .unwrap();
+    notified.sort();
+    assert_eq!(notified, [WAITER, "holder01"]);
+    assert_eq!(queued(&db, WAITER).len(), 1);
+    assert_eq!(
+        queued(&db, "holder01"),
+        ["[sm await] Queue job 2611-check (job_071682aa6be6) succeeded. Your wait on it for \"proof run\" ended."]
+    );
+    assert_eq!(end_reasons(&store), ["job_ended", "job_ended"]);
+    assert!(store.open_waits().unwrap().is_empty());
+}
+
+#[test]
+fn sm2611_a_wait_on_work_outside_sm_ends_only_at_its_eta_or_cancel() {
+    let (store, db) = new_store();
+    let dir = directory();
+    let modal = WaitTarget::External("modal:ap-12".into());
+    let cron = WaitTarget::External("cron:3fa9".into());
+    let (wait, _) = store
+        .open_wait(WAITER, &modal, "training epoch 60", at(120), at(0))
+        .unwrap();
+    assert_eq!(wait.target(), modal);
+    assert_eq!(wait.target_ref.as_deref(), Some("modal:ap-12"));
+    store
+        .open_wait(WAITER, &cron, "CI green", at(120), at(0))
+        .unwrap();
+    // Re-running updates the same wait; a different reference is another.
+    let (_, created) = store
+        .open_wait(WAITER, &modal, "training epoch 60/60", at(150), at(1))
+        .unwrap();
+    assert!(!created);
+    assert_eq!(store.open_waits().unwrap().len(), 2);
+    assert_eq!(store.deliver_waits(TARGET, WAITER, at(2)).unwrap(), 0);
+    assert_eq!(store.cancel_waits(WAITER, Some(&cron), at(3)).unwrap(), 1);
+    assert!(store
+        .run_wait_endings(&answered(&[]), &BTreeMap::new(), &dir, at(149))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .run_wait_endings(&answered(&[]), &BTreeMap::new(), &dir, at(150))
+            .unwrap(),
+        [WAITER]
+    );
+    assert_eq!(
+        queued(&db, WAITER),
+        ["[sm await] Your wait on modal:ap-12 for \"training epoch 60/60\" passed its ETA, Thu 22 Oct 00:30 UTC, and ended."]
+    );
+    assert_eq!(end_reasons(&store), ["cancelled", "expired"]);
+}
+
+#[test]
+fn sm2611_the_seat_and_ticket_table_migrates_with_its_rows() {
+    let dir = std::env::temp_dir().join(format!(
+        "sm-agent-waits-migrate-{}-{}",
+        std::process::id(),
+        OsRng.next_u64()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("message_queue.db");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE agent_waits (
+            id TEXT PRIMARY KEY,
+            waiter_session_id TEXT NOT NULL,
+            target_kind TEXT NOT NULL CHECK (target_kind IN ('seat','ticket')),
+            target_session_id TEXT, repo TEXT, number INTEGER,
+            deliverable TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            until_at TEXT NOT NULL, ended_at TEXT,
+            end_reason TEXT CHECK (end_reason IN
+                ('delivered','ticket_closed','target_retired','expired','cancelled','waiter_retired')),
+            end_message_id TEXT);
+         CREATE UNIQUE INDEX agent_waits_open ON agent_waits
+            (waiter_session_id, target_kind, IFNULL(target_session_id,''), IFNULL(repo,''),
+             IFNULL(number,0)) WHERE ended_at IS NULL;
+         INSERT INTO agent_waits VALUES ('wait_000000000001', '7e317fcd', 'seat', '4c1d2e3f',
+            NULL, NULL, 'hashes', '2026-10-21T22:00:00Z', '2026-10-21T22:00:00Z',
+            '2026-10-22T05:30:00Z', NULL, NULL, NULL);",
+    )
+    .unwrap();
+    drop(conn);
+    let store = WorkClaimStore::new(db);
+    store.ensure_schema().unwrap();
+    let open = store.open_waits().unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].target(), seat(TARGET));
+    assert_eq!(open[0].deliverable, "hashes");
+    store
+        .open_wait(
+            WAITER,
+            &WaitTarget::External("slurm:9912".into()),
+            "eval",
+            at(60),
+            at(0),
+        )
+        .unwrap();
+    assert_eq!(store.open_waits().unwrap().len(), 2);
 }

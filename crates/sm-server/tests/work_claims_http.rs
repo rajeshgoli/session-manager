@@ -919,7 +919,7 @@ async fn the_sync_pass_runs_check_c_for_an_idle_holder_waiting_on_nothing() {
     assert_eq!(texts.len(), 1, "{texts:?}");
     assert!(texts[0].starts_with("[sm claim] Idle "), "{}", texts[0]);
     assert!(
-        texts[0].ends_with("m, nothing pending. You hold: ticket #1 (open)."),
+        texts[0].contains("m, nothing pending. You hold: ticket #1 (open). If you are waiting"),
         "{}",
         texts[0]
     );
@@ -1452,6 +1452,37 @@ fn feed_entry<'a>(feed: &'a Value, id: &str) -> &'a Value {
         .iter()
         .find(|entry| entry["session_id"] == id)
         .unwrap()
+}
+
+#[tokio::test]
+async fn sm2611_agent_waits_take_queue_jobs_and_work_outside_sm() {
+    let f = fixture();
+    let (status, body) = open_wait(&f, "lead0001", "modal:ap-12", &eta(60)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["label"], "modal:ap-12 · hashes");
+    assert_eq!(body["target_kind"], "external");
+    assert_eq!(body["target_ref"], "modal:ap-12");
+    for (target, detail) in [
+        ("queue:job_nope", "queue job job_nope not found"),
+        ("job_nope", "queue job job_nope not found"),
+        (
+            "modal:",
+            "an outside reference is <kind>:<id> with no spaces, at most 100 characters",
+        ),
+    ] {
+        let (status, body) = open_wait(&f, "lead0001", target, &eta(60)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{target}: {body}");
+        assert_eq!(body["detail"], detail);
+    }
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/claims/waits/cancel",
+        Some(json!({"waiter_session_id": "lead0001", "target": "modal:ap-12"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cancelled"], 1);
 }
 
 #[tokio::test]

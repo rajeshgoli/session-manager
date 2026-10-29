@@ -3,8 +3,9 @@
 
 use super::*;
 use crate::analytics_time::ThreadInterval;
-use crate::board::clock::{self, Activity, ClockFacts, ClockJob, JobPhase, CLOCK_HOURS};
+use crate::board::clock::{self, Activity, ClockFacts, ClockJob, ClockWait, JobPhase, CLOCK_HOURS};
 use crate::board::model::{Board, Key, ModelInput, TicketState};
+use crate::work_claims::waits::{until_text, AgentWait, WaitTarget};
 use crate::work_claims::{canonical_repo, HolderState};
 
 /// `clock_hours`: 3, 6 or 24; 3 when absent.
@@ -65,6 +66,7 @@ pub(super) fn clocks(
         &state.config.sm_send.db_path,
     ))?;
     let claim_store = claims::work_claim_store(state);
+    let waits = claim_store.waits_since(window.0 - stall)?;
 
     let intervals = cached_intervals(state, hours, &session_list, &paths, window.0 - stall, now)?;
 
@@ -137,6 +139,41 @@ pub(super) fn clocks(
                 .filter_map(|review| Some((review.pr_number, parse_time(&review.requested_at)?)))
                 .max_by_key(|&(_, requested)| requested)
         });
+        let holder_waits: Vec<&(AgentWait, Option<String>)> = holder
+            .map(|holder| {
+                waits
+                    .iter()
+                    .filter(|(wait, _)| wait.waiter_session_id == holder.session_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let open: Vec<&AgentWait> = holder_waits
+            .iter()
+            .filter(|(_, ended)| ended.is_none())
+            .map(|(wait, _)| wait)
+            .collect();
+        let wait = open.first().map(|wait| ClockWait {
+            since: parse_time(&wait.created_at).unwrap_or(now),
+            target: match wait.target() {
+                WaitTarget::Seat(id) => sessions
+                    .get(id.as_str())
+                    .map(|record| record.name.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| id.chars().take(8).collect()),
+                WaitTarget::Ticket { number, .. } => format!("#{number}"),
+                WaitTarget::Job(id) | WaitTarget::External(id) => id,
+            },
+            deliverable: wait.deliverable.clone(),
+            until: until_text(wait),
+            more: open.len() - 1,
+        });
+        let wait_spans: Vec<_> = holder_waits
+            .iter()
+            .filter_map(|(wait, ended)| {
+                let opened = parse_time(&wait.created_at)?;
+                Some((opened, ended.as_deref().and_then(parse_time)))
+            })
+            .collect();
         let clock_facts = ClockFacts {
             needs_you: facts.needs_you.as_ref().map(|needs_you| {
                 (
@@ -151,6 +188,7 @@ pub(super) fn clocks(
             note: holder
                 .and_then(|holder| notes.get(&holder.session_id))
                 .map(|note| (parse_time(&note.at).unwrap_or(now), note.text.clone())),
+            wait,
         };
         let ball = clock::ball(&clock_facts, now, stall);
         let mut ticket_intervals = intervals.get(key).cloned().unwrap_or_default();
@@ -163,7 +201,13 @@ pub(super) fn clocks(
                 to: clock::ms(now),
             });
         }
-        let strip = clock::segments(&ticket_intervals, &clock_facts.jobs, window, stall);
+        let strip = clock::segments(
+            &ticket_intervals,
+            &clock_facts.jobs,
+            &wait_spans,
+            window,
+            stall,
+        );
         clocks.insert(
             key.clone(),
             clock::clock_json(&ball, clock::segments_json(&strip)),

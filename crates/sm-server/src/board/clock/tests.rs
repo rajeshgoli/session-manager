@@ -243,6 +243,69 @@ fn d7_constructed_stalled_after_fifteen_minutes() {
     );
 }
 
+fn far_2434_wait(more: usize) -> Option<ClockWait> {
+    Some(ClockWait {
+        since: datetime!(2026-09-29 23:58:47 UTC),
+        target: "far-2434-h3".to_owned(),
+        deliverable: "#2434 base run done".to_owned(),
+        until: "Fri 30 Oct 03:00 UTC".to_owned(),
+        more,
+    })
+}
+
+#[test]
+fn sm2611_an_open_sm_await_replaces_stalled() {
+    // The seat idled 34 minutes but said with `sm await` what it waits for.
+    let ball = check(
+        ClockFacts {
+            holder: idle_since(datetime!(2026-09-29 23:51:00 UTC)),
+            wait: far_2434_wait(0),
+            ..Default::default()
+        },
+        "awaiting",
+        "Waiting on far-2434-h3 26m: #2434 base run done · until Fri 30 Oct 03:00 UTC",
+    );
+    assert_eq!(ball.since, Some(datetime!(2026-09-29 23:58:47 UTC)));
+    check(
+        ClockFacts {
+            holder: idle_since(datetime!(2026-09-29 23:51:00 UTC)),
+            wait: far_2434_wait(2),
+            ..Default::default()
+        },
+        "awaiting",
+        "Waiting on far-2434-h3 26m: #2434 base run done · until Fri 30 Oct 03:00 UTC · +2 more",
+    );
+    // An owner note still wins; a running job and a working agent too.
+    check(
+        ClockFacts {
+            holder: idle_since(datetime!(2026-09-29 23:51:00 UTC)),
+            wait: far_2434_wait(0),
+            note: Some((NOW, "training overnight".to_owned())),
+            ..Default::default()
+        },
+        "idle",
+        "📌 training overnight",
+    );
+    check(
+        ClockFacts {
+            holder: Some((Activity::Working, NOW - Duration::minutes(3))),
+            wait: far_2434_wait(0),
+            ..Default::default()
+        },
+        "working",
+        "Agent working 3m",
+    );
+    // Without a live holder the wait does not show.
+    check(
+        ClockFacts {
+            wait: far_2434_wait(0),
+            ..Default::default()
+        },
+        "no_agent",
+        "No agent",
+    );
+}
+
 #[test]
 fn needs_you_wins_and_no_agent_is_last() {
     check(
@@ -314,7 +377,7 @@ fn segments_map_parts_and_merge() {
         quiet_since: Some(at(50)),
         ..job("tests", JobPhase::Ended, at(20))
     }];
-    let segments = segments(&intervals, &jobs, (at(0), at(90)), STALL);
+    let segments = segments(&intervals, &jobs, &[], (at(0), at(90)), STALL);
     assert_eq!(
         strip(&segments),
         [
@@ -337,7 +400,7 @@ fn segments_turn_idle_past_the_stall_threshold_stalled() {
         interval("model", 30, 40),
         interval("idle", 40, 50),
     ];
-    let segments = segments(&intervals, &[], (at(0), at(60)), STALL);
+    let segments = segments(&intervals, &[], &[], (at(0), at(60)), STALL);
     assert_eq!(
         strip(&segments),
         [
@@ -350,6 +413,39 @@ fn segments_turn_idle_past_the_stall_threshold_stalled() {
 }
 
 #[test]
+fn segments_show_idle_inside_an_sm_await_as_awaiting() {
+    // Idle 0..60; the agent ran `sm await` at 10 and the wait ended at 40.
+    // Working time inside a wait stays working.
+    let intervals = [
+        interval("idle", 0, 20),
+        interval("model", 20, 25),
+        interval("idle", 25, 60),
+    ];
+    let waits = [(at(10), Some(at(40)))];
+    let closed = segments(&intervals, &[], &waits, (at(0), at(60)), STALL);
+    assert_eq!(
+        strip(&closed),
+        [
+            ("idle", 0, 10),
+            ("awaiting", 10, 20),
+            ("working", 20, 25),
+            ("awaiting", 25, 40),
+            ("idle", 40, 55),
+            ("stalled", 55, 60),
+        ]
+    );
+    // An open wait runs to the window's end.
+    let segments = segments(
+        &intervals[..1],
+        &[],
+        &[(at(5), None)],
+        (at(0), at(20)),
+        STALL,
+    );
+    assert_eq!(strip(&segments), [("idle", 0, 5), ("awaiting", 5, 20)]);
+}
+
+#[test]
 fn segments_take_the_ball_order_across_agents() {
     // One agent idle, another working, a third waiting on the owner.
     let intervals = [
@@ -357,7 +453,7 @@ fn segments_take_the_ball_order_across_agents() {
         interval("model", 5, 20),
         interval("you", 10, 15),
     ];
-    let segments = segments(&intervals, &[], (at(0), at(30)), STALL);
+    let segments = segments(&intervals, &[], &[], (at(0), at(30)), STALL);
     assert_eq!(
         strip(&segments),
         [

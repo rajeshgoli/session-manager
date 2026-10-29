@@ -234,7 +234,7 @@ impl WorkClaimStore {
                 continue;
             }
             let text = format!(
-                "[sm claim] Idle {}m, nothing pending. You hold: {}.",
+                "[sm claim] Idle {}m, nothing pending. You hold: {}. {AWAIT_HINT}",
                 idle_for.whole_minutes(),
                 held_list(&tx, &named)?
             );
@@ -253,6 +253,10 @@ impl WorkClaimStore {
         Ok(notified)
     }
 }
+
+/// Check C's closing line (sm#2611): how a seat that waits on something
+/// says so, so the board shows the wait instead of Stalled.
+pub const AWAIT_HINT: &str = "If you are waiting on another agent, a ticket, a queue job or work outside sm, run `sm await <agent | #ticket | queue:<job id> | <kind>:<id>> --for \"<what>\" --until <ETA>` so the board shows the wait instead of Stalled.";
 
 /// The open tickets linked to `pr`, or `None` while any linked ticket is
 /// unsettled: not answered by GitHub in this pass and not already recorded
