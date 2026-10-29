@@ -7,6 +7,8 @@
 //! - Check C: idle for `idle_nudge_minutes` with nothing pending.
 //! - Check D (`merge_findings`): a PR merged with P0/P1 review findings
 //!   nobody answered.
+//! - Check E (sm#2611): the board first shows the agent's ticket Stalled
+//!   (`board.stall_minutes`); once per agent, it names `sm await`.
 //!
 //! Every message is an `important` queue message in the `work_claim`
 //! category and writes a `claim.nudge` event on each item it names. What the
@@ -248,6 +250,84 @@ impl WorkClaimStore {
                 &mut notified,
             )?;
             set_nudged_idle(&tx, &named, now)?;
+        }
+        tx.commit()?;
+        Ok(notified)
+    }
+}
+
+impl WorkClaimStore {
+    /// Check E (sm#2611): each idle session with nothing pending, idle at
+    /// least `stall` (the board's Stalled threshold), holding open claims,
+    /// and never asked before, gets one message naming `sm await`. An agent
+    /// that wakes on its own schedule (a cron, a poll loop) shows Stalled
+    /// between wakes but never idles long enough for Check C. A session
+    /// Check C already told in this idle stretch carries the same hint and
+    /// is left alone. Returns the sessions sent a message.
+    pub fn run_check_e(
+        &self,
+        candidates: &[IdleSession],
+        sessions: &SessionDirectory,
+        stall: Duration,
+        now: OffsetDateTime,
+    ) -> Result<Vec<String>> {
+        let Some(mut conn) = self.open_existing()? else {
+            return Ok(Vec::new());
+        };
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut notified = Vec::new();
+        for candidate in candidates {
+            let is_idle = sessions
+                .get(&candidate.session_id)
+                .is_some_and(|session| session.state == HolderState::Idle);
+            let Some(last_activity) = parse_time(&candidate.last_activity) else {
+                continue;
+            };
+            let idle_for = now - last_activity;
+            if !is_idle || candidate.waiting || idle_for < stall {
+                continue;
+            }
+            let asked = tx
+                .query_row(
+                    "SELECT 1 FROM events WHERE kind = 'claim.nudge' AND session_id = ?1
+                        AND json_extract(payload, '$.check') = 'E' LIMIT 1",
+                    params![candidate.session_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if asked {
+                continue;
+            }
+            let named = query_claims(
+                &tx,
+                "WHERE session_id = ?1 AND ended_at IS NULL AND reserved_at IS NULL",
+                params![candidate.session_id],
+            )?;
+            let told_by_c = named.iter().any(|claim| {
+                claim
+                    .nudged_idle_at
+                    .as_deref()
+                    .and_then(parse_time)
+                    .is_some_and(|nudged| nudged >= last_activity)
+            });
+            if named.is_empty() || told_by_c {
+                continue;
+            }
+            let text = format!(
+                "[sm claim] The board shows {} Stalled: idle {}m, nothing pending. {AWAIT_HINT} sm asks this once.",
+                held_list(&tx, &named)?,
+                idle_for.whole_minutes()
+            );
+            nudge(
+                &tx,
+                "E",
+                &candidate.session_id,
+                &named,
+                &text,
+                now,
+                &mut notified,
+            )?;
         }
         tx.commit()?;
         Ok(notified)

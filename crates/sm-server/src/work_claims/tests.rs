@@ -1728,3 +1728,57 @@ fn check_b_defers_when_github_omits_an_alias() {
     );
     assert_eq!(queued(&db, "eng1").len(), 1);
 }
+
+#[test]
+fn sm2611_check_e_asks_once_when_the_board_shows_stalled() {
+    let (store, db) = new_store();
+    let dir = directory();
+    claim_ticket(&store, "lead", &dir);
+    let stall = Duration::from_secs(15 * 60);
+    let run = |sessions: &[IdleSession], now: i64| {
+        store.run_check_e(sessions, &dir, stall, at(now)).unwrap()
+    };
+    // Under the board's threshold, or waiting on something: not asked.
+    assert!(run(&idle_lead(0, false), 14).is_empty());
+    assert!(run(&idle_lead(0, true), 16).is_empty());
+    // Stalled on the board: asked once.
+    assert_eq!(run(&idle_lead(0, false), 16), vec!["lead"]);
+    assert_eq!(
+        queued(&db, "lead"),
+        vec![format!(
+            "[sm claim] The board shows ticket #1 (open) Stalled: idle 16m, nothing pending. {} sm asks this once.",
+            checks::AWAIT_HINT
+        )]
+    );
+    assert_eq!(nudges(&store)[0].3["check"], "E");
+    // A cron wakes it every 20 minutes; the next stall is not asked again.
+    assert!(run(&idle_lead(20, false), 36).is_empty());
+    assert_eq!(queued(&db, "lead").len(), 1);
+}
+
+#[test]
+fn sm2611_check_e_leaves_a_seat_check_c_already_told() {
+    let (store, db) = new_store();
+    let dir = directory();
+    claim_ticket(&store, "lead", &dir);
+    let c = store
+        .run_check_c(
+            &answered(&[1]),
+            &idle_lead(0, false),
+            &dir,
+            Duration::from_secs(30 * 60),
+            at(30),
+        )
+        .unwrap();
+    assert_eq!(c, vec!["lead"]);
+    let e = store
+        .run_check_e(
+            &idle_lead(0, false),
+            &dir,
+            Duration::from_secs(15 * 60),
+            at(35),
+        )
+        .unwrap();
+    assert!(e.is_empty());
+    assert_eq!(queued(&db, "lead").len(), 1);
+}

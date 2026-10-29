@@ -671,11 +671,18 @@ pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
     let jobs = super::agent_waits::ended_jobs(state, &store.open_waits()?);
     notified.extend(store.run_wait_endings(&answered, &jobs, &sessions, now)?);
     notified.extend(run_check_d(state, &store, &sessions, now));
+    let idle = idle_sessions(state)?;
     notified.extend(store.run_check_c(
         &answered,
-        &idle_sessions(state)?,
+        &idle,
         &sessions,
         state.config.work_claims.idle_nudge(),
+        now,
+    )?);
+    notified.extend(store.run_check_e(
+        &idle,
+        &sessions,
+        std::time::Duration::from_secs(u64::from(state.config.board.stall_minutes) * 60),
         now,
     )?);
     notified.sort();
