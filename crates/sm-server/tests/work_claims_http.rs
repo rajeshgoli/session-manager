@@ -15,6 +15,7 @@ use sm_server::{
         OwnerDocSource,
     },
     owner_docs::git_blob_sha,
+    review::findings::{Finding, FindingsSource, PrFindings},
     work_claims::{BatchFetch, GhItem, ItemFetch, WorkClaimStore, WorkItemSource, WorkKind},
 };
 use std::{
@@ -72,6 +73,41 @@ impl StubItems {
             .get_mut(&number)
             .unwrap()
             .merged_at = Some(merged_at);
+    }
+}
+
+/// Check D's GitHub: open findings per PR; `None` means the read fails.
+#[derive(Clone, Default)]
+struct StubFindings(Arc<Mutex<BTreeMap<i64, Option<Vec<Finding>>>>>);
+
+impl FindingsSource for StubFindings {
+    fn findings(&self, _repo: &str, pr: i64) -> Result<PrFindings, String> {
+        let open = match self.0.lock().unwrap().get(&pr) {
+            Some(None) => return Err("gh api graphql failed".into()),
+            Some(Some(open)) => open.clone(),
+            None => Vec::new(),
+        };
+        Ok(PrFindings {
+            author: "me".into(),
+            state: "MERGED".into(),
+            merged_at: None,
+            url: format!("https://github.com/{REPO}/pull/{pr}"),
+            open,
+            lower_open: 0,
+        })
+    }
+}
+
+fn p1(id: &str) -> Finding {
+    Finding {
+        id: id.into(),
+        severity: 1,
+        path: "src/store.rs".into(),
+        line: Some(683),
+        title: "Never-filled orders read as filled".into(),
+        url: format!("https://github.com/{REPO}/pull/9#discussion_r{id}"),
+        commit: "aaaa1111abcdef".into(),
+        created_at: "2026-10-28T16:40:01Z".into(),
     }
 }
 
@@ -169,6 +205,7 @@ struct Fixture {
     app: axum::Router,
     state: AppState,
     items: StubItems,
+    findings: StubFindings,
     dir: PathBuf,
 }
 
@@ -220,8 +257,10 @@ fn fixture() -> Fixture {
     items.put(2, WorkKind::Ticket, "closed");
     items.put(9, WorkKind::Pr, "open");
     items.put(10, WorkKind::Pr, "merged");
+    let findings = StubFindings::default();
     let state = AppState::new(config)
         .with_work_item_source(Arc::new(items.clone()))
+        .with_review_findings_source(Arc::new(findings.clone()))
         .with_merge_hold_source(Arc::new(items.clone()))
         .with_owner_doc_source(Arc::new(StubDocs))
         .with_github_review_poster(Arc::new(StubPoster));
@@ -233,6 +272,7 @@ fn fixture() -> Fixture {
         app: router(state.clone()),
         state,
         items,
+        findings,
         dir,
     }
 }
@@ -764,6 +804,95 @@ async fn the_sync_pass_runs_check_a_after_a_merge_without_closes() {
     );
     f.state.run_work_claims_sync_pass().unwrap();
     assert_eq!(claim_texts(&f, "eng00001").len(), 1);
+}
+
+#[tokio::test]
+async fn the_sync_pass_runs_check_d_once_for_a_pr_merged_with_open_findings() {
+    let f = fixture();
+    claim(&f, "eng00001", "pr", 9, json!({})).await;
+    claim(&f, "eng00002", "pr", 10, json!({})).await;
+    f.findings
+        .0
+        .lock()
+        .unwrap()
+        .insert(9, Some(vec![p1("11"), p1("12")]));
+    f.items.merge(9, 3);
+    f.items.merge(10, 3);
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert_eq!(
+        claim_texts(&f, "eng00001"),
+        vec![format!(
+            "[sm claim] PR #9 merged with 2 P0/P1 review findings nobody answered:\n\
+             - P1 src/store.rs:683 — Never-filled orders read as filled (reviewed at aaaa111) \
+             https://github.com/{REPO}/pull/9#discussion_r11\n\
+             - P1 src/store.rs:683 — Never-filled orders read as filled (reviewed at aaaa111) \
+             https://github.com/{REPO}/pull/9#discussion_r12\n\
+             A finding is answered by a reply on its thread, a resolve, or a PR comment from \
+             the author naming its reviewed commit."
+        )]
+    );
+    // PR 10 merged clean: no message.
+    assert!(claim_texts(&f, "eng00002").is_empty());
+    // Once per PR.
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert_eq!(claim_texts(&f, "eng00001").len(), 1);
+    assert!(f
+        .store()
+        .merged_prs_due_findings_check(time::OffsetDateTime::now_utc())
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn check_d_retries_a_failed_read_and_tells_the_owner_when_the_holder_retired() {
+    let f = fixture();
+    claim(&f, "eng00001", "pr", 9, json!({})).await;
+    f.findings.0.lock().unwrap().insert(9, None);
+    f.items.merge(9, 3);
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert!(claim_texts(&f, "eng00001").is_empty());
+    let (status, body) =
+        request(&f.app, "POST", "/sessions/eng00001/retire", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    f.findings.0.lock().unwrap().insert(9, Some(vec![p1("11")]));
+    f.state.run_work_claims_sync_pass().unwrap();
+    f.state.run_work_claims_sync_pass().unwrap();
+    let conn = rusqlite::Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let (title, body): (String, String) = conn
+        .query_row("SELECT title, body_markdown FROM owner_messages", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(title, "PR #9 merged with unanswered review findings");
+    assert!(body.contains("the agent that held it is gone"), "{body}");
+    assert!(
+        body.contains("- [P1 src/store.rs:683 — Never-filled orders read as filled]"),
+        "{body}"
+    );
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM owner_messages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn check_d_tells_the_owner_when_the_holder_is_stopped() {
+    let f = fixture();
+    let (status, body) = claim(&f, "asleep01", "pr", 9, json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    f.findings.0.lock().unwrap().insert(9, Some(vec![p1("11")]));
+    f.items.merge(9, 3);
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert!(claim_texts(&f, "asleep01").is_empty());
+    let conn = rusqlite::Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM owner_messages WHERE title = 'PR #9 merged with unanswered review findings'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[tokio::test]

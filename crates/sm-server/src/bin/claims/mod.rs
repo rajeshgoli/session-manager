@@ -5,6 +5,7 @@
 use super::*;
 use crate::git_repo::{resolve_repo_slug, run_ok, DocTools, ProcessTools};
 
+pub(crate) mod findings;
 pub(crate) mod waits;
 pub(crate) mod worktree;
 
@@ -41,7 +42,10 @@ pub(crate) struct TicketArgs {
 }
 
 #[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
 pub(crate) struct PrArgs {
+    #[command(subcommand)]
+    command: Option<findings::PrCommand>,
     /// PR number to claim; without one, the current branch's open PR
     number: Option<i64>,
     /// owner/name, or a bare repo name with the cwd repo's owner
@@ -167,6 +171,9 @@ pub(crate) fn run_ticket(client: &ApiClient, args: TicketArgs) -> Result<()> {
 }
 
 pub(crate) fn run_pr(client: &ApiClient, args: PrArgs) -> Result<()> {
+    if let Some(command) = args.command {
+        return findings::run(command);
+    }
     let session_id = managed_session_id("sm pr")?;
     let cwd = env::current_dir()?;
     let target = resolve_claim_target(&ProcessTools, &cwd, args.repo.as_deref())?;

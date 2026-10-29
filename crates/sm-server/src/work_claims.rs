@@ -38,7 +38,7 @@ pub const MESSAGE_CATEGORY: &str = "work_claim";
 
 // Bump when this initializer or its merge-hold, loose-worktree, or board
 // schema dependencies change. The marker is published with the whole schema.
-const WORK_CLAIMS_SCHEMA_VERSION: &str = "2";
+const WORK_CLAIMS_SCHEMA_VERSION: &str = "3";
 
 fn work_claims_schema_is_current(conn: &Connection) -> Result<bool> {
     if !table_exists(conn, "work_claims_meta")? {
@@ -79,6 +79,7 @@ pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
 fn init_work_claims_schema_in_transaction(conn: &Connection) -> Result<()> {
     merge_holds::init_schema(conn)?;
     waits::init_schema(conn)?;
+    merge_findings::init_schema(conn)?;
     worktrees::loose::init_schema(conn)?;
     crate::board::init_board_schema(conn)?;
     conn.execute_batch(
@@ -2858,6 +2859,7 @@ fn rfc3339_before(age: Duration) -> String {
 }
 
 mod checks;
+pub mod merge_findings;
 pub use checks::{IdleSession, MERGE_SETTLE};
 
 #[cfg(test)]
