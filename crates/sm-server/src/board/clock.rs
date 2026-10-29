@@ -62,6 +62,22 @@ pub struct ClockFacts {
     /// A note the owner pinned to the holder (sm#1851): it replaces Idle
     /// and Stalled, since the owner knows why the agent waits.
     pub note: Option<(OffsetDateTime, String)>,
+    /// The holder's oldest open `sm await` (sm#2611): it replaces Idle and
+    /// Stalled, since the agent stated what it waits for and until when.
+    pub wait: Option<ClockWait>,
+}
+
+/// An open `sm await` of the holder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClockWait {
+    pub since: OffsetDateTime,
+    /// The awaited seat's name, or `#N`.
+    pub target: String,
+    pub deliverable: String,
+    /// `Fri 30 Oct 03:00 UTC`.
+    pub until: String,
+    /// The holder's other open waits.
+    pub more: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +245,19 @@ pub fn ball(facts: &ClockFacts, now: OffsetDateTime, stall: Duration) -> Ball {
         if let Some((pinned, note)) = &facts.note {
             return make("idle", *pinned, format!("📌 {note}"));
         }
+        if let Some(wait) = &facts.wait {
+            let mut text = format!(
+                "Waiting on {} {}: {} · until {}",
+                wait.target,
+                age(now - wait.since),
+                wait.deliverable,
+                wait.until
+            );
+            if wait.more > 0 {
+                text.push_str(&format!(" · +{} more", wait.more));
+            }
+            return make("awaiting", wait.since, text);
+        }
         let idle = now - since;
         return if idle < stall {
             make("idle", since, format!("Idle {}", age(idle)))
@@ -276,10 +305,12 @@ fn from_ms(at: i64) -> OffsetDateTime {
 
 /// The strip over `[from, to)`. `intervals` are the ticket's
 /// `analytics_time::thread_intervals` from `from - stall`, so an idle run
-/// that began before the window turns stalled on time.
+/// that began before the window turns stalled on time. `waits` are the
+/// holder's `sm await` spans; idle time inside one is `awaiting`.
 pub fn segments(
     intervals: &[ThreadInterval],
     jobs: &[ClockJob],
+    waits: &[(OffsetDateTime, Option<OffsetDateTime>)],
     (from, to): (OffsetDateTime, OffsetDateTime),
     stall: Duration,
 ) -> Vec<Segment> {
@@ -293,9 +324,14 @@ pub fn segments(
             Some((started, ended, job.quiet_since.map(ms)))
         })
         .collect();
+    let waits: Vec<(i64, i64)> = waits
+        .iter()
+        .map(|&(opened, ended)| (ms(opened), ended.map_or(i64::MAX, ms)))
+        .collect();
     let mut points: Vec<i64> = intervals
         .iter()
         .flat_map(|interval| [interval.from, interval.to])
+        .chain(waits.iter().flat_map(|&(opened, ended)| [opened, ended]))
         .chain(runs.iter().flat_map(|&(started, ended, quiet)| {
             [Some(started), Some(ended), quiet].into_iter().flatten()
         }))
@@ -337,6 +373,12 @@ pub fn segments(
             }
             "review" => "review",
             "you" => "you",
+            _ if waits
+                .iter()
+                .any(|&(opened, ended)| opened <= start && start < ended) =>
+            {
+                "awaiting"
+            }
             _ => "idle",
         };
         match merged.last_mut() {

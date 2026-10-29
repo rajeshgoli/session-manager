@@ -919,7 +919,7 @@ async fn the_sync_pass_runs_check_c_for_an_idle_holder_waiting_on_nothing() {
     assert_eq!(texts.len(), 1, "{texts:?}");
     assert!(texts[0].starts_with("[sm claim] Idle "), "{}", texts[0]);
     assert!(
-        texts[0].ends_with("m, nothing pending. You hold: ticket #1 (open)."),
+        texts[0].contains("m, nothing pending. You hold: ticket #1 (open). If you are waiting"),
         "{}",
         texts[0]
     );

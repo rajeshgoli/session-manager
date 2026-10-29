@@ -96,6 +96,7 @@ test('clock clips at the chosen window and preserves gaps and quiet segments', (
   assert.ok(Math.abs(result[1].left - 200 / 3) < 1e-8);
   assert.equal(BALL_TONE.job_quiet, 'red');
   assert.equal(BALL_TONE.no_agent, 'red');
+  assert.equal(BALL_TONE.awaiting, 'amber');
   assert.equal(clockSegments([], end, 24).length, 0);
 });
 test('Start uses rendered name and brief and omits provider-default model/effort', () => {

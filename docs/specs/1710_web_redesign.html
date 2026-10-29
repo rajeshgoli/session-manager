@@ -969,18 +969,20 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <tr><td>3</td><td>At least one of the ticket's jobs is running</td><td>job_running</td><td>earliest running start</td><td>One job: “{Type} running {age} of {limit}” (drop “of {limit}” when there is no limit). Several: “{n} running · {m} waiting {oldest wait}”</td></tr>
 <tr><td>4</td><td>At least one of the ticket's jobs is waiting</td><td>queue</td><td>earliest queued_at</td><td>One job: “Job waiting {age} · {ordinal} in line”. Several with the same reason: “{m} jobs waiting {age} for a slot”</td></tr>
 <tr><td>5</td><td>The holder waits on a Codex review of the ticket's PR</td><td>review</td><td>review requested</td><td>“Codex review on PR #{pr}, {age}”</td></tr>
+<tr><td>5a</td><td>A live holder is idle and has an open <code>sm await</code> (sm#2611), and the owner pinned no note on it. Several open waits: the oldest, with “ · +{n} more”</td><td>awaiting</td><td>wait opened</td><td>“Waiting on {seat name or #N} {age}: {for} · until {ETA}”, e.g. “Waiting on far-2434-h3 26m: #2434 base run done · until Fri 30 Oct 03:00 UTC”</td></tr>
 <tr><td>6</td><td>A live holder is idle for less than <code>board.stall_minutes</code> (default 15)</td><td>idle</td><td>idle start</td><td>“Idle {age}”</td></tr>
 <tr><td>7</td><td>A live holder is idle for at least <code>board.stall_minutes</code></td><td>stalled</td><td>idle start + 0</td><td>“Stalled {age}: agent idle, nothing running”</td></tr>
 <tr><td>8</td><td>No live holder</td><td>no_agent</td><td>claim released or holder stopped</td><td>“No agent”</td></tr>
 </tbody>
 </table>
-<p><b>Colours.</b> <code>you</code> is magenta. <code>working</code> and <code>job_running</code> are green. <code>queue</code> and <code>review</code> are amber. <code>idle</code> is muted. <code>stalled</code>, <code>job_quiet</code> and <code>no_agent</code> are red.</p>
+<p><b>Colours.</b> <code>you</code> is magenta. <code>working</code> and <code>job_running</code> are green. <code>queue</code>, <code>review</code> and <code>awaiting</code> are amber. <code>idle</code> is muted. <code>stalled</code>, <code>job_quiet</code> and <code>no_agent</code> are red.</p>
 <p><b>Ages.</b> Under 1 hour: “{m}m”. Otherwise: “{h}h {m}m”.</p>
 <p><b>Segments.</b> Start from the ticket's instants in the Analytics › Time timeline (<code>analytics_time.rs</code>). Add <code>analytics_time::thread_intervals(repo, number, from, to)</code>, which returns the parts over the window.</p>
 <ul>
 <li><code>model</code>, <code>tools</code> and <code>agents</code> become <code>working</code>.</li>
 <li><code>queue</code> becomes <code>job_running</code> wherever one of the ticket's jobs was running at that instant, and <code>queue</code> otherwise.</li>
 <li><code>review</code> and <code>you</code> keep their names.</li>
+<li><code>idle</code> becomes <code>awaiting</code> at instants inside one of the holder's <code>sm await</code> waits (opened to ended, or to now while open), and stays <code>idle</code> otherwise.</li>
 <li><code>idle</code> becomes <code>idle</code>, and instants past the stall threshold within an idle run become <code>stalled</code> on the strip.</li>
 <li>A <code>job_running</code> instant after a job's <code>quiet_since</code> becomes <code>quiet</code>, drawn red.</li>
 <li>Adjacent segments of the same kind merge.</li>

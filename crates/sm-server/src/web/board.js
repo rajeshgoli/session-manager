@@ -8,7 +8,7 @@ import { exactConfig } from './launch-fields.js';
 import { HandoffPopover } from './handoff.js';
 import { PolicyPopover, reviewerText, setByText } from './reviews.js';
 
-export const BALL_TONE = { you: 'magenta', working: 'green', job_running: 'green', queue: 'amber', review: 'amber', idle: 'muted', stalled: 'red', job_quiet: 'red', no_agent: 'red' };
+export const BALL_TONE = { you: 'magenta', working: 'green', job_running: 'green', queue: 'amber', review: 'amber', awaiting: 'amber', idle: 'muted', stalled: 'red', job_quiet: 'red', no_agent: 'red' };
 export const OTHER_ROW_LIMIT = 10;
 const STATE_TONE = { needs_you: 'magenta', ready: 'accent', in_progress: 'green', close_ready: 'cyan', standing: 'cyan', blocked: 'muted', done: 'muted' };
 const ticketKey = (t) => `${t.repo}#${t.number}`;

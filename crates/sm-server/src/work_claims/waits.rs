@@ -250,6 +250,30 @@ impl WorkClaimStore {
         query_waits(&conn, "WHERE ended_at IS NULL ORDER BY created_at, id", [])
     }
 
+    /// Every wait open at some instant after `from`, oldest first, with
+    /// when it ended (`None` while open): the board's ticket clock (#2611).
+    pub fn waits_since(&self, from: OffsetDateTime) -> Result<Vec<(AgentWait, Option<String>)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        if !table_exists(&conn, "agent_waits")? {
+            return Ok(Vec::new());
+        }
+        let filter = "WHERE ended_at IS NULL OR ended_at > ?1 ORDER BY created_at, id";
+        let from = format_time(from);
+        let ended: BTreeMap<String, Option<String>> = conn
+            .prepare(&format!("SELECT id, ended_at FROM agent_waits {filter}"))?
+            .query_map(params![from], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(query_waits(&conn, filter, params![from])?
+            .into_iter()
+            .map(|wait| {
+                let at = ended.get(&wait.id).cloned().flatten();
+                (wait, at)
+            })
+            .collect())
+    }
+
     /// Ends the waiter's open wait on `target`, or all of them. Returns how
     /// many ended.
     pub fn cancel_waits(
