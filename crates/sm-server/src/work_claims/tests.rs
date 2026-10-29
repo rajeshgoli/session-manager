@@ -1736,8 +1736,16 @@ fn sm2611_check_e_asks_once_when_the_board_shows_stalled() {
     claim_ticket(&store, "lead", &dir);
     let stall = Duration::from_secs(15 * 60);
     let run = |sessions: &[IdleSession], now: i64| {
-        store.run_check_e(sessions, &dir, stall, at(now)).unwrap()
+        store
+            .run_check_e(sessions, &BTreeSet::new(), &dir, stall, at(now))
+            .unwrap()
     };
+    // The owner pinned a note: the board shows it, not Stalled.
+    let noted = BTreeSet::from(["lead".to_owned()]);
+    assert!(store
+        .run_check_e(&idle_lead(0, false), &noted, &dir, stall, at(16))
+        .unwrap()
+        .is_empty());
     // Under the board's threshold, or waiting on something: not asked.
     assert!(run(&idle_lead(0, false), 14).is_empty());
     assert!(run(&idle_lead(0, true), 16).is_empty());
@@ -1774,6 +1782,7 @@ fn sm2611_check_e_leaves_a_seat_check_c_already_told() {
     let e = store
         .run_check_e(
             &idle_lead(0, false),
+            &BTreeSet::new(),
             &dir,
             Duration::from_secs(15 * 60),
             at(35),

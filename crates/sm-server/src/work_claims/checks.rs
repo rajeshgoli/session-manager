@@ -263,10 +263,13 @@ impl WorkClaimStore {
     /// that wakes on its own schedule (a cron, a poll loop) shows Stalled
     /// between wakes but never idles long enough for Check C. A session
     /// Check C already told in this idle stretch carries the same hint and
-    /// is left alone. Returns the sessions sent a message.
+    /// is left alone, and so is one in `noted`: the board shows an
+    /// owner-pinned note in its place of Stalled. Returns the sessions sent
+    /// a message.
     pub fn run_check_e(
         &self,
         candidates: &[IdleSession],
+        noted: &BTreeSet<String>,
         sessions: &SessionDirectory,
         stall: Duration,
         now: OffsetDateTime,
@@ -284,7 +287,11 @@ impl WorkClaimStore {
                 continue;
             };
             let idle_for = now - last_activity;
-            if !is_idle || candidate.waiting || idle_for < stall {
+            if !is_idle
+                || candidate.waiting
+                || idle_for < stall
+                || noted.contains(&candidate.session_id)
+            {
                 continue;
             }
             let asked = tx
