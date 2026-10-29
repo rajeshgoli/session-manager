@@ -161,6 +161,7 @@ pub(super) fn clocks(
                     .filter(|name| !name.is_empty())
                     .unwrap_or_else(|| id.chars().take(8).collect()),
                 WaitTarget::Ticket { number, .. } => format!("#{number}"),
+                WaitTarget::Job(id) | WaitTarget::External(id) => id,
             },
             deliverable: wait.deliverable.clone(),
             until: until_text(wait),

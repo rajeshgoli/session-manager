@@ -5,6 +5,10 @@
 //! awaited seat messages the waiter (`delivered`), the awaited ticket closes,
 //! the awaited seat retires, the ETA passes, the waiter cancels, or the
 //! waiter retires; the three sync-time endings message the waiter.
+//!
+//! A wait may also name a queue job (`queue:<job id>`), which ends it when the
+//! job ends, or work outside sm (`<kind>:<id>`, e.g. `modal:ap-12`), which
+//! only the ETA, a cancel or the waiter's retire ends (sm#2611).
 
 use super::checks::{format_time, parse_time};
 use super::*;
@@ -15,35 +19,68 @@ pub const MAX_WAIT: Duration = Duration::from_secs(72 * 60 * 60);
 pub const MAX_DELIVERABLE_CHARS: usize = 200;
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
+    // Waits from before sm#2611 allowed only seats and tickets; SQLite cannot
+    // widen a CHECK in place, so the table is rebuilt once.
+    let old: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'agent_waits'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let migrate = old.is_some_and(|sql| !sql.contains("target_ref"));
+    if migrate {
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS agent_waits_open;
+             ALTER TABLE agent_waits RENAME TO agent_waits_v1;",
+        )?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS agent_waits (
             id TEXT PRIMARY KEY,
             waiter_session_id TEXT NOT NULL,
-            target_kind TEXT NOT NULL CHECK (target_kind IN ('seat','ticket')),
+            target_kind TEXT NOT NULL CHECK (target_kind IN ('seat','ticket','job','external')),
             target_session_id TEXT,
             repo TEXT,
             number INTEGER,
+            target_ref TEXT,                    -- job id, or the external reference
             deliverable TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             until_at TEXT NOT NULL,
             ended_at TEXT,
             end_reason TEXT CHECK (end_reason IN
-                ('delivered','ticket_closed','target_retired','expired','cancelled','waiter_retired')),
+                ('delivered','ticket_closed','target_retired','job_ended','expired',
+                 'cancelled','waiter_retired')),
             end_message_id TEXT);
         CREATE UNIQUE INDEX IF NOT EXISTS agent_waits_open ON agent_waits
             (waiter_session_id, target_kind, IFNULL(target_session_id,''), IFNULL(repo,''),
-             IFNULL(number,0))
+             IFNULL(number,0), IFNULL(target_ref,''))
             WHERE ended_at IS NULL;",
     )?;
+    if migrate {
+        conn.execute_batch(
+            "INSERT INTO agent_waits (id, waiter_session_id, target_kind, target_session_id,
+                repo, number, deliverable, created_at, updated_at, until_at, ended_at,
+                end_reason, end_message_id)
+             SELECT id, waiter_session_id, target_kind, target_session_id, repo, number,
+                deliverable, created_at, updated_at, until_at, ended_at, end_reason,
+                end_message_id
+               FROM agent_waits_v1;
+             DROP TABLE agent_waits_v1;",
+        )?;
+    }
     Ok(())
 }
 
-/// What a wait is on: a seat by session id, or a ticket.
+/// What a wait is on: a seat by session id, a ticket, a queue job by id, or
+/// work outside sm by the reference the waiter gave (`modal:ap-12`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitTarget {
     Seat(String),
     Ticket { repo: String, number: i64 },
+    Job(String),
+    External(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -54,6 +91,7 @@ pub struct AgentWait {
     pub target_session_id: Option<String>,
     pub repo: Option<String>,
     pub number: Option<i64>,
+    pub target_ref: Option<String>,
     pub deliverable: String,
     pub created_at: String,
     pub updated_at: String,
@@ -62,6 +100,12 @@ pub struct AgentWait {
 
 impl AgentWait {
     pub fn target(&self) -> WaitTarget {
+        let reference = || self.target_ref.clone().unwrap_or_default();
+        match self.target_kind.as_str() {
+            "job" => return WaitTarget::Job(reference()),
+            "external" => return WaitTarget::External(reference()),
+            _ => {}
+        }
         match (&self.target_session_id, &self.repo, self.number) {
             (_, Some(repo), Some(number)) if self.target_kind == "ticket" => WaitTarget::Ticket {
                 repo: repo.clone(),
@@ -81,6 +125,7 @@ pub enum WaitEnd {
     Delivered,
     TicketClosed,
     TargetRetired,
+    JobEnded,
     Expired,
     Cancelled,
     WaiterRetired,
@@ -92,6 +137,7 @@ impl WaitEnd {
             Self::Delivered => "delivered",
             Self::TicketClosed => "ticket_closed",
             Self::TargetRetired => "target_retired",
+            Self::JobEnded => "job_ended",
             Self::Expired => "expired",
             Self::Cancelled => "cancelled",
             Self::WaiterRetired => "waiter_retired",
@@ -162,7 +208,19 @@ fn target_name(sessions: &SessionDirectory, wait: &AgentWait) -> String {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| id.chars().take(8).collect()),
         WaitTarget::Ticket { number, .. } => format!("#{number}"),
+        WaitTarget::Job(id) | WaitTarget::External(id) => id,
     }
+}
+
+/// A queue job some open wait names, once it is no longer pending or
+/// running (or the queue has no such job): `run_wait_endings` ends its waits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndedJob {
+    /// `2611-check (job_071682aa6be6) succeeded`, or `job_x was not found`.
+    pub text: String,
+    /// The session the queue already woke with the job's result; its wait
+    /// ends without a second message.
+    pub woken: Option<String>,
 }
 
 impl WorkClaimStore {
@@ -199,18 +257,22 @@ impl WorkClaimStore {
             }
             None => {
                 let id = random_wait_id();
-                let (kind, seat, repo, number) = match target {
-                    WaitTarget::Seat(seat) => ("seat", Some(seat.as_str()), None, None),
+                let (kind, seat, repo, number, reference) = match target {
+                    WaitTarget::Seat(seat) => ("seat", Some(seat.as_str()), None, None, None),
                     WaitTarget::Ticket { repo, number } => {
                         insert_stub(&tx, repo, *number, WorkKind::Ticket)?;
-                        ("ticket", None, Some(repo.as_str()), Some(*number))
+                        ("ticket", None, Some(repo.as_str()), Some(*number), None)
+                    }
+                    WaitTarget::Job(id) => ("job", None, None, None, Some(id.as_str())),
+                    WaitTarget::External(reference) => {
+                        ("external", None, None, None, Some(reference.as_str()))
                     }
                 };
                 tx.execute(
                     "INSERT INTO agent_waits (id, waiter_session_id, target_kind,
-                        target_session_id, repo, number, deliverable, created_at, updated_at,
-                        until_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)",
+                        target_session_id, repo, number, target_ref, deliverable, created_at,
+                        updated_at, until_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
                     params![
                         id,
                         waiter,
@@ -218,6 +280,7 @@ impl WorkClaimStore {
                         seat,
                         repo,
                         number,
+                        reference,
                         deliverable,
                         stamp,
                         until
@@ -346,6 +409,7 @@ impl WorkClaimStore {
                     )
                     .optional()?
                     .is_some(),
+                WaitTarget::Job(_) | WaitTarget::External(_) => false,
             };
             if from_target {
                 end_wait(&tx, &wait, WaitEnd::Delivered, None, &stamp)?;
@@ -359,12 +423,14 @@ impl WorkClaimStore {
     /// After a sync pass, before Check C: ends waits whose waiter retired,
     /// whose ticket GitHub reported closed or missing in this pass
     /// (`answered`, as for Check A) or whose cached state is already closed,
-    /// whose seat retired, or whose ETA passed,
-    /// in that order of precedence; all but the first message the waiter.
+    /// whose seat retired, whose queue job ended (`jobs`), or whose ETA
+    /// passed, in that order of precedence; all but the first message the
+    /// waiter, except a job's end to the session the queue already woke.
     /// Returns the sessions sent a message.
     pub fn run_wait_endings(
         &self,
         answered: &BTreeSet<(String, i64)>,
+        jobs: &BTreeMap<String, EndedJob>,
         sessions: &SessionDirectory,
         now: OffsetDateTime,
     ) -> Result<Vec<String>> {
@@ -396,7 +462,7 @@ impl WorkClaimStore {
                                 && item.state != "open"
                         })
                 }
-                WaitTarget::Seat(_) => false,
+                _ => false,
             };
             let mut ending = match wait.target() {
                 WaitTarget::Ticket { repo, number } if ticket_settled => {
@@ -410,6 +476,15 @@ impl WorkClaimStore {
                         seat_label(sessions, &seat)
                     ),
                 )),
+                WaitTarget::Job(id) => jobs.get(&id).map(|job| {
+                    let text = (job.woken.as_deref() != Some(&wait.waiter_session_id)).then(|| {
+                        format!(
+                            "[sm await] Queue job {}. Your wait on it for \"{deliverable}\" ended.",
+                            job.text
+                        )
+                    });
+                    (WaitEnd::JobEnded, text.unwrap_or_default())
+                }),
                 _ => None,
             };
             if ending.is_none() && parse_time(&wait.until_at).is_some_and(|until| until <= now) {
@@ -425,6 +500,10 @@ impl WorkClaimStore {
             let Some((reason, text)) = ending else {
                 continue;
             };
+            if text.is_empty() {
+                end_wait(&tx, &wait, reason, None, &stamp)?;
+                continue;
+            }
             let message_id = crate::queue::enqueue_important_in_conn(
                 &tx,
                 &wait.waiter_session_id,
@@ -470,6 +549,7 @@ impl WorkClaimStore {
                         && match wait.target() {
                             WaitTarget::Seat(seat) => seat == session_id,
                             WaitTarget::Ticket { repo, number } => held.contains(&(repo, number)),
+                            WaitTarget::Job(_) | WaitTarget::External(_) => false,
                         }
                 })
                 .map(|wait| {
@@ -592,6 +672,7 @@ fn wait_event(
     let mut payload = json!({
         "wait_id": wait.id, "target_kind": wait.target_kind,
         "target_session_id": wait.target_session_id, "repo": wait.repo, "number": wait.number,
+        "target_ref": wait.target_ref,
         "for": wait.deliverable, "until": wait.until_at,
     });
     if let Some(reason) = reason {
@@ -617,7 +698,7 @@ fn query_waits(
 ) -> Result<Vec<AgentWait>> {
     let mut statement = conn.prepare(&format!(
         "SELECT id, waiter_session_id, target_kind, target_session_id, repo, number,
-                deliverable, created_at, updated_at, until_at
+                deliverable, created_at, updated_at, until_at, target_ref
            FROM agent_waits {filter}"
     ))?;
     let rows = statement
@@ -633,6 +714,7 @@ fn query_waits(
                 created_at: row.get(7)?,
                 updated_at: row.get(8)?,
                 until_at: row.get(9)?,
+                target_ref: row.get(10)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

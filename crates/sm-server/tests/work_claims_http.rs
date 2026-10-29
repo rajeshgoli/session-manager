@@ -1455,6 +1455,37 @@ fn feed_entry<'a>(feed: &'a Value, id: &str) -> &'a Value {
 }
 
 #[tokio::test]
+async fn sm2611_agent_waits_take_queue_jobs_and_work_outside_sm() {
+    let f = fixture();
+    let (status, body) = open_wait(&f, "lead0001", "modal:ap-12", &eta(60)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["label"], "modal:ap-12 · hashes");
+    assert_eq!(body["target_kind"], "external");
+    assert_eq!(body["target_ref"], "modal:ap-12");
+    for (target, detail) in [
+        ("queue:job_nope", "queue job job_nope not found"),
+        ("job_nope", "queue job job_nope not found"),
+        (
+            "modal:",
+            "an outside reference is <kind>:<id> with no spaces, at most 100 characters",
+        ),
+    ] {
+        let (status, body) = open_wait(&f, "lead0001", target, &eta(60)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{target}: {body}");
+        assert_eq!(body["detail"], detail);
+    }
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/claims/waits/cancel",
+        Some(json!({"waiter_session_id": "lead0001", "target": "modal:ap-12"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cancelled"], 1);
+}
+
+#[tokio::test]
 async fn agent_waits_validate_list_and_project_into_the_feed() {
     let f = fixture();
     let (status, body) = open_wait(&f, "lead0001", "other001-agent", &eta(420)).await;

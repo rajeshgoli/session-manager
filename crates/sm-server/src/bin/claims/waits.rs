@@ -1,14 +1,16 @@
-//! `sm await` (#2477): record that this session waits on another seat or a
-//! ticket for a deliverable, until an ETA. The server ends the wait when the
-//! awaited seat messages you, the ticket closes, the seat retires, or the
-//! ETA passes.
+//! `sm await` (#2477): record that this session waits on another seat, a
+//! ticket, a queue job or work outside sm for a deliverable, until an ETA.
+//! The server ends the wait when the awaited seat messages you, the ticket
+//! closes, the seat retires, the job ends, or the ETA passes.
 
 use super::*;
 
 #[derive(Args)]
 pub(crate) struct AwaitArgs {
-    /// The seat (id or name) or ticket (#N or owner/repo#N) you wait on;
-    /// without one, list your open waits and the waits on you
+    /// What you wait on: a seat (id or name), a ticket (#N or
+    /// owner/repo#N), a queue job (queue:<job id>), or work outside sm as
+    /// <kind>:<id> (cron:3fa9, modal:ap-12, gh-run:4567). Without one, list
+    /// your open waits and the waits on you
     target: Option<String>,
     /// What you wait for (required to open a wait)
     #[arg(long = "for", value_name = "DELIVERABLE")]
@@ -41,7 +43,9 @@ pub(crate) fn run_await(client: &ApiClient, args: AwaitArgs) -> Result<()> {
     }
     let Some(target) = target else {
         if args.deliverable.is_some() || args.until.is_some() {
-            bail!("sm await needs a target: a seat, #N or owner/repo#N");
+            bail!(
+                "sm await needs a target: a seat, #N, owner/repo#N, queue:<job id> or <kind>:<id>"
+            );
         }
         let payload = client.get_json(&format!(
             "/claims/waits?session_id={}",
@@ -100,6 +104,9 @@ fn target_text(wait: &Value) -> String {
             Some(title) => format!("#{number} \"{title}\""),
             None => format!("#{number}"),
         };
+    }
+    if let Some(reference) = wait["target_ref"].as_str() {
+        return reference.to_owned();
     }
     seat_text(&wait["target_name"], &wait["target_session_id"])
 }
