@@ -734,6 +734,34 @@ test('tmux mouse mode on: a tap reaches the agent with no motion, a drag selects
   } finally { await browser.close(); }
 });
 
+test('tmux owns the history: a selection dragged above the terminal leaves no second scrollback to scroll into (#2618)', async () => {
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  try {
+    const { page, errors } = await open(browser, { viewport: { width: 1440, height: 900 } });
+    // sm's tmux draws on the normal screen (smcup@), so lines it scrolls reach the
+    // browser terminal's buffer too.
+    await page.addInitScript(() => {
+      window.termOutput = '\x1b[?1000h\x1b[?1002h\x1b[?1006h' + Array.from({ length: 300 }, (_, i) => `old line ${i}`).join('\r\n') + '\r\n> ';
+    });
+    await page.goto(`${ORIGIN}/terminal/iter8-run`);
+    await page.locator('.term-page[data-connection="Live"]').waitFor();
+    await page.locator('.xterm-rows', { hasText: 'old line 299' }).waitFor();
+    const box = await page.evaluate(() => {
+      const r = document.querySelector('.xterm-screen').getBoundingClientRect();
+      return { x: r.left, y: r.top, h: r.height };
+    });
+    await page.mouse.move(box.x + 40, box.y + box.h / 2);
+    await page.mouse.down();
+    await page.mouse.move(box.x + 40, box.y - 40, { steps: 10 });
+    await page.waitForTimeout(400);
+    await page.mouse.up();
+    await page.mouse.wheel(0, 200);
+    assert.ok(await page.locator('.xterm-rows', { hasText: 'old line 299' }).isVisible(), 'the screen stays on tmux\'s current frame');
+    assert.equal(await page.evaluate(() => document.querySelector('.xterm-viewport').scrollHeight - document.querySelector('.xterm-viewport').clientHeight), 0, 'no browser-side scrollback');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); }
+});
+
 test('a mouse request sharing a sequence with the alternate screen draws in the alternate screen, and a tap still reaches the agent', async () => {
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   try {
