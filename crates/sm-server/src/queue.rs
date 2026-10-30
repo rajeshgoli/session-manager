@@ -4051,6 +4051,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     init_codex_review_requests_schema(conn)?;
     crate::owner_docs::init_owner_docs_schema(conn)?;
     crate::work_claims::init_work_claims_schema(conn)?;
+    conn.execute_batch(crate::owner_push::PUSH_DESK_LOG_SCHEMA)?;
     Ok(())
 }
 

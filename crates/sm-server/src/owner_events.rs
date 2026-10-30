@@ -24,6 +24,35 @@ pub const REPEAT_WINDOW_MS: i64 = 60_000;
 
 pub const SURFACES: [&str; 4] = ["android", "web", "agent_prompt", "terminal"];
 
+/// Web requests that can happen without the owner acting on the page.
+/// Keep this list aligned with the at-desk measurement query.
+pub const DESK_BACKGROUND_ACTIONS: &[&str] = &[
+    "watch.state",
+    "restart.latest",
+    "session.models",
+    "model.status",
+    "board.badge",
+    "board.seen",
+    "doc.head",
+    "queue.stats",
+    "utilization.series",
+    "host.status",
+    "terminal.ticket",
+    "app.meta",
+    "push.register",
+    "follow.list",
+    "artifact.activity",
+    "artifact.list",
+    "session.obligations",
+    "review.status",
+    "handoff.defaults",
+    "doc.drafts",
+    "claim.list",
+    "notice.ack",
+    "app.bootstrap",
+    "review.policies",
+];
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct OwnerEvent {
     pub id: i64,
@@ -240,10 +269,22 @@ impl OwnerEventStore {
             return Ok(0);
         }
         let conn = self.open_write()?;
-        Ok(conn.execute(
+        let removed = conn.execute(
             "DELETE FROM owner_events WHERE at_ms < ?1",
             [now_ms - RETENTION_MS],
-        )?)
+        )?;
+        let has_desk_log: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'push_desk_log')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_desk_log {
+            conn.execute(
+                "DELETE FROM push_desk_log WHERE created_at_ms < ?1",
+                [now_ms - RETENTION_MS],
+            )?;
+        }
+        Ok(removed)
     }
 
     /// When the owner last did anything in sm (overnight mode's idle rule).
@@ -252,6 +293,28 @@ impl OwnerEventStore {
             return Ok(None);
         };
         Ok(conn.query_row("SELECT MAX(at_ms) FROM owner_events", [], |row| row.get(0))?)
+    }
+
+    /// The owner acted on the web, but not Android, in the preceding five minutes.
+    pub fn at_desk(&self, at_ms: i64) -> Result<bool> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(false);
+        };
+        let mut statement = conn.prepare(
+            "SELECT surface, action FROM owner_events WHERE at_ms >= ?1 AND at_ms < ?2 \
+             AND surface IN ('web', 'android')",
+        )?;
+        let mut rows = statement.query(params![at_ms - 300_000, at_ms])?;
+        let mut web_action = false;
+        while let Some(row) = rows.next()? {
+            let surface: &str = row.get_ref(0)?.as_str()?;
+            if surface == "android" {
+                return Ok(false);
+            }
+            let action: &str = row.get_ref(1)?.as_str()?;
+            web_action |= !DESK_BACKGROUND_ACTIONS.contains(&action);
+        }
+        Ok(web_action)
     }
 
     /// Rows in `(at_ms, id)` order, and the cursor of the last row when more

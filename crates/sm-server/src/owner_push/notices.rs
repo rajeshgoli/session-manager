@@ -20,6 +20,7 @@ pub const NOTICE_WITHDRAW: &str = "withdraw";
 pub const RECENT_NOTICE_WINDOW: Duration = Duration::days(7);
 /// How far back the repair pass looks for subjects without a notice.
 pub const NOTICE_REPAIR_WINDOW: Duration = Duration::hours(24);
+pub const DESK_HOLD: Duration = Duration::minutes(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Notice {
@@ -196,6 +197,19 @@ CREATE TABLE IF NOT EXISTS owner_notice_withdrawals (
 );
 "#;
 
+pub const PUSH_DESK_LOG_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS push_desk_log (
+  notice_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  desk_at_create INTEGER NOT NULL,
+  held INTEGER NOT NULL,
+  outcome TEXT,
+  sent_at_ms INTEGER,
+  desk_at_send INTEGER
+);
+"#;
+
 const NOTICE_COLUMNS: &str = "id, user_id, kind, session_id, session_name, subject_id, title, \
      body, reader_path, blocking, created_at, notify_after, push_attempts, last_push_error, \
      notified_at, notified_via, acked_at, email_sent_at";
@@ -227,14 +241,28 @@ impl OwnerPushStore {
     /// Creates the subject's notice unless it has one. Returns whether this
     /// call created it; a racing create and repair leave one row.
     pub fn create_notice(&self, notice: &NewNotice, now: OffsetDateTime) -> Result<bool> {
+        self.create_notice_with_desk(notice, now, false, false)
+    }
+
+    /// `desk` records the observation even with the experiment switch off.
+    pub fn create_notice_with_desk(
+        &self,
+        notice: &NewNotice,
+        now: OffsetDateTime,
+        desk: bool,
+        switch_on: bool,
+    ) -> Result<bool> {
         let conn = self.open()?;
+        let eligible = notice.kind == NOTICE_REVIEW_REQUESTED
+            || (notice.kind == NOTICE_MESSAGE && !notice.blocking);
+        let held = eligible && desk && switch_on;
+        let notify_after = format_ts(if held { now + DESK_HOLD } else { now });
         for _ in 0..16 {
             let id = format!("not_{}", random_base32(12));
-            let now = format_ts(now);
             match conn.execute(
                 "INSERT INTO owner_notices (id, user_id, kind, session_id, session_name, \
                    subject_id, title, body, reader_path, blocking, created_at, notify_after) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                  ON CONFLICT(kind, subject_id) DO NOTHING",
                 params![
                     id,
@@ -247,10 +275,23 @@ impl OwnerPushStore {
                     notice.body,
                     notice.reader_path,
                     notice.blocking,
-                    now
+                    format_ts(now),
+                    notify_after,
                 ],
             ) {
-                Ok(changed) => return Ok(changed > 0),
+                Ok(changed) => {
+                    if changed > 0 && eligible {
+                        if let Err(error) = self.open_desk_log().and_then(|conn| Ok(conn.execute(
+                            "INSERT INTO push_desk_log (notice_id, kind, created_at_ms, desk_at_create, held) \
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![id, notice.kind, (now.unix_timestamp_nanos() / 1_000_000) as i64,
+                                i64::from(desk), i64::from(held)],
+                        )?)) {
+                            eprintln!("notice {id} desk log insert failed: {error:#}");
+                        }
+                    }
+                    return Ok(changed > 0);
+                }
                 // Only the primary key can still collide: pick another id.
                 Err(rusqlite::Error::SqliteFailure(error, _))
                     if error.code == rusqlite::ErrorCode::ConstraintViolation => {}
@@ -373,6 +414,9 @@ impl OwnerPushStore {
             )?;
         }
         tx.commit()?;
+        for id in ids {
+            self.log_outcome(id, "overnight", None, None);
+        }
         Ok(released)
     }
 
@@ -431,7 +475,12 @@ impl OwnerPushStore {
         Ok(())
     }
 
-    fn save_notice_delivery(&self, notice: &Notice) -> Result<()> {
+    fn save_notice_delivery(
+        &self,
+        notice: &Notice,
+        world: &dyn NoticeWorld,
+        now: OffsetDateTime,
+    ) -> Result<()> {
         self.open()?.execute(
             "UPDATE owner_notices SET notify_after = ?2, push_attempts = ?3, \
                last_push_error = ?4, notified_at = ?5, notified_via = ?6, email_sent_at = ?7 \
@@ -446,7 +495,54 @@ impl OwnerPushStore {
                 notice.email_sent_at,
             ],
         )?;
+        if let Some(outcome) = notice.notified_via.as_deref() {
+            let sent_at = (outcome == "push").then_some(now);
+            let desk = sent_at.and_then(|at| match world.at_desk(at) {
+                Ok(desk) => Some(desk),
+                Err(error) => {
+                    eprintln!("notice {} send desk lookup failed: {error:#}", notice.id);
+                    None
+                }
+            });
+            self.log_outcome(&notice.id, outcome, sent_at, desk);
+        }
         Ok(())
+    }
+
+    fn log_outcome(
+        &self,
+        id: &str,
+        outcome: &str,
+        sent_at: Option<OffsetDateTime>,
+        desk: Option<bool>,
+    ) {
+        let result = self.open_desk_log().and_then(|conn| {
+            conn.execute(
+                "UPDATE push_desk_log SET outcome = ?2, sent_at_ms = ?3, desk_at_send = ?4 \
+                 WHERE notice_id = ?1 AND outcome IS NULL",
+                params![
+                    id,
+                    outcome,
+                    sent_at.map(|at| (at.unix_timestamp_nanos() / 1_000_000) as i64),
+                    desk.map(i64::from)
+                ],
+            )?;
+            Ok(())
+        });
+        if let Err(error) = result {
+            eprintln!("notice {id} desk log outcome failed: {error:#}");
+        }
+    }
+
+    pub(super) fn open_desk_log(&self) -> Result<Connection> {
+        let path = self.desk_log_path.as_ref().unwrap_or(&self.db_path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.execute_batch(PUSH_DESK_LOG_SCHEMA)?;
+        Ok(conn)
     }
 
     fn query_notices(&self, clause: &str, params: impl rusqlite::Params) -> Result<Vec<Notice>> {
@@ -473,6 +569,13 @@ fn random_base32(len: usize) -> String {
 
 /// The rest of the server, as notice delivery sees it.
 pub trait NoticeWorld {
+    /// Owner activity at the time of the notice or push.
+    fn at_desk(&self, _at: OffsetDateTime) -> Result<bool> {
+        Ok(false)
+    }
+    fn desk_hold_on(&self) -> bool {
+        false
+    }
     /// Whether the notice's subject still wants the owner (appendix F2): a
     /// message still new, read or needs-you; a review request still in the
     /// doc's current review round, and the doc still requested (sm#2466).
@@ -500,7 +603,22 @@ pub fn repair_notices(
 ) -> Result<usize> {
     let mut created = 0;
     for candidate in world.notice_candidates(now - NOTICE_REPAIR_WINDOW)? {
-        created += usize::from(store.create_notice(&candidate, now)?);
+        let desk = if candidate.kind == NOTICE_REVIEW_REQUESTED
+            || (candidate.kind == NOTICE_MESSAGE && !candidate.blocking)
+        {
+            world.at_desk(now).unwrap_or_else(|error| {
+                eprintln!("notice desk lookup failed: {error:#}");
+                false
+            })
+        } else {
+            false
+        };
+        created += usize::from(store.create_notice_with_desk(
+            &candidate,
+            now,
+            desk,
+            world.desk_hold_on(),
+        )?);
     }
     Ok(created)
 }
@@ -535,7 +653,7 @@ pub fn deliver_notices_holding(
         }
         if !world.still_wanted(&notice)? || world.opened(&notice)? {
             close_resolved(&mut notice, now);
-            store.save_notice_delivery(&notice)?;
+            store.save_notice_delivery(&notice, world, now)?;
             continue;
         }
         let tokens = match sender {
@@ -593,7 +711,7 @@ pub fn deliver_notices_holding(
                     ));
                     notice.last_push_error = Some(format!("email failed: {detail}"));
                     notice.notify_after = format_ts(now + EMAIL_RETRY_DELAY);
-                    store.save_notice_delivery(&notice)?;
+                    store.save_notice_delivery(&notice, world, now)?;
                     continue;
                 }
                 Err(error) => {
@@ -608,7 +726,7 @@ pub fn deliver_notices_holding(
             notice.notified_via = Some("email".to_owned());
             notice.email_sent_at = Some(format_ts(now));
         }
-        store.save_notice_delivery(&notice)?;
+        store.save_notice_delivery(&notice, world, now)?;
     }
     for mut notice in store.notice_ack_fallback_due(now)? {
         if held(&notice) {
@@ -616,7 +734,7 @@ pub fn deliver_notices_holding(
         }
         if !world.still_wanted(&notice)? || world.opened(&notice)? {
             close_resolved(&mut notice, now);
-            store.save_notice_delivery(&notice)?;
+            store.save_notice_delivery(&notice, world, now)?;
             continue;
         }
         let due_since = notice
@@ -633,7 +751,7 @@ pub fn deliver_notices_holding(
                 ));
                 notice.last_push_error = Some(format!("email failed: {detail}"));
                 notice.notify_after = format_ts(now + EMAIL_RETRY_DELAY);
-                store.save_notice_delivery(&notice)?;
+                store.save_notice_delivery(&notice, world, now)?;
                 continue;
             }
             Err(error) => {
@@ -645,7 +763,7 @@ pub fn deliver_notices_holding(
             }
         }
         notice.email_sent_at = Some(format_ts(now));
-        store.save_notice_delivery(&notice)?;
+        store.save_notice_delivery(&notice, world, now)?;
     }
     Ok(problems)
 }
