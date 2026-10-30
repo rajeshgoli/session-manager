@@ -258,7 +258,10 @@ export function TerminalPage({ id, watch, moon, open, visible = true, onEnded })
     setDirectError('');
     const terminal = new window.Terminal({
       fontFamily: '"SF Mono", Menlo, monospace', fontSize: parseFloat(getComputedStyle(document.documentElement).fontSize) - 1, cursorBlink: true,
-      lineHeight: 1.12, scrollback: 10000, minimumContrastRatio: CONTRAST_FLOOR,
+      // tmux keeps the history and the wheel scrolls it. sm's tmux draws on the normal
+      // screen, so a scrollback here would hold a second, stale copy that a selection
+      // dragged past the top scrolls into and the wheel cannot leave (#2618).
+      lineHeight: 1.12, scrollback: 0, minimumContrastRatio: CONTRAST_FLOOR,
       // OSC 8 links, without xterm's confirm dialog. Claude Code links file paths as
       // file://, which open in the file view like a plain path does (#2597); other schemes do nothing.
       linkHandler: { allowNonHttpProtocols: true, activate: (event, uri) => {
