@@ -733,7 +733,7 @@ impl AskReason<'_> {
 /// D.1. `claims` is already rendered by [`claims_text`].
 pub fn ask_text(reason: &AskReason<'_>, claims: &str) -> String {
     format!(
-        "[sm context management] {} Stop at a logical point. sm will move your claims ({claims}) and pending wakes to a fresh agent. Post what the next agent needs in your PR, ticket, or a file, then run `sm handoff --link <url>` or `sm handoff --path <file>` and end your turn.",
+        "[sm context management] {} Stop at a logical point, but first wait for every background agent, subagent, or background shell command you started to complete: the handoff ends your session and kills them (`sm queue` jobs survive). sm will move your claims ({claims}) and pending wakes to a fresh agent. Post what the next agent needs in your PR, ticket, or a file, then run `sm handoff --link <url>` or `sm handoff --path <file>` and end your turn.",
         reason.text()
     )
 }
@@ -741,7 +741,7 @@ pub fn ask_text(reason: &AskReason<'_>, claims: &str) -> String {
 /// D.2.
 pub fn reminder_text(percent: f64, asked_percent: f64) -> String {
     format!(
-        "[sm context management] Reminder: your context is at {}% and sm asked you to hand off at {}%. Finish the current step, post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`.",
+        "[sm context management] Reminder: your context is at {}% and sm asked you to hand off at {}%. Finish the current step, let every background agent, subagent, or background shell command you started complete, then post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`.",
         round_percent(percent),
         round_percent(asked_percent)
     )
@@ -1097,7 +1097,7 @@ mod tests {
         let claims = claims_text(&[("ticket", 1651), ("PR", 1660)]);
         assert_eq!(claims, "ticket #1651, PR #1660");
         assert_eq!(claims_text(&[]), "none");
-        let tail = " Stop at a logical point. sm will move your claims (ticket #1651, PR #1660) and pending wakes to a fresh agent. Post what the next agent needs in your PR, ticket, or a file, then run `sm handoff --link <url>` or `sm handoff --path <file>` and end your turn.";
+        let tail = " Stop at a logical point, but first wait for every background agent, subagent, or background shell command you started to complete: the handoff ends your session and kills them (`sm queue` jobs survive). sm will move your claims (ticket #1651, PR #1660) and pending wakes to a fresh agent. Post what the next agent needs in your PR, ticket, or a file, then run `sm handoff --link <url>` or `sm handoff --path <file>` and end your turn.";
         assert_eq!(
             ask_text(&AskReason::Context { percent: 41.4 }, &claims),
             format!("[sm context management] Your context is at 41%.{tail}")
@@ -1155,7 +1155,7 @@ mod tests {
         );
         assert_eq!(
             reminder_text(50.2, 36.4),
-            "[sm context management] Reminder: your context is at 50% and sm asked you to hand off at 36%. Finish the current step, post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`."
+            "[sm context management] Reminder: your context is at 50% and sm asked you to hand off at 36%. Finish the current step, let every background agent, subagent, or background shell command you started complete, then post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`."
         );
     }
 
