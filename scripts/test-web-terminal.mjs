@@ -835,7 +835,7 @@ test('kept terminal stays connected, cannot resize or type hidden, and returns w
     await page.setViewportSize({ width: 1200, height: 800 });
     await page.evaluate(async () => {
       const { activeTerminal } = await import('/assets/terminal.js');
-      activeTerminal.paste('also blocked'); activeTerminal.focus();
+      if (await activeTerminal.type('also blocked')) throw new Error('typed into a hidden terminal'); activeTerminal.focus();
       window.keptSocket.onmessage({ data: JSON.stringify({ type: 'output', sequence: 2, data: btoa('\r\nhidden output arrived') }) });
     });
     await page.waitForTimeout(800);

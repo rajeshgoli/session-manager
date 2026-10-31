@@ -118,8 +118,9 @@ function server() {
     if (url.pathname === '/client/session-models') return json({ models: ['sonnet', 'opus'] });
     if (url.pathname === '/client/sessions' && method === 'POST') { calls.starts.push(request.postDataJSON()); return json({ id: 'started', name: 'new-agent' }); }
     if (url.pathname === '/github/issues') { calls.issues.push(request.postDataJSON()); return json({ number: 42, url: 'https://github.com/rajeshgoli/session-manager/issues/42' }); }
-    if (url.pathname.endsWith('/browser-attach-ticket')) return json({ ticket_id: 'ticket', ticket_secret: 'secret', ws_url: '/client/terminal' });
-    if (url.pathname === '/watch/state') return json({ sessions: [{ id: 'agent', name: 'sm-agent', provider: 'claude', repo: '/repo', state: 'idle', attention: { section: 'idle' }, facts: { agent: { state: 'idle', since: stamp() } } }], counts: {} });
+    // A shell attaches in the browser only over a loopback socket.
+    if (url.pathname.endsWith('/browser-attach-ticket')) return json({ ticket_id: 'ticket', ticket_secret: 'secret', ws_url: url.pathname.includes('/zsh/') ? 'ws://localhost:8420/client/terminal' : '/client/terminal' });
+    if (url.pathname === '/watch/state') return json({ sessions: [{ id: 'agent', name: 'sm-agent', provider: 'claude', repo: '/repo', state: 'idle', attention: { section: 'idle' }, facts: { agent: { state: 'idle', since: stamp() } } }, { id: 'zsh', kind: 'shell', name: 'zsh-1', repo: '/repo', state: 'idle', attention: { section: 'idle' } }], counts: {} });
     return json({});
   };
   handler.calls = calls;
@@ -249,10 +250,26 @@ test('page, terminal pane, actions and a version conflict', async () => {
       await terminal.waitForFunction(() => document.querySelectorAll('.term-panel .note-card').length === 1);
       await terminal.locator('.term-panel .note-card-main').first().click();
       if (shots) await terminal.screenshot({ path: `${shots}/notes-terminal-${width}-${colorScheme}.png` });
-      await terminal.locator('.term-panel .notes-editor textarea').fill('Paste without Enter');
+      // Typed, not pasted (#2623): no bracketed-paste markers, line breaks as LF, small pieces.
+      const typed = `Type without Enter\n${'é'.repeat(300)}\nlast line`;
+      await terminal.locator('.term-panel .notes-editor textarea').fill(typed);
       await terminal.locator('.term-panel .notes-editor .notes-actions').getByText('Type into terminal').click();
-      await terminal.waitForFunction(() => window.sockets[0].sent.some(frame => frame.type === 'input'));
-      assert.ok((await terminal.evaluate(() => window.sockets[0].sent.filter(frame => frame.type === 'input').map(frame => frame.data).join(''))).includes('\x1b[200~Paste without Enter\x1b[201~'));
+      await terminal.waitForFunction((length) => window.sockets[0].sent.filter(frame => frame.type === 'input').map(frame => frame.data).join('').length === length, typed.length);
+      const pieces = await terminal.evaluate(() => window.sockets[0].sent.filter(frame => frame.type === 'input').map(frame => frame.data));
+      assert.equal(pieces.join(''), typed);
+      assert.ok(pieces.length >= 3 && pieces.every(piece => Array.from(piece).length <= 128 && !piece.includes('\r')));
+      // A shell would run each typed line, so a shell still gets one bracketed paste.
+      if (width === 1440 && colorScheme === 'light') {
+        await terminal.goto(`${origin}/terminal/zsh`);
+        await terminal.locator('.term-page[data-connection="Live"]').waitFor();
+        await terminal.keyboard.press('Meta+j');
+        await terminal.locator('.term-panel .note-card-main').first().waitFor();
+        if (!await terminal.locator('.term-panel .notes-editor').count()) await terminal.locator('.term-panel .note-card-main').first().click();
+        await terminal.locator('.term-panel .notes-editor textarea').fill('echo one\necho two');
+        await terminal.locator('.term-panel .notes-editor .notes-actions').getByText('Type into terminal').click();
+        await terminal.waitForFunction(() => window.sockets.at(-1).sent.some(frame => frame.type === 'input'));
+        assert.deepEqual(await terminal.evaluate(() => window.sockets.at(-1).sent.filter(frame => frame.type === 'input').map(frame => frame.data)), ['\x1b[200~echo one\necho two\x1b[201~']);
+      }
       await terminalContext.close();
     }
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });

@@ -72,7 +72,7 @@ function NoteActions({ noteId, text, summary, canType, onType, target, repos }) 
     try {
       const content = await text();
       if (!content.trim()) throw new Error('Write some text first.');
-      if (!await onType(content)) throw new Error('Terminal is not connected. Nothing was added.');
+      if (!await onType(content)) throw new Error('The terminal was not connected or not shown, so the text may be missing or incomplete.');
       toast(`Added to ${target.label} · press Enter in the terminal to send`);
       await remember('terminal_added', target.id, target.label, content);
     } catch (err) { setError(err.message); }
