@@ -608,7 +608,7 @@ async fn review_requests_carry_the_handoff_ask_above_the_floor() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         body["handoff_ask"],
-        "[sm context management] Your context is at 24% and you just requested a review of PR #9, a good point to hand off. Stop at a logical point. sm will move your claims (PR #9) and pending wakes to a fresh agent. Your handoff note is drafted at /repo/.sm/handoff.md with what sm knows. Fill in the rest, re-read it against the checklist at its end, then run `sm handoff` and end your turn."
+        "[sm context management] Your context is at 24% and you just requested a review of PR #9, a good point to hand off. Stop at a logical point, but first wait for every background agent, subagent, or background shell command you started to complete: the handoff ends your session and kills them (`sm queue` jobs survive). sm will move your claims (PR #9) and pending wakes to a fresh agent. Your handoff note is drafted at /repo/.sm/handoff.md with what sm knows. Fill in the rest, re-read it against the checklist at its end, then run `sm handoff` and end your turn."
     );
     // A second request in state `asked` does nothing new.
     let (status, body) = request(

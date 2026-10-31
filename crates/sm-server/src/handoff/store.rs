@@ -746,7 +746,7 @@ mod tests {
     use super::*;
     use crate::work_claims::{ClaimSource, HolderState, SessionDirectory, SessionInfo};
 
-    const ASK_TAIL: &str = " Stop at a logical point. sm will move your claims (none) and pending wakes to a fresh agent. Run `sm handoff`; it drafts your note with what sm knows and tells you where.";
+    const ASK_TAIL: &str = " Stop at a logical point, but first wait for every background agent, subagent, or background shell command you started to complete: the handoff ends your session and kills them (`sm queue` jobs survive). sm will move your claims (none) and pending wakes to a fresh agent. Run `sm handoff`; it drafts your note with what sm knows and tells you where.";
 
     fn temp_path(label: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1099,7 +1099,7 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(
             messages[1],
-            "[sm context management] Reminder: your context is at 50% and sm asked you to hand off at 36%. Finish the current step, run `sm handoff` to draft your note."
+            "[sm context management] Reminder: your context is at 50% and sm asked you to hand off at 36%. Finish the current step, let every background agent, subagent, or background shell command you started complete, then run `sm handoff` to draft your note."
         );
         assert!(record(&store, "agent001").unwrap().reminded_at.is_some());
         assert_eq!(display(&store, "agent001"), "handoff overdue");
