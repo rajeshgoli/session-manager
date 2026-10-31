@@ -362,13 +362,16 @@ export function TerminalPage({ id, watch, moon, open, visible = true, onEnded })
       },
       key: (key) => { if (live) send({ type: 'key', key }); focus(); },
       paste: (text) => { if (!live || !shown.current) return false; input(`\x1b[200~${text}\x1b[201~`); focus(); return true; },
-      // Unbracketed, with line breaks as LF (Ctrl-J), which inserts a newline in Claude and Codex instead of sending.
+      // Agents get it unbracketed, line breaks as LF (Ctrl-J), which inserts a newline in Claude and Codex
+      // instead of sending. A shell would run each line, so a shell still gets a bracketed paste.
       type: async (text) => {
+        if (targetKind === 'shell') return control.current.paste(text);
         if (!live || !shown.current) return false;
         const chars = Array.from(text.replace(/\r\n?/g, '\n'));
         for (let i = 0; i < chars.length; i += TYPE_CHUNK_CHARS) {
           if (i > 0) await new Promise(resolve => setTimeout(resolve, TYPE_GAP_MS));
-          if (!live) return false;
+          // Hidden or dropped part way: the rest would be discarded, so report the note as not added.
+          if (!live || !shown.current) return false;
           input(chars.slice(i, i + TYPE_CHUNK_CHARS).join(''));
         }
         focus();
