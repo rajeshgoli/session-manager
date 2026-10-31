@@ -249,10 +249,14 @@ test('page, terminal pane, actions and a version conflict', async () => {
       await terminal.waitForFunction(() => document.querySelectorAll('.term-panel .note-card').length === 1);
       await terminal.locator('.term-panel .note-card-main').first().click();
       if (shots) await terminal.screenshot({ path: `${shots}/notes-terminal-${width}-${colorScheme}.png` });
-      await terminal.locator('.term-panel .notes-editor textarea').fill('Paste without Enter');
+      // Typed, not pasted (#2623): no bracketed-paste markers, line breaks as LF, small pieces.
+      const typed = `Type without Enter\n${'é'.repeat(300)}\nlast line`;
+      await terminal.locator('.term-panel .notes-editor textarea').fill(typed);
       await terminal.locator('.term-panel .notes-editor .notes-actions').getByText('Type into terminal').click();
-      await terminal.waitForFunction(() => window.sockets[0].sent.some(frame => frame.type === 'input'));
-      assert.ok((await terminal.evaluate(() => window.sockets[0].sent.filter(frame => frame.type === 'input').map(frame => frame.data).join(''))).includes('\x1b[200~Paste without Enter\x1b[201~'));
+      await terminal.waitForFunction((length) => window.sockets[0].sent.filter(frame => frame.type === 'input').map(frame => frame.data).join('').length === length, typed.length);
+      const pieces = await terminal.evaluate(() => window.sockets[0].sent.filter(frame => frame.type === 'input').map(frame => frame.data));
+      assert.equal(pieces.join(''), typed);
+      assert.ok(pieces.length >= 3 && pieces.every(piece => Array.from(piece).length <= 128 && !piece.includes('\r')));
       await terminalContext.close();
     }
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });

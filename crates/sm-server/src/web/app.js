@@ -701,7 +701,7 @@ function Panel({ openRef, layout, updateLayout, beside = null, notesTarget = nul
   return html`<aside class=${notesTarget ? 'panel term-panel' : 'panel'} aria-label=${kind === 'notes' ? 'Notes' : 'Details'}>
     <div class="grip" ref=${grip} onMouseDown=${drag}></div>
     ${kind === 'notes' ? html`<${NotesView} pane onClose=${closePanel} target=${notesTarget || undefined}
-        onType=${notesTarget ? (text) => activeTerminal.paste(text) : undefined} />` : Renderer
+        onType=${notesTarget ? (text) => activeTerminal.type(text) : undefined} />` : Renderer
       ? html`<${Renderer} key=${openRef} id=${id} controls=${controls} beside=${beside} />`
       : html`<div class="phd"><span></span><span class="t">${kind}</span>${controls}
           <span class="s">This item does not open in the panel yet.</span></div>`}

@@ -24,6 +24,10 @@ const RESIZE_SETTLE_MS = 150;
 // ...and once the agent has redrawn at that size, a one-column nudge makes it repaint every cell.
 const REDRAW_SETTLE_MS = 400;
 const REDRAW_NUDGE_MS = 120;
+// Notes type text in pieces this small, this far apart, so Claude reads typing rather than a paste
+// (#2623). 128 characters is at most 512 bytes, the piece `sm send` types (#1446).
+const TYPE_CHUNK_CHARS = 128;
+const TYPE_GAP_MS = 20;
 /** Sessions retired from this page, which an older poll may still list as live. */
 export const retiredIds = new Set();
 
@@ -46,7 +50,7 @@ export function needsYou(agent, now = Date.now()) {
 export const pillReturn = { id: null, path: null };
 
 /** The open terminal, for the app's Notes pane ("Type into terminal") and focus after the palette closes. */
-export const activeTerminal = { id: null, paste: () => false, focus: () => {} };
+export const activeTerminal = { id: null, type: async () => false, focus: () => {} };
 // Terminal links open in a new tab; web URLs only.
 // A link to one of sm's own documents opens the document view (2543 F.4); anything else, a new tab.
 const openTarget = (uri) => {
@@ -358,11 +362,23 @@ export function TerminalPage({ id, watch, moon, open, visible = true, onEnded })
       },
       key: (key) => { if (live) send({ type: 'key', key }); focus(); },
       paste: (text) => { if (!live || !shown.current) return false; input(`\x1b[200~${text}\x1b[201~`); focus(); return true; },
+      // Unbracketed, with line breaks as LF (Ctrl-J), which inserts a newline in Claude and Codex instead of sending.
+      type: async (text) => {
+        if (!live || !shown.current) return false;
+        const chars = Array.from(text.replace(/\r\n?/g, '\n'));
+        for (let i = 0; i < chars.length; i += TYPE_CHUNK_CHARS) {
+          if (i > 0) await new Promise(resolve => setTimeout(resolve, TYPE_GAP_MS));
+          if (!live) return false;
+          input(chars.slice(i, i + TYPE_CHUNK_CHARS).join(''));
+        }
+        focus();
+        return true;
+      },
       model: () => { input('\x1b[200~/model\x1b[201~\r'); focus(); },
       focus,
       redraw: () => { redraw(); focus(); },
     };
-    Object.assign(activeTerminal, { id, paste: (text) => !!control.current?.paste(text), focus: () => control.current?.focus() });
+    Object.assign(activeTerminal, { id, type: async (text) => !!await control.current?.type(text), focus: () => control.current?.focus() });
     const mouse = installPageMouse(terminal, host.current, input, async (text) => {
       try { await navigator.clipboard.writeText(text); toast('Copied'); } catch (err) { toast(`Could not copy: ${err.message}`); }
     });
@@ -538,7 +554,7 @@ export function TerminalPage({ id, watch, moon, open, visible = true, onEnded })
       removeImagePaste(); mouse.dispose();
       stopped = true; clearTimeout(timer); clearTimeout(handshakeTimer); clearTimeout(resizeTimer); clearTimeout(nudgeTimer); stopDirect(); detach(); observer.disconnect(); themeWatch.disconnect(); scheme.removeEventListener('change', retheme); window.removeEventListener('storage', storageWatch); data.dispose(); terminal.dispose();
       window.removeEventListener('pagehide', pagehide); window.removeEventListener('pageshow', pageshow); control.current = null;
-      if (activeTerminal.id === id) Object.assign(activeTerminal, { id: null, paste: () => false, focus: () => {} });
+      if (activeTerminal.id === id) Object.assign(activeTerminal, { id: null, type: async () => false, focus: () => {} });
     };
   }, [id, attempt, targetKind]);
 
