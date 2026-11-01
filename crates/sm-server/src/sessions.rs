@@ -8177,7 +8177,7 @@ impl SessionStore {
             if !authority.can_retire(session) {
                 return Ok(authority.rejection_outcome(session));
             }
-            if if_finished_idle && !raw_session_is_finished_idle(session) {
+            if if_finished_idle && !authority.finished_idle(session) {
                 return Ok(CoreRetireOutcome::PreconditionFailed);
             }
             if raw_session_is_stopped(session) {
@@ -8282,7 +8282,7 @@ impl SessionStore {
             if !authority.can_retire(session) {
                 return Ok(authority.rejection_outcome(session));
             }
-            if if_finished_idle && !raw_session_is_finished_idle(session) {
+            if if_finished_idle && !authority.finished_idle(session) {
                 return Ok(CoreRetireOutcome::PreconditionFailed);
             }
             if raw_session_is_stopped(session) {
@@ -10694,6 +10694,10 @@ pub struct SendCoreInputRequest {
     pub remind_cancel_on_reply_session_id: Option<String>,
     #[serde(default)]
     pub parent_session_id: Option<String>,
+    /// `sm send --restore`: the parent of an auto-retired child brings it
+    /// back on purpose (sm#2625).
+    #[serde(default)]
+    pub restore: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -11014,9 +11018,13 @@ pub enum RetireAuthority {
     Handoff {
         successor_session_id: String,
     },
-    /// The auto-retire sweep (sm#1839): finished and idle this long.
+    /// The auto-retire sweep (sm#1839): finished and idle this long. An
+    /// agent another agent spawned retires idle without having finished
+    /// (sm#2625); `idle_child_since` is the `last_activity` the sweep saw,
+    /// so any activity since then cancels the retire.
     AutoRetire {
         idle_minutes: u64,
+        idle_child_since: Option<String>,
     },
 }
 
@@ -11053,7 +11061,37 @@ impl RetireAuthority {
     }
 
     pub fn auto_retire(idle_minutes: u64) -> Self {
-        Self::AutoRetire { idle_minutes }
+        Self::AutoRetire {
+            idle_minutes,
+            idle_child_since: None,
+        }
+    }
+
+    /// The sweep retiring an idle child agent that has not run
+    /// `sm task-complete` (sm#2625).
+    pub fn auto_retire_idle_child(idle_minutes: u64, last_activity: impl Into<String>) -> Self {
+        Self::AutoRetire {
+            idle_minutes,
+            idle_child_since: Some(last_activity.into()),
+        }
+    }
+
+    /// The precondition of an `if_finished_idle` retire, under the store's
+    /// lock: finished, or for an idle child, untouched since the sweep saw it.
+    pub(crate) fn finished_idle(&self, session: &Map<String, Value>) -> bool {
+        if raw_session_is_finished_idle(session) {
+            return true;
+        }
+        let Self::AutoRetire {
+            idle_child_since: Some(since),
+            ..
+        } = self
+        else {
+            return false;
+        };
+        !raw_session_is_stopped(session)
+            && json_text(session.get("parent_session_id")).is_some()
+            && json_text(session.get("last_activity")).as_deref() == Some(since.as_str())
     }
 
     fn is_authorized(&self, sessions: &[SessionRecord], credential: Option<&str>) -> bool {
@@ -11137,10 +11175,15 @@ impl RetireAuthority {
                 crate::handoff::execute::RETIRE_SOURCE,
                 tmux_disposition,
             ),
-            Self::AutoRetire { idle_minutes } => TerminalProvenance {
-                detail: Some(format!(
-                    "auto-retire after {idle_minutes} minutes finished and idle"
-                )),
+            Self::AutoRetire {
+                idle_minutes,
+                idle_child_since,
+            } => TerminalProvenance {
+                detail: Some(if idle_child_since.is_some() {
+                    format!("auto-retire after {idle_minutes} minutes idle (spawned by an agent)")
+                } else {
+                    format!("auto-retire after {idle_minutes} minutes finished and idle")
+                }),
                 ..TerminalProvenance::explicit_retire(
                     requested_at,
                     None,
@@ -21878,6 +21921,7 @@ sleep 30
                     remind_hard_threshold: None,
                     remind_cancel_on_reply_session_id: None,
                     parent_session_id: None,
+                    restore: false,
                 },
             )
             .unwrap()
@@ -28648,6 +28692,7 @@ sleep 30
                     remind_hard_threshold: None,
                     remind_cancel_on_reply_session_id: None,
                     parent_session_id: Some("oldpar01".to_owned()),
+                    restore: false,
                 },
                 &TmuxRuntime::from_config(&crate::config::RustCoreConfig::default()),
             )

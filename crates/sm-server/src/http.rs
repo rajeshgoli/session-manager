@@ -4024,6 +4024,7 @@ async fn inbound_email_webhook(
         remind_hard_threshold: None,
         remind_cancel_on_reply_session_id: None,
         parent_session_id: None,
+        restore: false,
     };
     let outcome = if state.config.rust_core.runtime_enabled {
         if !is_primary_node(&session.node) {
@@ -5230,6 +5231,17 @@ async fn spawn_session_authorized(
         .as_ref()
         .and_then(|reservation| claims::finish_spawn_ticket(&state, reservation, created.is_ok()));
     let child = created?;
+    if child.provider == parent.provider {
+        if let Err(error) = state
+            .session_store
+            .inherit_context_management(&parent.id, &child.id)
+        {
+            eprintln!(
+                "{} inheriting context management from {} failed: {error:#}",
+                child.id, parent.id
+            );
+        }
+    }
     if parent.is_em && child.provider != "codex-fork" {
         let _ = state.session_store.arm_stop_notify(
             &child.id,
@@ -11176,6 +11188,15 @@ async fn send_session_input(
             detail: "text is required".to_owned(),
         });
     }
+    if let Some(retired) = auto_retire::parent_must_restore(&state, &session_id, &payload)? {
+        return Ok(Json(json!({
+            "ok": false,
+            "session_id": retired.id,
+            "status": "retired",
+            "delivered": false,
+            "detail": auto_retire::parent_must_restore_detail(&retired),
+        })));
+    }
     let session_id = auto_retire::restore_send_target(&state, &session_id)
         .await?
         .unwrap_or(session_id);
@@ -11926,6 +11947,18 @@ async fn send_session_input_batch(
         .then(|| TmuxRuntime::from_app_config(&state.config));
     let mut results = Vec::with_capacity(recipients.len());
     for identifier in recipients {
+        if let Some(retired) =
+            auto_retire::parent_must_restore(&state, &identifier, &payload.input)?
+        {
+            results.push(failed_batch_result(
+                &identifier,
+                Some(retired.id.clone()),
+                session_target_name(&retired),
+                Some(retired.provider.clone()),
+                auto_retire::parent_must_restore_detail(&retired),
+            ));
+            continue;
+        }
         let target = auto_retire::restore_send_target(&state, &identifier)
             .await?
             .unwrap_or_else(|| identifier.clone());

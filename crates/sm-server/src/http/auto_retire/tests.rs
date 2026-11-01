@@ -154,6 +154,65 @@ fn each_exclusion_keeps_it() {
     assert_eq!(with(&|s| s.status = "stopped".to_owned()), Some("stopped"));
 }
 
+/// sm#2625: an agent another agent spawned retires after ten idle minutes,
+/// whether or not it ran `sm task-complete`.
+#[test]
+fn a_child_retires_after_ten_idle_minutes_finished_or_not() {
+    let mut child = agent();
+    child.parent_session_id = Some("far01800".to_owned());
+    child.agent_task_completed_at = None;
+    child.last_activity = "2026-09-30T12:55:00Z".to_owned();
+    assert_eq!(check(&child, &context()), None);
+    child.last_activity = "2026-09-30T12:56:00Z".to_owned();
+    assert_eq!(check(&child, &context()), Some("not idle long enough"));
+    // Finished, it uses the same ten minutes rather than the owner's hour.
+    child.agent_task_completed_at = Some("2026-09-30T12:55:00Z".to_owned());
+    child.last_activity = "2026-09-30T12:55:00Z".to_owned();
+    assert_eq!(check(&child, &context()), None);
+    // A top-level agent still has to finish.
+    let mut top = child.clone();
+    top.parent_session_id = None;
+    top.agent_task_completed_at = None;
+    top.last_activity = COMPLETED.to_owned();
+    assert_eq!(check(&top, &context()), Some("not finished"));
+}
+
+#[test]
+fn an_idle_child_waiting_on_an_agent_or_delivery_stays() {
+    let mut child = agent();
+    child.parent_session_id = Some("far01800".to_owned());
+    child.agent_task_completed_at = None;
+    for (kind, why) in [
+        ("agent_wait", "waits on another agent"),
+        ("queue_delivery", "waits on a queue delivery"),
+    ] {
+        let mut context = context();
+        context.watch.get_mut("far01855").unwrap()["waiting_on"] = json!([{"kind": kind}]);
+        assert_eq!(check(&child, &context), Some(why));
+    }
+}
+
+/// The locked re-check: an unfinished child retires only while untouched
+/// since the sweep saw it.
+#[test]
+fn the_idle_child_authority_requires_no_activity_since_the_sweep() {
+    let raw = |parent: Value, completed: Value, last: &str| {
+        json!({"status": "running", "parent_session_id": parent,
+            "agent_task_completed_at": completed, "last_activity": last})
+        .as_object()
+        .unwrap()
+        .clone()
+    };
+    let seen = "2026-09-30T12:55:00Z";
+    let child = RetireAuthority::auto_retire_idle_child(10, seen);
+    assert!(child.finished_idle(&raw(json!("far01800"), Value::Null, seen)));
+    assert!(!child.finished_idle(&raw(json!("far01800"), Value::Null, NOW)));
+    assert!(!child.finished_idle(&raw(Value::Null, Value::Null, seen)));
+    assert!(child.finished_idle(&raw(Value::Null, json!(COMPLETED), NOW)));
+    let plain = RetireAuthority::auto_retire(60);
+    assert!(!plain.finished_idle(&raw(json!("far01800"), Value::Null, seen)));
+}
+
 /// A fixture store holding `sessions`.
 fn state_with(sessions: Value) -> (AppState, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(

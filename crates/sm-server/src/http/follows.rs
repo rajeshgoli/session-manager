@@ -312,6 +312,7 @@ fn send_follow_message(
         remind_hard_threshold: None,
         remind_cancel_on_reply_session_id: None,
         parent_session_id: None,
+        restore: false,
     };
     let runtime = (state.config.rust_core.runtime_enabled && is_primary_node(&session.node))
         .then(|| TmuxRuntime::from_app_config(&state.config));
