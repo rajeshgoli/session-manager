@@ -2845,18 +2845,31 @@ impl RetainedQueueStore {
 
     /// Completion message identities and their current recipients, without
     /// loading message bodies or changing delivery state on a read surface.
+    /// Missing storage reads as empty; never initialize it or change journal
+    /// mode here, which can race a startup writer even with a busy timeout.
     pub fn pending_queue_completion_recipients(&self) -> Result<Vec<(String, String)>> {
-        self.with_connection(|conn| {
-            let mut statement = conn.prepare(
-                "SELECT id, target_session_id FROM message_queue
-                 WHERE delivered_at IS NULL AND message_category = 'queue-completion'
-                 ORDER BY queued_at, id",
-            )?;
-            let rows = statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })
+        if !self.db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let mut statement = match conn.prepare(
+            "SELECT id, target_session_id FROM message_queue
+             WHERE delivered_at IS NULL AND message_category = 'queue-completion'
+             ORDER BY queued_at, id",
+        ) {
+            Ok(statement) => statement,
+            Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message.contains("no such table") =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn pending_target_session_ids_by_category(
@@ -15512,6 +15525,82 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn pending_queue_completion_recipients_do_not_initialize_storage() {
+        let db_path = unique_temp_path("completion-recipients-uninitialized");
+        let store = RetainedQueueStore::new(db_path.clone());
+        assert!(store
+            .pending_queue_completion_recipients()
+            .unwrap()
+            .is_empty());
+        assert!(!db_path.exists());
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("CREATE TABLE unrelated (id TEXT)")
+            .unwrap();
+        assert!(store
+            .pending_queue_completion_recipients()
+            .unwrap()
+            .is_empty());
+        let tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1);
+    }
+
+    #[test]
+    fn pending_queue_completion_recipients_read_under_rollback_reader_lock() {
+        let db_path = unique_temp_path("completion-recipients-reader-lock");
+        let store = RetainedQueueStore::new(db_path.clone());
+        for (id, category) in [
+            ("second", "queue-completion"),
+            ("first", "queue-completion"),
+            ("delivered", "queue-completion"),
+            ("other", "other"),
+        ] {
+            store
+                .enqueue_message_once_with_metadata(
+                    id,
+                    "target",
+                    id,
+                    "sequential",
+                    QueueMessageMetadata {
+                        message_category: Some(category.to_owned()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let reader = Connection::open(&db_path).unwrap();
+        reader
+            .execute_batch(
+                "UPDATE message_queue SET queued_at = '2026-11-01T00:00:00Z';
+             UPDATE message_queue SET delivered_at = queued_at WHERE id = 'delivered';
+             PRAGMA journal_mode = DELETE;
+             BEGIN;
+             SELECT * FROM message_queue;",
+            )
+            .unwrap();
+        // Changing journal mode or initializing schemas here would require a
+        // lock that this open read transaction deliberately prevents (#2627).
+        assert_eq!(
+            store.pending_queue_completion_recipients().unwrap(),
+            vec![
+                ("first".to_owned(), "target".to_owned()),
+                ("second".to_owned(), "target".to_owned()),
+            ]
+        );
+        let mode: String = reader
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        reader.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
