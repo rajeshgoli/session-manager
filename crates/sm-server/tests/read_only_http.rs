@@ -14726,6 +14726,79 @@ async fn fixture_core_spawn_endpoint_inherits_parent_fields() {
     assert_eq!(payload["working_dir"], parent_dir.display().to_string());
 }
 
+/// sm#2625: a child of the parent's provider starts with the parent's
+/// context monitor (alerts the parent sent itself go to the child) and its
+/// per-agent handoff policy; a child of another provider does not.
+#[tokio::test]
+async fn fixture_core_spawn_inherits_context_management_for_the_same_provider() {
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let parent_dir = unique_temp_path();
+    fs::create_dir_all(&parent_dir).unwrap();
+    let handoff =
+        json!({"enabled": true, "threshold_percent": 55.0, "set_at": "2026-06-01T00:00:00Z"});
+    fs::write(
+        &state_file,
+        json!({"sessions": [{
+            "id": "ctxparent", "name": "claude-ctxparent",
+            "working_dir": parent_dir.display().to_string(),
+            "tmux_session": "claude-ctxparent", "node": "primary", "provider": "claude",
+            "log_file": "/tmp/ctxparent.log", "status": "running",
+            "created_at": "2026-06-01T00:00:00", "last_activity": "2026-06-01T00:01:00",
+            "context_monitor_enabled": true, "context_monitor_notify": "ctxparent",
+            "context_monitor_threshold_percentages": [60, 80],
+            "context_warning_sent": true,
+            "handoff_policy_override": handoff,
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+            ..PathsConfig::default()
+        },
+        rust_core: RustCoreConfig {
+            fixture_writes_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+    for (id, provider) in [("ctxclaude", "claude"), ("ctxcodex", "codex")] {
+        let (status, payload) = post_json(
+            app.clone(),
+            "/sessions/spawn",
+            json!({"id": id, "parent_session_id": "ctxparent", "prompt": "work",
+                "provider": provider}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+    }
+    let stored: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let find = |id: &str| {
+        stored["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    let same = find("ctxclaude");
+    assert_eq!(same["context_monitor_enabled"], true, "{same}");
+    assert_eq!(same["context_monitor_notify"], "ctxclaude", "{same}");
+    assert_eq!(
+        same["context_monitor_threshold_percentages"],
+        json!([60, 80])
+    );
+    assert_ne!(same["context_warning_sent"], true, "{same}");
+    assert_eq!(same["handoff_policy_override"], handoff);
+    let other = find("ctxcodex");
+    assert_ne!(other["context_monitor_enabled"], true, "{other}");
+    assert!(other["handoff_policy_override"].is_null(), "{other}");
+}
+
 #[tokio::test]
 async fn fixture_core_spawn_auto_arms_em_stop_notify_for_retained_children() {
     let state_file = write_completion_fixture();
@@ -18621,6 +18694,7 @@ while true; do sleep 1; done
                         remind_hard_threshold: None,
                         remind_cancel_on_reply_session_id: None,
                         parent_session_id: None,
+                        restore: false,
                     },
                     &disabled_fallback_runtime,
                 )

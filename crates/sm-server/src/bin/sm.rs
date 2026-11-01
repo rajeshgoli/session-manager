@@ -248,6 +248,10 @@ struct SendArgs {
     /// A message to a person: you cannot continue until they answer.
     #[arg(long)]
     blocking: bool,
+    /// Bring back your child agent that sm retired after it went idle, with
+    /// its context. Without it, a send to such a child is refused.
+    #[arg(long)]
+    restore: bool,
 }
 
 #[derive(Args)]
@@ -1727,6 +1731,9 @@ fn run_send(client: &ApiClient, args: SendArgs) -> Result<()> {
     let delivery_mode = if args.urgent { "urgent" } else { "sequential" };
     let targets = split_send_targets(&args.session_id);
     let mut payload = send_input_payload(text.clone(), delivery_mode, args.wait);
+    if args.restore {
+        payload["restore"] = json!(true);
+    }
     if targets.len() > 1 {
         // A message to a person has its own reply path; never mix it into
         // a broadcast. Checked before anything is sent.
@@ -1766,6 +1773,12 @@ fn run_send(client: &ApiClient, args: SendArgs) -> Result<()> {
         if let Some(forwarded) = payload["forwarded"].as_str() {
             println!("{forwarded}");
             return Ok(());
+        }
+        if let Some(detail) = payload["detail"]
+            .as_str()
+            .filter(|_| payload["delivered"] == false)
+        {
+            bail!("{detail}");
         }
         println!(
             "{}",
@@ -7145,6 +7158,7 @@ mod tests {
             wait: None,
             title: None,
             blocking: false,
+            restore: false,
         }
     }
 

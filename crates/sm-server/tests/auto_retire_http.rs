@@ -63,8 +63,9 @@ const BRIDGE: &str = r#"humans:
 "#;
 
 /// `eng00001` live; under it `auto0001` auto-retired at 13:05, `manual01`
-/// retired by `sm retire`, and `done0001`, which sm started and which
-/// finished at 12:05 and has been idle since.
+/// retired by `sm retire`, and `kid00001`, which it spawned and which has
+/// been idle since 12:55 without finishing. `done0001` is top-level: sm
+/// started it, and it finished at 12:05 and has been idle since.
 fn fixture(owner_settings: Value) -> Fixture {
     let dir = temp_dir();
     let state_file = dir.join("sessions.json");
@@ -88,10 +89,13 @@ fn fixture(owner_settings: Value) -> Fixture {
             "observed_at": RETIRED_AT, "authority": "server_lifecycle", "source": source});
         record
     };
-    let mut done = session("done0001", Some("eng00001"));
+    let mut done = session("done0001", None);
     done["started_by_sm"] = json!(true);
     done["agent_task_completed_at"] = json!(FINISHED_AT);
     done["last_activity"] = json!(FINISHED_AT);
+    let mut kid = session("kid00001", Some("eng00001"));
+    kid["started_by_sm"] = json!(true);
+    kid["last_activity"] = json!("2026-09-30T12:55:00Z");
     fs::write(
         &state_file,
         json!({"sessions": [
@@ -99,6 +103,7 @@ fn fixture(owner_settings: Value) -> Fixture {
             retired("auto0001", "auto_retire"),
             retired("manual01", "operator"),
             done,
+            kid,
         ], "owner_settings": owner_settings})
         .to_string(),
     )
@@ -296,7 +301,7 @@ async fn the_sweep_retires_after_the_delay_and_marks_it_automatic() {
         .unwrap();
     assert!(retired.is_empty(), "{retired:?}");
     let retired = sweep_auto_retire(state, at(RETIRED_AT)).await.unwrap();
-    assert_eq!(retired, vec!["done0001".to_owned()]);
+    assert_eq!(retired, vec!["done0001".to_owned(), "kid00001".to_owned()]);
     let done = session(&f, "done0001").await;
     assert_eq!(done["status"], "stopped", "{done}");
     assert_eq!(
@@ -329,4 +334,81 @@ async fn the_sweep_does_nothing_when_the_owner_turned_it_off() {
         .unwrap();
     assert!(retired.is_empty(), "{retired:?}");
     assert_eq!(session(&f, "done0001").await["status"], "running");
+}
+
+fn send_as(sender: &str, restore: bool) -> Value {
+    json!({"text": "Now do YM too", "delivery_mode": "sequential",
+        "from_sm_send": true, "sender_session_id": sender, "restore": restore})
+}
+
+/// sm#2625: a child the sweep retired while idle and unfinished refuses its
+/// parent's plain `sm send`, and comes back on `--restore`.
+#[tokio::test]
+async fn an_idle_child_retires_unfinished_and_its_parent_restores_it_on_purpose() {
+    let f = fixture(json!({}));
+    let state = Arc::new(f.state.clone());
+    let retired = sweep_auto_retire(state.clone(), at("2026-09-30T13:04:00Z"))
+        .await
+        .unwrap();
+    assert!(retired.is_empty(), "{retired:?}");
+    let retired = sweep_auto_retire(state, at(RETIRED_AT)).await.unwrap();
+    assert!(retired.contains(&"kid00001".to_owned()), "{retired:?}");
+    let kid = session(&f, "kid00001").await;
+    assert_eq!(kid["status"], "stopped", "{kid}");
+    assert_eq!(
+        kid["terminal_provenance"]["detail"],
+        "auto-retire after 10 minutes idle (spawned by an agent)",
+        "{kid}"
+    );
+
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/sessions/kid00001/input",
+        Some(send_as("eng00001", false)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["delivered"], false, "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("sm send --restore kid00001"),
+        "{body}"
+    );
+    assert_eq!(session(&f, "kid00001").await["status"], "stopped");
+
+    // The batch path refuses it the same way.
+    let mut batch = send_as("eng00001", false);
+    batch["recipients"] = json!(["kid00001"]);
+    let (_, body) = request(&f.app, "POST", "/sessions/input-batch", Some(batch)).await;
+    assert_eq!(body["failure_count"], 1, "{body}");
+    assert_eq!(session(&f, "kid00001").await["status"], "stopped");
+
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/sessions/kid00001/input",
+        Some(send_as("eng00001", true)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["delivered"], true, "{body}");
+    assert_eq!(session(&f, "kid00001").await["status"], "running");
+}
+
+#[tokio::test]
+async fn anyone_but_the_parent_restores_an_auto_retired_child_by_messaging_it() {
+    let f = fixture(json!({}));
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/sessions/auto0001/input",
+        Some(send_as("done0001", false)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["delivered"], true, "{body}");
+    assert_eq!(session(&f, "auto0001").await["status"], "running");
 }

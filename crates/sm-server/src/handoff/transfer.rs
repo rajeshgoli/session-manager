@@ -468,6 +468,58 @@ impl SessionStore {
         self.write_raw_json_value(&state)
     }
 
+    /// A child of the parent's provider starts with the parent's context
+    /// management (sm#2625): its context monitor, with alerts the parent
+    /// sent itself going to the child, and its per-agent handoff policy.
+    /// The child or the owner changes either afterwards as for any agent.
+    pub fn inherit_context_management(&self, parent_id: &str, child_id: &str) -> Result<()> {
+        let _guard = self.write_guard()?;
+        self.thaw_ids_locked(&_guard, &[parent_id, child_id])?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(parent) = session_object(sessions, parent_id) else {
+            return Ok(());
+        };
+        let provider = json_text(parent.get("provider"));
+        let monitored = parent.get("context_monitor_enabled") == Some(&Value::Bool(true));
+        let inherited = [
+            policy::OVERRIDE_KEY,
+            "context_monitor_enabled",
+            "context_monitor_notify",
+            "context_monitor_notify_source",
+            "context_monitor_threshold_percentages",
+            "context_monitor_warning_percentage",
+            "context_monitor_critical_percentage",
+        ]
+        .iter()
+        .filter(|key| monitored || **key == policy::OVERRIDE_KEY)
+        .filter_map(|key| {
+            parent
+                .get(*key)
+                .filter(|value| !value.is_null())
+                .map(|value| (*key, value.clone()))
+        })
+        .collect::<Vec<_>>();
+        if inherited.is_empty() {
+            return Ok(());
+        }
+        let Some(child) = session_object_mut(sessions, child_id) else {
+            return Ok(());
+        };
+        if json_text(child.get("provider")) != provider {
+            return Ok(());
+        }
+        for (key, value) in inherited {
+            if key == policy::OVERRIDE_KEY && child.get(key).is_some_and(|v| !v.is_null()) {
+                continue;
+            }
+            child.insert(key.to_owned(), value);
+        }
+        replace_text_field(child, "context_monitor_notify", parent_id, child_id);
+        reset_context_oneshot_flags(child);
+        self.write_raw_json_value(&state)
+    }
+
     /// G step 1, then every JSON-store row of the transfer table. Safe to
     /// repeat: each change is `where <field> = predecessor`.
     pub fn transfer_handoff_json(&self, predecessor_id: &str, successor_id: &str) -> Result<()> {

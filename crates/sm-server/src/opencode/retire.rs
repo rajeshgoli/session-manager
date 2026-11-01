@@ -66,7 +66,7 @@ impl SessionStore {
                 .is_none_or(|v| v.is_null())
             {
                 if if_finished_idle
-                    && (!raw_session_is_finished_idle(raw) || live_activity_blocks_retire(&record))
+                    && (!authority.finished_idle(raw) || live_activity_blocks_retire(&record))
                 {
                     return Ok(CoreRetireOutcome::PreconditionFailed);
                 }

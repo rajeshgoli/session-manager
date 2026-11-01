@@ -6,6 +6,11 @@
 //! waiting on them. Anything addressed to such an agent afterwards restores
 //! it: the restore rebuilds its worktree at the same path and reopens the
 //! claims its retire ended.
+//!
+//! An agent another agent spawned (sm#2625) retires sooner and without
+//! `sm task-complete`: idle for `CHILD_IDLE_MINUTES` with nothing waiting on
+//! it. Its parent's plain `sm send` to it is refused with a pointer to a
+//! fresh agent or `sm send --restore`; anyone else's message restores it.
 
 use super::claims::work_claim_store;
 use super::*;
@@ -14,6 +19,8 @@ use crate::work_claims::worktrees::{rebuild_worktree, WorktreeRebuild};
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 /// Providers History can restore; others are never auto-retired.
 const RESTORABLE_PROVIDERS: [&str; 4] = ["claude", "codex", "codex-fork", "opencode"];
+/// How long an agent another agent spawned stays idle before it retires.
+pub(crate) const CHILD_IDLE_MINUTES: u64 = 10;
 
 /// The sweep, on the server that runs the runtime.
 pub(super) fn spawn_auto_retire_sweeper(state: Arc<AppState>) {
@@ -41,10 +48,10 @@ pub async fn sweep_auto_retire(
         .await
         .map_err(|error| anyhow::anyhow!(error))??;
     let mut retired = Vec::new();
-    for (session_id, idle_minutes) in due {
+    for (session_id, authority) in due {
         let work = state.clone();
         let id = session_id.clone();
-        let outcome = tokio::task::spawn_blocking(move || retire(&work, &id, idle_minutes))
+        let outcome = tokio::task::spawn_blocking(move || retire(&work, &id, authority))
             .await
             .map_err(|error| anyhow::anyhow!(error))?;
         match outcome {
@@ -101,9 +108,8 @@ async fn restore_queued_autopm_messages(state: &Arc<AppState>) -> anyhow::Result
 fn retire(
     state: &AppState,
     session_id: &str,
-    idle_minutes: u64,
+    authority: RetireAuthority,
 ) -> anyhow::Result<CoreRetireOutcome> {
-    let authority = RetireAuthority::auto_retire(idle_minutes);
     let busy = |session: &SessionRecord| {
         live_activity_state(state, session).is_some_and(|activity| activity != "idle")
     };
@@ -129,12 +135,17 @@ struct Context {
     roles: BTreeSet<String>,
     followed: BTreeSet<String>,
     parents_of_live: BTreeSet<String>,
+    /// Sessions with a scheduled reminder still to fire.
+    reminded: BTreeSet<String>,
     /// `sm watch` items by session id: `state` and `facts`.
     watch: BTreeMap<String, Value>,
 }
 
-/// Sessions to retire now, each with the delay that applied.
-fn due_sessions(state: &AppState, now: OffsetDateTime) -> anyhow::Result<Vec<(String, u64)>> {
+/// Sessions to retire now, each with the authority (and delay) that applied.
+fn due_sessions(
+    state: &AppState,
+    now: OffsetDateTime,
+) -> anyhow::Result<Vec<(String, RetireAuthority)>> {
     let settings = state.session_store.owner_settings()?;
     let Some(minutes) = crate::owner_settings::auto_retire_minutes(&settings) else {
         return Ok(Vec::new());
@@ -163,6 +174,8 @@ fn due_sessions(state: &AppState, now: OffsetDateTime) -> anyhow::Result<Vec<(St
         .filter(|follow| follow.target_kind == crate::owner_push::TARGET_SESSION)
         .map(|follow| follow.session_id)
         .collect(),
+        reminded: RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path))
+            .scheduled_reminder_targets()?,
         parents_of_live: sessions
             .iter()
             .filter(|session| !session.is_stopped())
@@ -183,12 +196,30 @@ fn due_sessions(state: &AppState, now: OffsetDateTime) -> anyhow::Result<Vec<(St
     Ok(sessions
         .iter()
         .filter(|session| why_not(session, &context, now, minutes).is_none())
-        .map(|session| (session.id.clone(), minutes))
+        .map(|session| {
+            let authority = if !is_child(session) {
+                RetireAuthority::auto_retire(minutes)
+            } else if session.agent_task_completed_at.is_some() {
+                RetireAuthority::auto_retire(CHILD_IDLE_MINUTES)
+            } else {
+                RetireAuthority::auto_retire_idle_child(
+                    CHILD_IDLE_MINUTES,
+                    session.last_activity.clone(),
+                )
+            };
+            (session.id.clone(), authority)
+        })
         .collect())
 }
 
+/// An agent another agent spawned retires on the child rule (sm#2625):
+/// after `CHILD_IDLE_MINUTES`, finished or not.
+fn is_child(session: &SessionRecord) -> bool {
+    session.parent_session_id.is_some()
+}
+
 /// Why `session` does not auto-retire now, or `None` when it does
-/// (spec 1821 E1).
+/// (spec 1821 E1; children per sm#2625).
 fn why_not(
     session: &SessionRecord,
     context: &Context,
@@ -213,19 +244,26 @@ fn why_not(
     if session.is_stopped() {
         return Some("stopped");
     }
-    let Some(completed_at) = session.agent_task_completed_at.as_deref() else {
+    let completed_at = session.agent_task_completed_at.as_deref();
+    if completed_at.is_none() && !is_child(session) {
         return Some("not finished");
-    };
+    }
     let Some(item) = context.watch.get(&session.id) else {
         return Some("not listed");
     };
     if item["state"] != "idle" {
         return Some("not idle");
     }
-    let since = [completed_at, session.last_activity.as_str()]
+    let since = [completed_at, Some(session.last_activity.as_str())]
         .into_iter()
+        .flatten()
         .filter_map(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
         .max();
+    let minutes = if is_child(session) {
+        CHILD_IDLE_MINUTES
+    } else {
+        minutes
+    };
     let delay = time::Duration::minutes(i64::try_from(minutes).unwrap_or(i64::MAX));
     if since.is_none_or(|since| now - since < delay) {
         return Some("not idle long enough");
@@ -244,6 +282,24 @@ fn why_not(
     }
     if !jobs["review"].is_null() {
         return Some("waits on a review");
+    }
+    // An idle child may be waiting on an `sm await` or a queue completion
+    // rather than finished (sm#2625).
+    let waits_on = |kind: &str| {
+        item["waiting_on"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["kind"] == kind))
+    };
+    if waits_on("agent_wait") {
+        return Some("waits on another agent");
+    }
+    if waits_on("queue_delivery") {
+        return Some("waits on a queue delivery");
+    }
+    // A reminder to a retired agent is dropped, not delivered, so a child
+    // that scheduled one is not done yet.
+    if is_child(session) && context.reminded.contains(&session.id) {
+        return Some("has a scheduled reminder");
     }
     if context.parents_of_live.contains(&session.id) {
         return Some("has live child agents");
@@ -483,6 +539,41 @@ pub(super) fn retired_autopm_needs_successor(state: &AppState, session: &Session
         && handoff["threshold_percent"]
             .as_f64()
             .is_some_and(|threshold| used >= threshold)
+}
+
+/// The parent's plain `sm send` to its auto-retired child is refused, so a
+/// parent picks a fresh agent for new work and restores an old one only on
+/// purpose with `sm send --restore` (sm#2625). Returns the refusal, if any.
+/// Anyone else's message, and every queued delivery, still restores it.
+pub(super) fn parent_must_restore(
+    state: &AppState,
+    identifier: &str,
+    payload: &SendCoreInputRequest,
+) -> Result<Option<SessionRecord>, ApiError> {
+    if !payload.from_sm_send || payload.restore {
+        return Ok(None);
+    }
+    let Some(named) = state.session_store.get_session(identifier)? else {
+        return Ok(None);
+    };
+    // A child that handed off: the send goes to its successor, so judge that.
+    let session = forward_handed_off(state, named.clone())?;
+    let sender = payload.sender_session_id.as_deref();
+    let from_parent = sender.is_some()
+        && [&named, &session]
+            .iter()
+            .any(|record| record.parent_session_id.as_deref() == sender);
+    Ok((from_parent && messages::restores(&session)).then_some(session))
+}
+
+/// What the parent reads when `parent_must_restore` refuses its send.
+pub(super) fn parent_must_restore_detail(session: &SessionRecord) -> String {
+    let name = session_target_name(session).unwrap_or_else(|| session.id.clone());
+    format!(
+        "Not sent: {name} ({}) was retired after it went idle. Spawn a fresh agent for new \
+         work, or bring this one back with its context: sm send --restore {} <message>",
+        session.id, session.id
+    )
 }
 
 /// `sm send` to an auto-retired agent restores it before the send, which
