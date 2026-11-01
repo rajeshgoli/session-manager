@@ -439,4 +439,4 @@ async fn with_activity<T>(
 mod acceptance;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
