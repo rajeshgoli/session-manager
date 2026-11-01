@@ -2462,6 +2462,23 @@ impl RetainedQueueStore {
             .collect())
     }
 
+    /// Sessions with a scheduled reminder still to fire (sm#2625).
+    pub fn scheduled_reminder_targets(&self) -> Result<BTreeSet<String>> {
+        if !self.db_path.exists() {
+            return Ok(Default::default());
+        }
+        let conn = Connection::open_with_flags(&self.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT target_session_id FROM scheduled_reminders
+             WHERE is_active = 1 AND (fired = 0 OR recurring_interval_seconds IS NOT NULL)",
+        )?;
+        let targets = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(targets)
+    }
+
     pub fn deactivate_scheduled_reminder(&self, reminder_id: &str) -> Result<bool> {
         self.with_connection(|conn| {
             Ok(conn.execute(

@@ -27,6 +27,7 @@ fn context() -> Context {
         roles: BTreeSet::new(),
         followed: BTreeSet::new(),
         parents_of_live: BTreeSet::new(),
+        reminded: BTreeSet::new(),
         watch: BTreeMap::from([(
             "far01855".to_owned(),
             json!({"state": "idle", "facts": {"you": null,
@@ -190,6 +191,18 @@ fn an_idle_child_waiting_on_an_agent_or_delivery_stays() {
         context.watch.get_mut("far01855").unwrap()["waiting_on"] = json!([{"kind": kind}]);
         assert_eq!(check(&child, &context), Some(why));
     }
+}
+
+#[test]
+fn a_child_with_a_scheduled_reminder_stays() {
+    let mut child = agent();
+    child.parent_session_id = Some("far01800".to_owned());
+    child.agent_task_completed_at = None;
+    let mut context = context();
+    context.reminded.insert("far01855".to_owned());
+    assert_eq!(check(&child, &context), Some("has a scheduled reminder"));
+    // A top-level agent keeps the existing rule.
+    assert_eq!(check(&agent(), &context), None);
 }
 
 /// The locked re-check: an unfinished child retires only while untouched

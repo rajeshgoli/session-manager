@@ -135,6 +135,8 @@ struct Context {
     roles: BTreeSet<String>,
     followed: BTreeSet<String>,
     parents_of_live: BTreeSet<String>,
+    /// Sessions with a scheduled reminder still to fire.
+    reminded: BTreeSet<String>,
     /// `sm watch` items by session id: `state` and `facts`.
     watch: BTreeMap<String, Value>,
 }
@@ -172,6 +174,8 @@ fn due_sessions(
         .filter(|follow| follow.target_kind == crate::owner_push::TARGET_SESSION)
         .map(|follow| follow.session_id)
         .collect(),
+        reminded: RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path))
+            .scheduled_reminder_targets()?,
         parents_of_live: sessions
             .iter()
             .filter(|session| !session.is_stopped())
@@ -291,6 +295,11 @@ fn why_not(
     }
     if waits_on("queue_delivery") {
         return Some("waits on a queue delivery");
+    }
+    // A reminder to a retired agent is dropped, not delivered, so a child
+    // that scheduled one is not done yet.
+    if is_child(session) && context.reminded.contains(&session.id) {
+        return Some("has a scheduled reminder");
     }
     if context.parents_of_live.contains(&session.id) {
         return Some("has live child agents");
@@ -544,11 +553,16 @@ pub(super) fn parent_must_restore(
     if !payload.from_sm_send || payload.restore {
         return Ok(None);
     }
-    let Some(session) = state.session_store.get_session(identifier)? else {
+    let Some(named) = state.session_store.get_session(identifier)? else {
         return Ok(None);
     };
-    let from_parent = session.parent_session_id.is_some()
-        && session.parent_session_id == payload.sender_session_id;
+    // A child that handed off: the send goes to its successor, so judge that.
+    let session = forward_handed_off(state, named.clone())?;
+    let sender = payload.sender_session_id.as_deref();
+    let from_parent = sender.is_some()
+        && [&named, &session]
+            .iter()
+            .any(|record| record.parent_session_id.as_deref() == sender);
     Ok((from_parent && messages::restores(&session)).then_some(session))
 }
 
