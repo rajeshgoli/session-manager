@@ -32,6 +32,7 @@ impl Drop for Fixture {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
+    let _ports = crate::local_egress::tests::service_ports().await;
     let root = PathBuf::from(format!(
         "/private/tmp/wh-{}-{}",
         std::process::id(),
@@ -91,7 +92,7 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     drop(reservation);
     config.local_host.base_url = format!("http://127.0.0.1:{model_port}");
     let judge = LocalJudgeRuntime::isolated(&config, root.join("judge"));
-    let fixture = Fixture {
+    let mut fixture = Fixture {
         root: root.clone(),
         judge: judge.clone(),
         egress_task,
@@ -196,6 +197,20 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     let b_request = registration("wall-b", 18501);
     let a = host.prepare(&a_request).unwrap();
     let b = host.prepare(&b_request).unwrap();
+    // Newly signed tool copies can need macOS first-launch loader work. Warm
+    // both compiler and linker without inherited capabilities, just as the
+    // native launch fixture warms rust-application in test_launch.py. Actual
+    // validation still runs inside the wall with the two-second recovery bound.
+    for (tool, argument) in [("cc", "--version"), ("ld", "-version_details")] {
+        let started = Instant::now();
+        let output = Command::new(&a.artifacts.tools[tool])
+            .env_clear()
+            .arg(argument)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{tool}: {output:?}");
+        eprintln!("staged {tool} first launch: {:?}", started.elapsed());
+    }
     fs::write(a_request.checkout.join("Cargo.toml"), "[package]\nname = \"staged-validation\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n").unwrap();
     fs::write(
         a_request.checkout.join("lib.rs"),
@@ -1008,5 +1023,8 @@ async fn host_preparation_two_agents_restore_and_failed_launch_are_confined() {
     assert_eq!(fs::read_to_string(record_path).unwrap(), "false");
     drop(uncertain_host);
     drop(host);
+    // Finish listener teardown before releasing the shared port reservation.
+    fixture.egress_task.abort();
+    let _ = (&mut fixture.egress_task).await;
     drop(fixture);
 }

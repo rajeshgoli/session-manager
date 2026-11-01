@@ -9144,6 +9144,15 @@ impl SessionStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn mutate_test_json(&self, update: impl FnOnce(&mut Value)) {
+        // Fixture changes must serialize with router startup maintenance too.
+        let _guard = self.write_guard().unwrap();
+        let mut state = self.load_raw_json_value().unwrap();
+        update(&mut state);
+        self.write_raw_json_value(&state).unwrap();
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_write_lock_attempts(&self) -> u64 {
         self.write_lock_attempts.load(Ordering::Relaxed)
     }

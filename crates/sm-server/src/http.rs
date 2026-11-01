@@ -26010,7 +26010,8 @@ mod tests {
         let host = crate::local_model::register_live(&config).unwrap();
         let db = Connection::open(&config.sm_send.db_path).unwrap();
         db.execute("INSERT INTO local_model (singleton,key,server,identifier,seats,context,reservation_bytes,measured_peak_bytes,state,desired,state_since,endpoint,last_yield_reason) VALUES (1,'test','mtplx','flash-next',1,200000,151000000000,137000000000,'ready',1,'now','http://127.0.0.1:8000','perf run')", []).unwrap();
-        let app = router(AppState::new(config.clone()));
+        let state = AppState::new(config.clone());
+        let app = router(state.clone());
         for (model_state, occupied) in [
             ("ready", false),
             ("ready", true),
@@ -26019,14 +26020,13 @@ mod tests {
         ] {
             db.execute("UPDATE local_model SET state=?1", [model_state])
                 .unwrap();
-            let mut raw: Value =
-                serde_json::from_slice(&fs::read(&config.paths.state_file).unwrap()).unwrap();
-            raw["sessions"][0]["host"] = if occupied {
-                json!("local")
-            } else {
-                Value::Null
-            };
-            fs::write(&config.paths.state_file, serde_json::to_vec(&raw).unwrap()).unwrap();
+            state.session_store.mutate_test_json(|raw| {
+                raw["sessions"][0]["host"] = if occupied {
+                    json!("local")
+                } else {
+                    Value::Null
+                };
+            });
             if model_state == "yielded" {
                 host.set_reload_hold_for_test(30);
             }
@@ -26066,7 +26066,8 @@ mod tests {
             .display()
             .to_string();
         let host = crate::local_model::register_live(&config).unwrap();
-        let app = router(AppState::new(config.clone()));
+        let state = AppState::new(config.clone());
+        let app = router(state.clone());
         let db = Connection::open(&config.sm_send.db_path).unwrap();
         for (model_state, expected) in [
             (None, json!([])),
@@ -26101,14 +26102,15 @@ mod tests {
         }
         db.execute("UPDATE local_model SET state='ready'", [])
             .unwrap();
-        let mut data: Value =
-            serde_json::from_slice(&fs::read(&config.paths.state_file).unwrap()).unwrap();
-        data["sessions"][0]["provider"] = json!("opencode");
-        data["sessions"][0]["friendly_name"] = json!("local-worker");
-        data["sessions"][0]["opencode"] = json!({"port":18500,"state_dir":"/private/tmp/opencode-test/local","version":"1.17.9","model_base_url":"http://127.0.0.1:8000/v1"});
+        state.session_store.mutate_test_json(|data| {
+            data["sessions"][0]["provider"] = json!("opencode");
+            data["sessions"][0]["friendly_name"] = json!("local-worker");
+            data["sessions"][0]["opencode"] = json!({"port":18500,"state_dir":"/private/tmp/opencode-test/local","version":"1.17.9","model_base_url":"http://127.0.0.1:8000/v1"});
+        });
         for (session_status, available) in [("idle", false), ("stopped", true)] {
-            data["sessions"][0]["status"] = json!(session_status);
-            fs::write(&config.paths.state_file, serde_json::to_vec(&data).unwrap()).unwrap();
+            state.session_store.mutate_test_json(|data| {
+                data["sessions"][0]["status"] = json!(session_status);
+            });
             let response = app
                 .clone()
                 .oneshot(local_request(

@@ -587,6 +587,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn reservations_survive_restart_and_retirement_and_environment_is_stable() {
+        let _ports = super::super::tests::service_ports().await;
         let dir = super::super::tests::directory();
         let mut registry = Registry::open(&dir).await.unwrap();
         let a = registry
@@ -683,6 +684,9 @@ mod tests {
             .request(Request::Unregister("a".into()))
             .await
             .unwrap();
+        // Other tests fork the multithreaded host. Their children can retain
+        // this CLOEXEC listener until exec even after our task has shut down.
+        crate::opencode::tests::wait_until_port_free(a.gateway.as_ref().unwrap().port);
         assert!(tokio::net::TcpStream::connect((
             std::net::Ipv4Addr::LOCALHOST,
             a.gateway.as_ref().unwrap().port
@@ -738,6 +742,12 @@ mod tests {
             format!("http://127.0.0.1:{}", a.gateway.as_ref().unwrap().port)
         );
         server.abort();
+        for (_, listener) in std::mem::take(&mut registry.listeners) {
+            listener.shutdown().await;
+        }
+        for (_, listener) in std::mem::take(&mut registry.gateway_listeners) {
+            listener.shutdown().await;
+        }
         drop(registry);
         fs::remove_dir_all(dir).unwrap();
     }

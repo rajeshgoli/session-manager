@@ -13,6 +13,29 @@ pub(super) fn directory() -> PathBuf {
     fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
     path
 }
+// These fixtures exercise the production allocator, so they share its fixed
+// port ranges. Keep the lock outside per-run roots and never unlink it: other
+// worktrees must coordinate on the same inode, even while a port is unbound.
+pub(crate) async fn service_ports() -> nix::fcntl::Flock<fs::File> {
+    tokio::task::spawn_blocking(|| {
+        use std::os::unix::fs::OpenOptionsExt;
+        // SAFETY: geteuid has no arguments.
+        let uid = unsafe { libc::geteuid() };
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(format!("/tmp/sm-egress-test-ports-{uid}.lock"))
+            .unwrap();
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive).unwrap()
+    })
+    .await
+    .unwrap()
+}
+
 #[test]
 fn rejects_non_public_and_encoded_private_addresses() {
     for address in [

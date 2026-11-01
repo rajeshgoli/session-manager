@@ -124,6 +124,10 @@ fn owner_restage_refuses_live_owner_and_generation_preparation_even_with_a_recei
     record_retired(&fixture.config).unwrap();
     let owner = stage_lock(&fixture.owner_root(), libc::LOCK_SH | libc::LOCK_NB).unwrap();
     assert!(fixture.reset().is_err());
+    // Unrelated pre_exec children can inherit the test host's file table.
+    // Explicit unlock ends this simulated owner's authority even while such
+    // a child still holds its CLOEXEC copy; drop alone waits for that exec.
+    assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_UN) }, 0);
     drop(owner);
     let lock_path = fixture
         .config
@@ -143,6 +147,10 @@ fn owner_restage_refuses_live_owner_and_generation_preparation_even_with_a_recei
         0
     );
     assert!(fixture.reset().is_err());
+    assert_eq!(
+        unsafe { libc::flock(preparation.as_raw_fd(), libc::LOCK_UN) },
+        0
+    );
     drop(preparation);
     fixture.reset().unwrap();
 }
