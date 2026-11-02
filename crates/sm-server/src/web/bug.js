@@ -15,7 +15,9 @@ export const decodedBytes = (b64) => Math.floor((b64.length * 3) / 4) - (b64.end
 export async function captureScreen({ node, ratio, render } = {}) {
   const attempt = async (pixelRatio) => {
     const draw = render || (await import('html-to-image')).toPng;
-    const url = String(await draw(node || document.body, { pixelRatio, filter: (n) => n.dataset?.bugExclude === undefined }));
+    // A broken image renders blank rather than failing the whole capture
+    // (sm#2639): a page with a broken image is one people file bugs from.
+    const url = String(await draw(node || document.body, { pixelRatio, filter: (n) => n.dataset?.bugExclude === undefined, onImageErrorHandler: () => {} }));
     const b64 = url.slice(url.indexOf(',') + 1);
     if (!url.startsWith('data:image/png') || decodedBytes(b64) > SCREENSHOT_MAX_BYTES) throw new Error('screenshot unusable');
     return b64;
