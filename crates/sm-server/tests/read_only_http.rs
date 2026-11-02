@@ -17555,6 +17555,60 @@ async fn runtime_core_claude_spawn_brief_accepts_transcript_created_by_the_brief
 }
 
 #[tokio::test]
+async fn runtime_core_claude_spawn_brief_answers_folder_trust_before_submitting() {
+    if !tmux_available() {
+        return;
+    }
+    for yes_selected in [false, true] {
+        let state_file = unique_temp_path();
+        let log_dir = unique_temp_path();
+        let working_dir = unique_temp_path();
+        fs::create_dir_all(&working_dir).unwrap();
+        fs::create_dir_all(&log_dir).unwrap();
+        let mut trust = include_str!("fixtures/claude_directory_trust.txt").to_owned();
+        if yes_selected {
+            trust = trust
+                .replace("❯ No, exit", "  No, exit")
+                .replace("  Yes, I trust this folder", "❯ Yes, I trust this folder");
+        }
+        fs::write(log_dir.join("directory-trust.txt"), trust).unwrap();
+        let tmux_socket = format!("sm-claude-trust-{}-{yes_selected}", std::process::id());
+        let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+        let app = runtime_app_with_structured_claude_provider(
+            &state_file,
+            &log_dir,
+            &tmux_socket,
+            true,
+            false,
+            false,
+        );
+        let (status, payload) = post_json(
+            app,
+            "/sessions",
+            json!({
+                "id": "claudetrusted",
+                "name": "claude-trusted",
+                "working_dir": working_dir.display().to_string(),
+                "provider": "claude",
+                "initial_message": "CLAUDE_TRUST_SENTINEL",
+                "spawn_prompt_source": {"kind": "file", "path": "/tmp/trust-brief.md"}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        let launch = &state["session_runtime_launches"][0];
+        let logs = fs::read_to_string(launch["log_file"].as_str().unwrap()).unwrap();
+        assert_eq!(logs.matches("folder-trust-confirmed").count(), 1, "{logs}");
+        assert_eq!(
+            logs.matches("received:CLAUDE_TRUST_SENTINEL").count(),
+            1,
+            "{logs}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn runtime_core_spawn_wait_detects_naturally_exited_tmux_child() {
     if !tmux_available() {
         return;
@@ -21928,6 +21982,27 @@ import json, os, sys, tty
 path, session_id = sys.argv[1:]
 fd = os.open('/dev/tty', os.O_RDWR)
 tty.setraw(fd)
+# Optional startup picker models Claude's default No and requires a separate
+# navigation event, a repainted Yes selection, and Enter before any brief.
+trust_path = {trust_path:?}
+if os.path.exists(trust_path):
+    with open(trust_path) as prompt_file:
+        trust = prompt_file.read()
+    def paint_trust():
+        os.write(fd, ('\x1b[2J\x1b[H' + trust.replace('\n', '\r\n')).encode())
+    paint_trust()
+    if '❯ No, exit' in trust:
+        navigation = b''
+        while not navigation.endswith(b'\x1b[B'):
+            navigation += os.read(fd, 1)
+            if b'\r' in navigation or b'\n' in navigation:
+                raise RuntimeError('confirmed No or pasted brief before selecting Yes')
+        trust = trust.replace('❯ No, exit', '  No, exit').replace('  Yes, I trust this folder', '❯ Yes, I trust this folder')
+        paint_trust()
+    if os.read(fd, 1) != b'\r':
+        raise RuntimeError('expected trust confirmation before brief')
+    print('folder-trust-confirmed', flush=True)
+    os.write(fd, b'\x1b[2J\x1b[H')
 # Model the initial composer: only a complete bracketed paste followed by a
 # literal carriage return submits. Preserve newlines and UTF-8 within the paste.
 os.write(fd, b'\x1b[?2004h')
@@ -21955,7 +22030,8 @@ while True:
             transcript.write(json.dumps(entry) + '\n')
     print('renderer changed again\r\n❯', end='', flush=True)
 PYTHON
-"#
+"#,
+            trust_path = log_dir.join("directory-trust.txt").display().to_string()
         ),
     )
     .unwrap();

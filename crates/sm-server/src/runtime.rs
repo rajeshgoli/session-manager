@@ -176,6 +176,7 @@ pub enum CodexModelValidationError {
 pub enum InitialBriefDeliveryError {
     ProviderAcknowledgementUnavailable { provider: String },
     ProviderReadinessTimedOut { provider: String },
+    DirectoryTrustBlocked { provider: String },
     ProviderAcceptanceTimedOut { provider: String },
     SessionExited { provider: String },
 }
@@ -190,6 +191,10 @@ impl std::fmt::Display for InitialBriefDeliveryError {
             Self::ProviderReadinessTimedOut { provider } => write!(
                 formatter,
                 "timed out waiting for {provider} to become ready for the initial spawn brief"
+            ),
+            Self::DirectoryTrustBlocked { provider } => write!(
+                formatter,
+                "{provider} is blocked on its folder-trust prompt; could not select 'Yes, I trust this folder' before the readiness timeout"
             ),
             Self::ProviderAcceptanceTimedOut { provider } => write!(
                 formatter,
@@ -1906,7 +1911,7 @@ impl TmuxRuntime {
                         .into(),
                     );
                 }
-                self.wait_for_claude_initial_brief_composer(&spec.tmux_session)?;
+                self.wait_for_initial_brief_readiness(&spec.tmux_session, "claude")?;
                 // Claude 2.1.280 creates its transcript only when the first
                 // user turn is submitted, so the transcript cannot gate
                 // readiness. Record any transcript an older Claude already
@@ -1960,36 +1965,6 @@ impl TmuxRuntime {
                 .into(),
             ),
         }
-    }
-
-    /// Wait until Claude exposes an empty composer at the live cursor. Startup
-    /// and onboarding screens precede the interactive UI.
-    fn wait_for_claude_initial_brief_composer(&self, tmux_session: &str) -> Result<()> {
-        let deadline = Instant::now() + self.initial_brief_ready_timeout;
-        loop {
-            if !self.session_exists(tmux_session)? {
-                return Err(InitialBriefDeliveryError::SessionExited {
-                    provider: "claude".to_owned(),
-                }
-                .into());
-            }
-            if self.claude_initial_brief_composer_ready(tmux_session) {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(InitialBriefDeliveryError::ProviderReadinessTimedOut {
-                    provider: "claude".to_owned(),
-                }
-                .into());
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Claude's empty composer must be at the active cursor, not merely occur
-    /// in scrollback or resemble a typed prompt in a startup frame.
-    fn claude_initial_brief_composer_ready(&self, tmux_session: &str) -> bool {
-        self.claude_empty_composer_pane(tmux_session).is_some()
     }
 
     fn claude_empty_composer_pane(&self, tmux_session: &str) -> Option<String> {
@@ -2052,6 +2027,7 @@ impl TmuxRuntime {
     ) -> Result<()> {
         let deadline = Instant::now() + self.initial_brief_ready_timeout;
         let mut directory_trust_accepted = false;
+        let mut claude_trust_selection_moved = false;
         loop {
             if provider != "opencode" && !self.session_exists(tmux_session)? {
                 return Err(InitialBriefDeliveryError::SessionExited {
@@ -2068,10 +2044,36 @@ impl TmuxRuntime {
                 self.send_key(tmux_session, "Enter")?;
                 directory_trust_accepted = true;
             }
+            if provider == "claude" && !directory_trust_accepted {
+                if let Some(trust_selected) = self
+                    .capture_pane_text(tmux_session)
+                    .as_deref()
+                    .and_then(claude_directory_trust_selection)
+                {
+                    if self.session_has_attached_clients(tmux_session)? {
+                        bail!("refusing to answer the Claude folder-trust prompt while a tmux client is attached");
+                    }
+                    if trust_selected {
+                        self.send_key(tmux_session, "Enter")?;
+                        directory_trust_accepted = true;
+                    } else if !claude_trust_selection_moved {
+                        // Claude defaults to No. Navigate once, then require a
+                        // fresh capture proving Yes is selected before Enter.
+                        self.send_key(tmux_session, "Down")?;
+                        claude_trust_selection_moved = true;
+                    }
+                }
+            }
             if self.session_input_ready(tmux_session, provider) {
                 return Ok(());
             }
             if Instant::now() >= deadline {
+                if claude_trust_selection_moved && !directory_trust_accepted {
+                    return Err(InitialBriefDeliveryError::DirectoryTrustBlocked {
+                        provider: provider.to_owned(),
+                    }
+                    .into());
+                }
                 return Err(InitialBriefDeliveryError::ProviderReadinessTimedOut {
                     provider: provider.to_owned(),
                 }
@@ -3314,6 +3316,26 @@ fn is_codex_directory_trust_prompt(pane: &str) -> bool {
     legacy || folder_access
 }
 
+/// Identify Claude's startup picker and its selected option. Checking the
+/// complete picker avoids treating quoted trust questions as startup input.
+fn claude_directory_trust_selection(pane: &str) -> Option<bool> {
+    if !pane.contains("Accessing workspace:")
+        || !pane.contains("Quick safety check: Is this a project you created or one you trust?")
+        || !pane.contains("Enter to confirm")
+        || !pane.contains("Esc to cancel")
+    {
+        return None;
+    }
+    let lines: Vec<_> = pane.lines().map(str::trim).collect();
+    if lines.contains(&"❯ No, exit") && lines.contains(&"Yes, I trust this folder") {
+        Some(false)
+    } else if lines.contains(&"No, exit") && lines.contains(&"❯ Yes, I trust this folder") {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 fn initial_stdin_prompt<'a>(spec: &'a TmuxSessionSpec, prompt_mode: &str) -> Option<&'a str> {
     if prompt_mode != "stdin" {
         return None;
@@ -4367,6 +4389,31 @@ esac
             "The docs ask: Trust this folder? Trust and continue / Open restricted",
         ] {
             assert!(!is_codex_directory_trust_prompt(pane));
+        }
+    }
+
+    #[test]
+    fn claude_directory_trust_requires_the_complete_picker_and_selected_option() {
+        let pane = include_str!("../tests/fixtures/claude_directory_trust.txt");
+        assert_eq!(claude_directory_trust_selection(pane), Some(false));
+        let yes_selected = pane
+            .replace("❯ No, exit", "  No, exit")
+            .replace("  Yes, I trust this folder", "❯ Yes, I trust this folder");
+        assert_eq!(claude_directory_trust_selection(&yes_selected), Some(true));
+        for changed in [
+            pane.replace("Accessing workspace:", ""),
+            pane.replace("Quick safety check:", ""),
+            pane.replace("❯ No, exit", "No, exit"),
+            pane.replace("Yes, I trust this folder", "Allow this action"),
+            pane.replace("Enter to confirm", ""),
+            pane.replace("Esc to cancel", ""),
+            format!("The docs ask: {}", pane.replace('\n', " ")),
+        ] {
+            assert_eq!(
+                claude_directory_trust_selection(&changed),
+                None,
+                "{changed}"
+            );
         }
     }
 
