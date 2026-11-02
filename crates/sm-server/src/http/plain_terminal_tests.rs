@@ -22,7 +22,39 @@ fn plain_test_state() -> (AppState, PlainTestTmux) {
     );
     state.config.tmux.socket_name = Some(socket.clone());
     state.config.rust_core.tmux_socket_name = Some(socket.clone());
-    (state, PlainTestTmux(socket))
+    let tmux = PlainTestTmux(socket);
+    // Keep personal login hooks and prompts out of this private tmux server.
+    // Set ZDOTDIR on the server, never in the parallel test process environment.
+    let zdotdir = path.parent().unwrap().join("zsh");
+    fs::create_dir_all(&zdotdir).unwrap();
+    fs::write(zdotdir.join(".zshenv"), "unsetopt GLOBAL_RCS\n").unwrap();
+    fs::write(zdotdir.join(".zshrc"), "PROMPT='sm-plain-test-ready> '\n").unwrap();
+    state.runtime().ensure_server_anchor().unwrap();
+    plain_tmux(&state, &["set-environment", "-g", "ZDOTDIR", zdotdir.to_str().unwrap()]);
+    (state, tmux)
+}
+
+fn plain_tmux(state: &AppState, args: &[&str]) {
+    let command = state.runtime().tmux_command(args.iter().copied()).unwrap();
+    let output = crate::runtime::command_output_with_timeout(command, Duration::from_secs(3)).unwrap();
+    assert!(output.status.success(), "tmux {args:?}: {output:?}");
+}
+
+async fn plain_wait_for(
+    state: &AppState,
+    id: &str,
+    description: &str,
+    mut ready: impl FnMut() -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {description} in {id}; pane: {:?}",
+            state.runtime().capture_pane_text(id)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 async fn plain_call(
     state: &AppState,
@@ -46,7 +78,14 @@ fn plain_set_limits(state: &AppState, patch: Value) {
 async fn plain_new(state: &AppState) -> String {
     let (status, body) = plain_call(state, Method::POST, "/terminals", json!({"cwd":"/tmp"})).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    body["id"].as_str().unwrap().into()
+    let id = body["id"].as_str().unwrap().to_owned();
+    plain_wait_for(state, &id, "the shell prompt", || {
+        state.runtime().capture_pane_text(&id).is_some_and(|pane| {
+            pane.lines().rev().find(|line| !line.trim().is_empty()).map(str::trim)
+                == Some("sm-plain-test-ready>")
+        })
+    }).await;
+    id
 }
 
 #[tokio::test]
@@ -184,20 +223,16 @@ async fn plain_terminal_busy_jobs_restart_adoption_idle_reap_and_watch() {
     let store = plain_terminals::store(&state);
     let t = store.get(&id).unwrap().unwrap();
     let output = PathBuf::from(&state.config.paths.state_file).with_extension("shell-env");
-    let line=format!("print -r -- ${{SESSION_MANAGER_ID-unset}}:${{CLAUDE_SESSION_MANAGER_ID-unset}}:${{SM_SESSION_CREDENTIAL-unset}} > '{}'; sleep 300 &",output.display());
+    let line=format!("sleep 300 & print -r -- ${{SESSION_MANAGER_ID-unset}}:${{CLAUDE_SESSION_MANAGER_ID-unset}}:${{SM_SESSION_CREDENTIAL-unset}} > '{}'",output.display());
     // Background work protects a prompt too, not only a foreground command.
-    state
-        .runtime()
-        .tmux_command(["send-keys", "-t", &id, &line, "Enter"])
-        .unwrap()
-        .output()
-        .unwrap();
-    for _ in 0..100 {
-        if output.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    plain_tmux(&state, &["send-keys", "-t", &id, "-l", &line]);
+    plain_tmux(&state, &["send-keys", "-t", &id, "Enter"]);
+    // A file can exist before print finishes; require its complete line and
+    // the background child before asking reconciliation to classify the shell.
+    plain_wait_for(&state, &id, "shell environment output and background work", || {
+        fs::read_to_string(&output).is_ok_and(|text| text.ends_with('\n'))
+            && crate::plain_terminals::observe(&state.runtime(), &t).is_ok_and(|o| o.busy)
+    }).await;
     assert_eq!(
         fs::read_to_string(output).unwrap().trim(),
         "unset:unset:unset"
@@ -251,7 +286,10 @@ async fn plain_terminal_busy_jobs_restart_adoption_idle_reap_and_watch() {
         Some("tmux_gone")
     );
     let idle = plain_new(&state).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let idle_terminal = store.get(&idle).unwrap().unwrap();
+    plain_wait_for(&state, &idle, "an idle shell", || {
+        crate::plain_terminals::observe(&state.runtime(), &idle_terminal).is_ok_and(|o| !o.busy)
+    }).await;
     conn.execute(
         "UPDATE plain_terminals SET created_at='2020-01-01T00:00:00Z' WHERE id=?1",
         [&idle],
