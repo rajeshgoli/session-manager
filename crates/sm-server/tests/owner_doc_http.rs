@@ -677,6 +677,9 @@ async fn assign_undelivered_review_spawns_agent() {
     let id = doc["id"].as_str().unwrap().to_owned();
     post_review(&f, &id, "sub-assign-1", None);
     let assign = format!("/docs/{id}/assign");
+    // Any reader load offers Assign while the review waits (sm#2643).
+    let (_, head) = request(&f.app, "GET", &format!("/docs/{id}/head"), None).await;
+    assert_eq!(head["undelivered_review"]["submission_id"], "sub-assign-1");
 
     let (status, body) = request(
         &f.app,
@@ -694,6 +697,7 @@ async fn assign_undelivered_review_spawns_agent() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(head["agent"]["session_id"], session_id);
     assert_eq!(head["agent"]["via"], "assignment");
+    assert_eq!(head["undelivered_review"], Value::Null);
     // The new agent: same provider, model and effort as the ended author,
     // in the newest checkout that still exists, no parent.
     let sessions: Value =
