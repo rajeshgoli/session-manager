@@ -425,7 +425,9 @@
       }
     }
     if (!MSG && S.undelivered) {
-      var parts = [el('span', { text: 'Review posted to PR #' + CONFIG.prNumber + ', but no agent is left to wake.' })];
+      // The review may have gone to a new PR (a merged or deleted doc).
+      var posted = /\/pull\/(\d+)/.exec(S.undelivered.url || '');
+      var parts = [el('span', { text: 'Review posted to PR #' + (posted ? posted[1] : CONFIG.prNumber) + ', but no agent is left to wake.' })];
       if (S.assigned) parts.push(el('span', { text: S.assigned }));
       else parts.push(el('button', { class: 'lk', text: 'Assign to a new agent', onclick: function (e) {
         var b = e.currentTarget; b.disabled = true;
@@ -484,6 +486,10 @@
       if (head.pr_state === 'open') S.reopenTarget = null;
       S.agent = head.agent || null; S.mergeHold = head.merge_hold || null;
       trackSubmission(head.review_submission);
+      // Assign is offered whenever the latest review waits for an agent (sm#2643).
+      var waiting = head.undelivered_review;
+      if (waiting && !(S.undelivered && S.undelivered.id === waiting.submission_id)) { S.undelivered = { id: waiting.submission_id, url: waiting.github_review_url }; S.assigned = ''; }
+      else if (!waiting && S.undelivered && !S.assigned) S.undelivered = null;
       if (!agentPanel.hidden) renderAgentPanel();
       if (head.pr_state) {
         S.prState = head.pr_state;

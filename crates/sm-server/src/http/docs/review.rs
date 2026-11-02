@@ -655,6 +655,34 @@ pub(super) fn review_submission_json(state: &AppState, doc_id: &str) -> Result<V
     })
 }
 
+/// The doc's latest posted review while no agent has it and no newer
+/// revision was published (sm#2643), so the reader offers Assign on any
+/// load, not only in the page that submitted it.
+pub(super) fn undelivered_review_json(state: &AppState, doc_id: &str) -> Result<Value, ApiError> {
+    let store = owner_doc_store(state);
+    let Some(review) = store
+        .reviews(doc_id)?
+        .into_iter()
+        .rev()
+        .find(|review| review.status == "posted")
+    else {
+        return Ok(Value::Null);
+    };
+    let published_at = store.publishes(doc_id)?.pop().map(|p| p.published_at);
+    let posted_at = review.posted_at.as_deref().unwrap_or(&review.submitted_at);
+    Ok(
+        if crate::owner_docs::review_awaits_agent(
+            review.delivered_to_session_id.is_some(),
+            posted_at,
+            published_at.as_deref(),
+        ) {
+            json!({"submission_id": review.id, "github_review_url": review.github_review_url})
+        } else {
+            Value::Null
+        },
+    )
+}
+
 async fn run_blocking(
     state: &Arc<AppState>,
     review: OwnerDocReview,

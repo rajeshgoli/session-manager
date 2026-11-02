@@ -338,7 +338,7 @@ pub fn derive_owner_doc_state(inputs: &OwnerDocStateInputs<'_>) -> OwnerDocState
 /// it, and no revision was published after it posted. A later publish means
 /// some agent took the review up (sm#1606). `posted_at` falls back to the
 /// submit time for rows older than the column.
-fn review_awaits_agent(
+pub(crate) fn review_awaits_agent(
     delivered: bool,
     posted_at: &str,
     latest_published_at: Option<&str>,

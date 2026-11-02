@@ -1831,6 +1831,7 @@ async fn doc_head_response(
         "pr_head_reader_path": null,
         "pr_state": null,
         "review_submission": review::review_submission_json(state, &doc.id)?,
+        "undelivered_review": review::undelivered_review_json(state, &doc.id)?,
     });
     match doc_pull_request_async(state, doc, false).await {
         None => {}
