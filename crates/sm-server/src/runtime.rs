@@ -194,7 +194,7 @@ impl std::fmt::Display for InitialBriefDeliveryError {
             ),
             Self::DirectoryTrustBlocked { provider } => write!(
                 formatter,
-                "{provider} is blocked on its folder-trust prompt; could not select 'Yes, I trust this folder' before the readiness timeout"
+                "{provider} is blocked on its folder-trust prompt; could not confirm 'Yes, I trust this folder' before the readiness timeout"
             ),
             Self::ProviderAcceptanceTimedOut { provider } => write!(
                 formatter,
@@ -2027,7 +2027,8 @@ impl TmuxRuntime {
     ) -> Result<()> {
         let deadline = Instant::now() + self.initial_brief_ready_timeout;
         let mut directory_trust_accepted = false;
-        let mut claude_trust_selection_moved = false;
+        let mut claude_trust_seen = false;
+        let mut claude_trust_last_action: Option<Instant> = None;
         loop {
             if provider != "opencode" && !self.session_exists(tmux_session)? {
                 return Err(InitialBriefDeliveryError::SessionExited {
@@ -2044,23 +2045,29 @@ impl TmuxRuntime {
                 self.send_key(tmux_session, "Enter")?;
                 directory_trust_accepted = true;
             }
-            if provider == "claude" && !directory_trust_accepted {
+            if provider == "claude" {
                 if let Some(trust_selected) = self
                     .capture_pane_text(tmux_session)
                     .as_deref()
                     .and_then(claude_directory_trust_selection)
                 {
+                    claude_trust_seen = true;
                     if self.session_has_attached_clients(tmux_session)? {
                         bail!("refusing to answer the Claude folder-trust prompt while a tmux client is attached");
                     }
-                    if trust_selected {
-                        self.send_key(tmux_session, "Enter")?;
-                        directory_trust_accepted = true;
-                    } else if !claude_trust_selection_moved {
-                        // Claude defaults to No. Navigate once, then require a
-                        // fresh capture proving Yes is selected before Enter.
-                        self.send_key(tmux_session, "Down")?;
-                        claude_trust_selection_moved = true;
+                    if claude_trust_last_action
+                        .is_none_or(|last| last.elapsed() >= Duration::from_millis(250))
+                    {
+                        if trust_selected {
+                            // Use the same literal submit byte as the brief.
+                            self.run_tmux(["send-keys", "-t", tmux_session, "-H", "0d"])?;
+                        } else {
+                            self.send_key(tmux_session, "Down")?;
+                        }
+                        // Startup can repaint/reset this picker after input.
+                        // Re-capture after settling and handle only a picker
+                        // still present; confirming it is not proof of readiness.
+                        claude_trust_last_action = Some(Instant::now());
                     }
                 }
             }
@@ -2068,7 +2075,7 @@ impl TmuxRuntime {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                if claude_trust_selection_moved && !directory_trust_accepted {
+                if claude_trust_seen {
                     return Err(InitialBriefDeliveryError::DirectoryTrustBlocked {
                         provider: provider.to_owned(),
                     }
