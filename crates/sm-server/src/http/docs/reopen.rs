@@ -127,12 +127,18 @@ fn follow_merges(
         };
         if stop {
             let tip = tip.ok_or_else(|| format!("{branch} was deleted without a merged PR"))?;
-            let (_, blob) = source
-                .fetch_doc_with_blob_sha(&doc.repo, &doc.path, tip)
-                .map_err(|_| format!("{} is not on {branch}", doc.path))?;
-            return Ok(
-                json!({"kind":"new_pr","base":branch,"tip_sha":tip,"doc_changed":blob!=latest_blob}),
-            );
+            // A file deleted on the way to `branch` (a review copy removed at
+            // merge) still takes the review: the comments travel as quotes
+            // and the woken author finds the reviewed revision from them.
+            return match source.fetch_doc_with_blob_sha(&doc.repo, &doc.path, tip) {
+                Ok((_, blob)) => Ok(
+                    json!({"kind":"new_pr","base":branch,"tip_sha":tip,"doc_changed":blob!=latest_blob}),
+                ),
+                Err(DocFetchError::NotFound(_)) => Ok(
+                    json!({"kind":"new_pr","base":branch,"tip_sha":tip,"doc_changed":true,"doc_deleted":true,"from_pr":doc.pr_number}),
+                ),
+                Err(_) => Err(format!("{} could not be read on {branch}", doc.path)),
+            };
         }
         branch = merged[0]["baseRefName"]
             .as_str()
@@ -409,7 +415,9 @@ pub(super) async fn prepare(
         target["held"] = json!(true);
         store.set_review_target(&review.id, &target)?;
     }
-    if body_only(&target) {
+    // A deleted doc has nothing to republish at the review PR's head: the doc
+    // keeps its last revision and the review body names where it came from.
+    if body_only(&target) && target["doc_deleted"] != true {
         let head = target["head_sha"]
             .as_str()
             .ok_or_else(|| conflict("missing review head"))?
@@ -548,8 +556,8 @@ mod tests {
         );
         s.missing = true;
         assert_eq!(
-            resolve_target(&s, &no_pr, "blob").unwrap_err(),
-            "No open PR changes memo.html, and memo.html is not on main"
+            resolve_target(&s, &no_pr, "blob").unwrap(),
+            json!({"kind":"new_pr","base":"main","tip_sha":"main-tip","doc_changed":true,"doc_deleted":true,"from_pr":null})
         );
         s.open_prs = json!([7, 9]);
         assert!(resolve_target(&s, &no_pr, "blob")
@@ -580,7 +588,18 @@ mod tests {
         }
     }
     #[test]
-    fn refuses_missing_branch_missing_doc_ambiguous_loop_and_long_chain() {
+    fn doc_deleted_at_merge_still_takes_a_review_on_a_new_pr() {
+        let mut s = source(
+            json!({"epic":{"tip":null,"prs":[merged("main","2026-02-01")]},"main":{"tip":"main-tip","prs":[]}}),
+        );
+        s.missing = true;
+        assert_eq!(
+            resolve_target(&s, &doc(), "blob").unwrap(),
+            json!({"kind":"new_pr","base":"main","tip_sha":"main-tip","doc_changed":true,"doc_deleted":true,"from_pr":1})
+        );
+    }
+    #[test]
+    fn refuses_missing_branch_ambiguous_loop_and_long_chain() {
         let cases = [
             (json!({"epic":{"tip":null,"prs":[]}}), "deleted"),
             (
@@ -598,11 +617,6 @@ mod tests {
                 .contains(reason));
         }
         let mut s = source(json!({"epic":{"tip":"tip","prs":[]}}));
-        s.missing = true;
-        assert!(resolve_target(&s, &doc(), "blob")
-            .unwrap_err()
-            .contains("not on epic"));
-        s.missing = false;
         s.branches.clear();
         for i in 0..11 {
             s.branches.insert(if i==0 {"epic".into()} else {format!("b{i}")},json!({"tip":null,"prs":[merged(&format!("b{}",i+1),&format!("2026-02-{:02}",i+1))]}));

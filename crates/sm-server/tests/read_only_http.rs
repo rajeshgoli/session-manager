@@ -25379,6 +25379,59 @@ async fn owner_doc_merged_review_retries_creation_without_duplicate_pr_or_publis
 }
 
 #[tokio::test]
+async fn owner_doc_deleted_at_merge_still_takes_a_review_on_a_new_pr() {
+    let sha = "a".repeat(40);
+    let tip = "c".repeat(40);
+    let head = "d".repeat(40);
+    let source = review_memo_source(&sha);
+    let (app, dir) = owner_docs_app(source.clone());
+    let id = publish_review_memo(&app, "specs/memo.html", &sha, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    add_draft(&app, &id, &sha, json!(3), "Buy the dip.", "Why now?").await;
+    {
+        let mut g = source.github.lock().unwrap();
+        g.set_pr(12, "merged", &sha);
+        g.reopen_info =
+            Some(json!({"state":"MERGED","baseRefName":"main","mergedAt":"2026-01-01"}));
+        g.branch_state = Some(json!({"tip":tip,"prs":[]}));
+    }
+    let (status, t) = get_json(app.clone(), &format!("/docs/{id}/reopen-target")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(t["kind"], "new_pr", "{t}");
+    assert_eq!(t["doc_deleted"], true);
+    let payload = json!({"submission_id":"deleted-sub-001","sha":sha,"verdict":"comment","body":"Make it mine"});
+    let (status, res) = submit_review(&app, &id, payload).await;
+    assert_eq!(status, StatusCode::OK, "{res}");
+    assert_eq!(res["file_comment_count"], 1);
+    {
+        let g = source.github.lock().unwrap();
+        assert_eq!(g.reviews.len(), 1);
+        assert_eq!(g.reviews[0].commit, head);
+        let body = &g.reviews[0].body;
+        assert!(body.contains(&format!(
+            "specs/memo.html is not on main. The reviewed revision is commit {sha}, published on PR #12."
+        )));
+        assert!(body.contains("Why now?"));
+    }
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    assert_eq!(
+        store.publishes(&id).unwrap().len(),
+        1,
+        "nothing to republish"
+    );
+    let wakes = queued_wakes(&dir, "[sm review]");
+    assert_eq!(wakes.len(), 1);
+    assert!(
+        wakes[0].1.contains("Opened PR #99 from main"),
+        "{}",
+        wakes[0].1
+    );
+    assert!(wakes[0].1.contains("specs/memo.html is not on main"));
+}
+
+#[tokio::test]
 async fn owner_doc_without_pr_review_goes_to_the_open_pr_changing_it() {
     let sha = "a".repeat(40);
     let head = "d".repeat(40);
