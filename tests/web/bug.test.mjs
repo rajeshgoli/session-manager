@@ -76,6 +76,13 @@ test('the excluded dialog is filtered out of the capture', async () => {
   assert.equal(filter({}), true, 'text nodes have no dataset');
 });
 
+test('a broken image does not fail the capture', async () => {
+  let options;
+  await captureScreen({ node: {}, ratio: 1, render: async (node, o) => { options = o; return png(3); } });
+  assert.equal(typeof options.onImageErrorHandler, 'function', 'without it html-to-image rejects on any image error');
+  assert.equal(options.onImageErrorHandler(), undefined);
+});
+
 test('the primary button reads File bug, File and start, or Start after a failed start', () => {
   assert.equal(bugPrimary({ startAgent: false }), 'File bug');
   assert.equal(bugPrimary({ startAgent: true }), 'File and start');
