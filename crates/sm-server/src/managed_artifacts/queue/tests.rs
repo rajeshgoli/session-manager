@@ -376,6 +376,113 @@ fn successful_recipe_preserves_commit_tag_and_failed_recipe_jobs_do_not_count() 
     assert!(tags.contains("refs/tags/artifact/out/"));
 }
 #[test]
+fn recipe_preservation_accepts_existing_matching_tags_and_rejects_conflicts() {
+    for matching in [true, false] {
+        let f = Fixture::new();
+        f.init_git();
+        let older = f.git(&["rev-parse", "HEAD"]);
+        f.git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "next build",
+        ]);
+        let sha = f.git(&["rev-parse", "HEAD"]);
+        let tag = format!("artifact/out/{}", &sha[..7]);
+        let remote_sha = if matching { &sha } else { &older };
+        f.git(&["push", "origin", &format!("{remote_sha}:refs/tags/{tag}")]);
+        let mut d = f.declarations("out");
+        d.record.as_mut().unwrap().recipe_complete = true;
+        let job = f.submit(d);
+        admit(&f.conn(), &job.id).unwrap();
+        f.finish(&job.id, "succeeded");
+        let a = f.detail("out");
+        assert_eq!(a["state"], "live");
+        assert_eq!(a["recipe_complete"], i64::from(matching));
+        assert_eq!(
+            f.git(&["ls-remote", "--tags", "origin", &format!("refs/tags/{tag}")]),
+            format!("{remote_sha}\trefs/tags/{tag}")
+        );
+        if matching {
+            assert_eq!(a["jobs"][0]["tag"], tag);
+            super::super::recipe::preserve(&f.conn(), &f.manager.config, &f.root, &["out".into()])
+                .unwrap();
+            assert_eq!(f.detail("out")["recipe_complete"], 1);
+        } else {
+            assert!(a["jobs"][0]["tag"].is_null());
+        }
+    }
+}
+
+#[test]
+fn recipe_preservation_rechecks_remote_after_a_failed_push() {
+    use std::os::unix::fs::PermissionsExt;
+    for outcome in ["matching", "conflicting", "missing"] {
+        let f = Fixture::new();
+        f.init_git();
+        let older = f.git(&["rev-parse", "HEAD"]);
+        f.git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "next build",
+        ]);
+        let sha = f.git(&["rev-parse", "HEAD"]);
+        let tag = format!("artifact/out/{}", &sha[..7]);
+        let remote_sha = if outcome == "matching" { &sha } else { &older };
+        f.git(&["push", "origin", "HEAD:refs/heads/main"]);
+        let mut d = f.declarations("out");
+        d.record.as_mut().unwrap().recipe_complete = true;
+        let job = f.submit(d);
+        admit(&f.conn(), &job.id).unwrap();
+        // Git invokes pre-push after reading the remote advertisement. Updating
+        // the bare remote here reproduces a concurrent push between the initial
+        // ls-remote and the server's ref creation.
+        let hook = Path::new(&f.root.repo_checkout).join(".git/hooks/pre-push");
+        let marker = f.dir.join("push-attempted");
+        fs::write(&hook, format!(
+            "#!/usr/bin/env python3\nimport pathlib, subprocess, sys\npathlib.Path({:?}).touch()\nif {outcome:?} == 'missing':\n    sys.exit(1)\nsubprocess.run(['git', '--git-dir', {:?}, 'update-ref', {:?}, {remote_sha:?}], check=True)\n",
+            marker.to_str().unwrap(),
+            f.dir.join("remote.git").to_str().unwrap(),
+            format!("refs/tags/{tag}"),
+        )).unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        f.finish(&job.id, "succeeded");
+        assert!(marker.exists(), "{outcome}");
+        let a = f.detail("out");
+        assert_eq!(a["state"], "live", "{outcome}");
+        assert_eq!(
+            a["recipe_complete"],
+            i64::from(outcome == "matching"),
+            "{outcome}"
+        );
+        let remote = f.git(&["ls-remote", "--tags", "origin", &format!("refs/tags/{tag}")]);
+        if outcome == "missing" {
+            assert!(remote.is_empty());
+        } else {
+            assert_eq!(remote, format!("{remote_sha}\trefs/tags/{tag}"));
+        }
+        if outcome == "matching" {
+            assert_eq!(a["jobs"][0]["tag"], tag);
+        } else {
+            assert!(a["jobs"][0]["tag"].is_null());
+        }
+    }
+}
+
+#[test]
 fn lost_artifact_side_of_submission_is_repaired_before_admission() {
     let f = Fixture::new();
     let job = f.submit(f.declarations("out"));
