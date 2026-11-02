@@ -39,8 +39,8 @@ merge or drop the weakest entries. Keep these six sections.
 - Metrics on `owner_events` need 14 days of it; the first usable baseline ends 2026-10-29. (readout 2026-W42)
 - Snapshot live databases with `sqlite3 -readonly <db> '.backup <scratch>'` before joining them; ATTACH on
   the live files fails in the agent sandbox. (2026-10-23)
-- `bug_reports.db` refuses `-readonly` opens in the sandbox; plain `cp` works (no WAL). Queue jobs live in
-  `queue-runner/queue_runner.db`; top-level `queue.db` is empty. (2026-11-02)
+- `bug_reports.db` refuses `-readonly` opens in the sandbox; use `sqlite3 <db> '.backup <scratch>'` without
+  `-readonly` (it runs in WAL mode, so never `cp`). Queue jobs: `queue-runner/queue_runner.db`. (2026-11-02)
 - Treat a change that loosens queue memory admission as ask-only in practice: it decides whether trading jobs
   get killed (#2507; 29 memory-pressure kills Oct 19–Nov 2, 28 in fractal-algo-rust). (readout 2026-W45)
 
