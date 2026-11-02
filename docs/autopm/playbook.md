@@ -13,6 +13,8 @@ merge or drop the weakest entries. Keep these six sections.
   week since Sep 24 (174 asks). Stalls are a tail, not the norm. (readout 2026-W42)
 - Reads a message from an agent he typed to in the last 2 h in 1–3 min (median, 56); other agent messages
   in 10–14 min. Does doc reviews mostly on web: 71 web, 16 Android, Oct 16–23. (readout 2026-W43)
+- Overrides the queue by hand in bursts: 178 Start presses Oct 19–Nov 1 on four days; 87 on jobs held for memory
+  another running job had declared, 62 on concurrency limits. No kill followed. (readout 2026-W45)
 
 ## What worked
 
@@ -37,7 +39,13 @@ merge or drop the weakest entries. Keep these six sections.
 - Metrics on `owner_events` need 14 days of it; the first usable baseline ends 2026-10-29. (readout 2026-W42)
 - Snapshot live databases with `sqlite3 -readonly <db> '.backup <scratch>'` before joining them; ATTACH on
   the live files fails in the agent sandbox. (2026-10-23)
+- `bug_reports.db` refuses `-readonly` opens in the sandbox; plain `cp` works (no WAL). Queue jobs live in
+  `queue-runner/queue_runner.db`; top-level `queue.db` is empty. (2026-11-02)
+- Treat a change that loosens queue memory admission as ask-only in practice: it decides whether trading jobs
+  get killed (#2507; 29 memory-pressure kills Oct 19–Nov 2, 28 in fractal-algo-rust). (readout 2026-W45)
 
 ## Open hypotheses
-1. Pushes reaching Rajesh at the desk (149 of 217, Oct 16–23; active on web, terminal or agent prompt in the
-   prior 5 min) are redundant. Test: does he act on the pushed item at the desk within 10 min? (readout 2026-W43)
+1. Queue memory: a repeat job's own earlier peak predicts its use (renders declare 16–28 GiB, use 1–7), so sm
+   could reserve less without admitting anything before a past kill. Test on 30 days of job samples. (readout 2026-W45)
+2. At-desk pushes are redundant: now `x-2026w44-desk-push-hold`, replay drops 62 of 79 held; asked 2026-11-02.
+   (readout 2026-W45)
