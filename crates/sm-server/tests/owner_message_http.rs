@@ -2048,6 +2048,22 @@ async fn overnight_tells_agents_holds_alerts_and_releases_them_quietly() {
     let (status, before) = create(&f, "eng00001", "# Keep it?\nx", json!({"blocking": true})).await;
     assert_eq!(status, StatusCode::CREATED);
     assert!(before["autoreply"].is_null(), "{before}");
+    // Both message creation and overnight activation store whole seconds.
+    // Make this question older explicitly, even when both HTTP calls finish
+    // in the same second; waiting on wall-clock time makes the test flaky.
+    let before_at = sm_server::owner_push::format_ts(
+        time::OffsetDateTime::now_utc() - time::Duration::minutes(1),
+    );
+    assert_eq!(
+        Connection::open(f.dir.join("message_queue.db"))
+            .unwrap()
+            .execute(
+                "UPDATE owner_messages SET created_at = ?1 WHERE id = ?2",
+                params![before_at, before["id"].as_str().unwrap()],
+            )
+            .unwrap(),
+        1
+    );
     follow_pass(&f).await;
     let pushed = || {
         sender
