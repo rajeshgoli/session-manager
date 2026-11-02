@@ -111,19 +111,27 @@ pub fn preserve(
             source,
             &["ls-remote", "--tags", &target, &format!("refs/tags/{tag}")],
         )?;
-        if remote.is_empty() {
+        let push_error = if remote.is_empty() {
             git_in(
                 source,
                 &["push", &target, &format!("{sha}:refs/tags/{tag}")],
-            )?;
+            )
+            .err()
         } else if remote.split_whitespace().next() != Some(sha.as_str()) {
             bail!("tag {tag} points at another commit");
-        }
+        } else {
+            None
+        };
+        // Another recorder may create the tag after our first lookup. Even a
+        // rejected push succeeds at preservation when the remote now matches.
         let verified = git_in(
             source,
             &["ls-remote", "--tags", &target, &format!("refs/tags/{tag}")],
         )?;
         if verified.split_whitespace().next() != Some(sha.as_str()) {
+            if let Some(error) = push_error {
+                return Err(error);
+            }
             bail!("tag {tag} was not preserved in the configured artifact repository");
         }
         conn.execute("UPDATE artifact_jobs SET tag=?3 WHERE root=?1 AND commit_sha=?2 AND name IN (SELECT name FROM artifacts WHERE root=?1 AND set_id=?4)",params![root.path,sha,tag,set])?;
