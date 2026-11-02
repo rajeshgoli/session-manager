@@ -1071,16 +1071,7 @@ fn finish(
                 line_comments,
                 file_comments,
             );
-            if let Some(t) = target.as_ref().filter(|t| super::reopen::body_only(t)) {
-                if t["kind"] == "attach" {
-                    text.push_str(&format!("\nThe doc had no PR, so this review went to PR #{0}, which changes it. Publish its next revision there with sm doc publish --pr {0}.",t["target_pr"]));
-                } else {
-                    text.push_str(&format!("\nOpened PR #{} from {} for this review.",t["target_pr"],t["base"].as_str().unwrap_or("")));
-                }
-                if t["doc_deleted"] == true {
-                    text.push_str(&format!("\n{} is not on {}, so the PR carries no file; the review quotes revision {}. Apply the comments where the doc's content now lives.",doc.path,t["base"].as_str().unwrap_or(""),&review.commit_sha[..7]));
-                } else if t["doc_changed"] == true {text.push_str("\nThe document changed since the reviewed revision; comments quote the original text.");}
-            }
+            text.push_str(&target_note(doc, review, target.as_ref()));
             if let Some(line) = &hold_line {
                 text.push_str(&format!("\n{line}"));
             }
@@ -1125,28 +1116,91 @@ pub(super) struct AssignReviewRequest {
 }
 
 /// The task a new agent gets for a review nobody was left to take.
+/// A spawn whose brief was sent but not confirmed still left a live agent
+/// holding it: that agent, with the warning, else the spawn's own result.
+fn spawned_or_retained(
+    created: Result<SessionRecord, ApiError>,
+    lookup: impl Fn(&str) -> Result<Option<SessionRecord>, ApiError>,
+) -> Result<(SessionRecord, Option<String>), ApiError> {
+    match created {
+        Ok(session) => Ok((session, None)),
+        Err(ApiError::StatusBody { status, body })
+            if body["code"] == "spawn_acceptance_unknown" =>
+        {
+            let retained = match body["session_id"].as_str() {
+                Some(id) => lookup(id)?,
+                None => None,
+            };
+            match retained {
+                Some(session) => Ok((session, body["detail"].as_str().map(str::to_owned))),
+                None => Err(ApiError::StatusBody { status, body }),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Where a review went when it is not on the doc's own open PR, for the
+/// author's wake and an assigned agent's brief alike.
+fn target_note(doc: &OwnerDoc, review: &OwnerDocReview, target: Option<&Value>) -> String {
+    let mut text = String::new();
+    let Some(t) = target.filter(|t| super::reopen::body_only(t)) else {
+        return text;
+    };
+    if t["kind"] == "attach" {
+        text.push_str(&format!("\nThe doc had no PR, so this review went to PR #{0}, which changes it. Publish its next revision there with sm doc publish --pr {0}.",t["target_pr"]));
+    } else {
+        text.push_str(&format!(
+            "\nOpened PR #{} from {} for this review.",
+            t["target_pr"],
+            t["base"].as_str().unwrap_or("")
+        ));
+    }
+    if t["doc_deleted"] == true {
+        text.push_str(&format!("\n{} is not on {}, so the PR carries no file; the review quotes revision {}. Apply the comments where the doc's content now lives.",doc.path,t["base"].as_str().unwrap_or(""),&review.commit_sha[..7]));
+    } else if t["doc_changed"] == true {
+        text.push_str(
+            "\nThe document changed since the reviewed revision; comments quote the original text.",
+        );
+    }
+    text
+}
+
 pub(super) fn assign_task_text(
     owner_name: &str,
     doc: &OwnerDoc,
     review: &OwnerDocReview,
+    target: Option<&Value>,
 ) -> String {
+    // The review may have gone to a new PR (sm#2645): name that one.
+    let mut doc = doc.clone();
+    if let Some(pr) = target.and_then(|t| t["target_pr"].as_i64()) {
+        doc.pr_number = Some(pr);
+    }
     let pr = doc.pr_number.unwrap_or_default();
+    let next = if target.is_some_and(|t| t["doc_deleted"] == true) {
+        "Apply the review where the doc's content now lives, open a PR for it, and run `sm pr` from its branch.".to_owned()
+    } else {
+        format!(
+            "Check out the PR branch in your own worktree, run `sm pr` from it to claim the PR, \
+             address the review, push, and republish with `sm doc publish {path} --pr {pr} --review`.",
+            path = doc.path
+        )
+    };
     format!(
         "[sm review] Your task is {owner_name}'s latest review of \"{title}\" on PR #{pr} in {repo}. \
-         The agent that wrote the doc has ended, so the review is yours.\n{wake}\n\
-         Check out the PR branch in your own worktree, run `sm pr` from it to claim the PR, \
-         address the review, push, and republish with `sm doc publish {path} --pr {pr} --review`.",
+         The agent that wrote the doc has ended, so the review is yours.\n{wake}{note}\n{next}",
         title = doc.title,
         repo = doc.repo,
-        path = doc.path,
         wake = render_owner_review_wake(
             owner_name,
-            doc,
+            &doc,
             review,
             review.github_review_url.as_deref().unwrap_or_default(),
             review.line_comment_count,
             review.file_comment_count,
         ),
+        note = target_note(&doc, review, target),
     )
 }
 
@@ -1212,7 +1266,12 @@ pub(super) async fn assign_review(
         provider: author.as_ref().map(|author| author.provider.clone()),
         parent_session_id: None,
         node: None,
-        initial_message: Some(assign_task_text(&state.config.owner_name, doc, &review)),
+        initial_message: Some(assign_task_text(
+            &state.config.owner_name,
+            doc,
+            &review,
+            store.review_target(&review.id)?.as_ref(),
+        )),
         model: author.as_ref().and_then(|author| author.model.clone()),
         reasoning_effort: author
             .as_ref()
@@ -1226,12 +1285,18 @@ pub(super) async fn assign_review(
         spawn_brief: None,
         started_by_sm: true,
     };
-    let session = super::super::create_session_from_request(state.clone(), payload).await?;
+    // An unconfirmed brief still left a live agent holding it (sm#2645):
+    // record it like a confirmed spawn so Assign cannot start a second one.
+    let (session, warning) = spawned_or_retained(
+        super::super::create_session_from_request(state.clone(), payload).await,
+        |id| Ok(state.session_store.get_session(id)?),
+    )?;
     store.assign_review(&review.id, &session.id)?;
     Ok(json!({
         "session_id": session.id,
         "name": session_display_name(session.clone()),
         "agent": super::doc_agent(state, doc),
+        "warning": warning,
     }))
 }
 
@@ -1286,6 +1351,57 @@ mod tests {
             queued_at: None,
             schedule: Default::default(),
         }
+    }
+
+    #[test]
+    fn assign_brief_names_the_review_pr_and_a_deleted_doc() {
+        let mut posted = review("comment");
+        posted.github_review_url = Some("https://github.com/acme/widgets/pull/17#r".into());
+        let deleted = json!({"kind":"new_pr","base":"main","target_pr":17,"doc_deleted":true});
+        let text = assign_task_text("Rajesh", &doc("Memo"), &posted, Some(&deleted));
+        assert!(text.contains("on PR #17 in acme/widgets"), "{text}");
+        assert!(text.contains("(PR #17 @ abcdef0)"), "{text}");
+        assert!(text.contains("specs/memo.html is not on main"), "{text}");
+        assert!(
+            text.ends_with("open a PR for it, and run `sm pr` from its branch."),
+            "{text}"
+        );
+        assert!(!text.contains("#12"), "{text}");
+        let own = assign_task_text("Rajesh", &doc("Memo"), &posted, None);
+        assert!(own.contains("on PR #12"), "{own}");
+        assert!(
+            own.ends_with("`sm doc publish specs/memo.html --pr 12 --review`."),
+            "{own}"
+        );
+    }
+
+    #[test]
+    fn assign_keeps_the_agent_an_unconfirmed_spawn_left_running() {
+        let session: SessionRecord = serde_json::from_value(json!({
+            "id": "5f16635d", "name": "n", "working_dir": "/repo", "tmux_session": "t",
+            "log_file": "/tmp/l", "status": "running", "provider": "claude",
+            "created_at": "2026-11-02T00:00:00Z", "last_activity": "2026-11-02T00:00:00Z"
+        }))
+        .unwrap();
+        let unknown = || {
+            Err(ApiError::StatusBody {
+                status: StatusCode::CONFLICT,
+                body: json!({"code":"spawn_acceptance_unknown","session_id":"5f16635d","detail":"not confirmed"}),
+            })
+        };
+        let found = |_: &str| Ok(Some(session.clone()));
+        let (kept, warning) = spawned_or_retained(unknown(), found).unwrap();
+        assert_eq!(kept.id, "5f16635d");
+        assert_eq!(warning.as_deref(), Some("not confirmed"));
+        assert!(
+            spawned_or_retained(unknown(), |_| Ok(None)).is_err(),
+            "no live agent: refuse"
+        );
+        let refused = Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "no".into(),
+        });
+        assert!(spawned_or_retained(refused, found).is_err());
     }
 
     #[test]
