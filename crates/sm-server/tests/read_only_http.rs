@@ -17559,7 +17559,7 @@ async fn runtime_core_claude_spawn_brief_answers_folder_trust_before_submitting(
     if !tmux_available() {
         return;
     }
-    for yes_selected in [false, true] {
+    for (yes_selected, reset_once) in [(false, false), (true, false), (false, true)] {
         let state_file = unique_temp_path();
         let log_dir = unique_temp_path();
         let working_dir = unique_temp_path();
@@ -17572,7 +17572,13 @@ async fn runtime_core_claude_spawn_brief_answers_folder_trust_before_submitting(
                 .replace("  Yes, I trust this folder", "❯ Yes, I trust this folder");
         }
         fs::write(log_dir.join("directory-trust.txt"), trust).unwrap();
-        let tmux_socket = format!("sm-claude-trust-{}-{yes_selected}", std::process::id());
+        if reset_once {
+            fs::write(log_dir.join("directory-trust-reset-once"), "").unwrap();
+        }
+        let tmux_socket = format!(
+            "sm-claude-trust-{}-{yes_selected}-{reset_once}",
+            std::process::id()
+        );
         let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
         let app = runtime_app_with_structured_claude_provider(
             &state_file,
@@ -21988,19 +21994,25 @@ trust_path = {trust_path:?}
 if os.path.exists(trust_path):
     with open(trust_path) as prompt_file:
         trust = prompt_file.read()
+    reset_once = os.path.exists(os.path.join(os.path.dirname(trust_path), 'directory-trust-reset-once'))
     def paint_trust():
         os.write(fd, ('\x1b[2J\x1b[H' + trust.replace('\n', '\r\n')).encode())
-    paint_trust()
-    if '❯ No, exit' in trust:
-        navigation = b''
-        while not navigation.endswith(b'\x1b[B'):
-            navigation += os.read(fd, 1)
-            if b'\r' in navigation or b'\n' in navigation:
-                raise RuntimeError('confirmed No or pasted brief before selecting Yes')
-        trust = trust.replace('❯ No, exit', '  No, exit').replace('  Yes, I trust this folder', '❯ Yes, I trust this folder')
+    while True:
         paint_trust()
-    if os.read(fd, 1) != b'\r':
-        raise RuntimeError('expected trust confirmation before brief')
+        if '❯ No, exit' in trust:
+            navigation = b''
+            while not navigation.endswith(b'\x1b[B'):
+                navigation += os.read(fd, 1)
+                if b'\r' in navigation or b'\n' in navigation:
+                    raise RuntimeError('confirmed No or pasted brief before selecting Yes')
+            trust = trust.replace('❯ No, exit', '  No, exit').replace('  Yes, I trust this folder', '❯ Yes, I trust this folder')
+            paint_trust()
+        if os.read(fd, 1) != b'\r':
+            raise RuntimeError('expected literal trust confirmation before brief')
+        if not reset_once:
+            break
+        reset_once = False
+        trust = trust.replace('❯ Yes, I trust this folder', '  Yes, I trust this folder').replace('  No, exit', '❯ No, exit')
     print('folder-trust-confirmed', flush=True)
     os.write(fd, b'\x1b[2J\x1b[H')
 # Model the initial composer: only a complete bracketed paste followed by a
