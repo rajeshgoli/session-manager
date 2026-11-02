@@ -696,6 +696,20 @@ fn run_submission(
         .collect();
     let verdict = OwnerDocVerdict::parse(&review.verdict).unwrap_or(OwnerDocVerdict::Comment);
     let mut body = review_body(verdict, review.body.as_deref(), &review.id);
+    // The review PR carries no file when the doc was deleted, so the body
+    // says where the reviewed revision lives.
+    if let Some(t) = target.as_ref().filter(|t| t["doc_deleted"] == true) {
+        body.push_str(&format!(
+            "\n\n{} is not on {}. The reviewed revision is commit {}{}.",
+            doc.path,
+            t["base"].as_str().unwrap_or(""),
+            review.commit_sha,
+            t["from_pr"]
+                .as_i64()
+                .map(|pr| format!(", published on PR #{pr}"))
+                .unwrap_or_default()
+        ));
+    }
     if body_only && !drafts.is_empty() {
         body.push_str(&format!(
             "\n\nComments on {}, written against {}:\n",
@@ -1035,7 +1049,9 @@ fn finish(
                 } else {
                     text.push_str(&format!("\nOpened PR #{} from {} for this review.",t["target_pr"],t["base"].as_str().unwrap_or("")));
                 }
-                if t["doc_changed"] == true {text.push_str("\nThe document changed since the reviewed revision; comments quote the original text.");}
+                if t["doc_deleted"] == true {
+                    text.push_str(&format!("\n{} is not on {}, so the PR carries no file; the review quotes revision {}. Apply the comments where the doc's content now lives.",doc.path,t["base"].as_str().unwrap_or(""),&review.commit_sha[..7]));
+                } else if t["doc_changed"] == true {text.push_str("\nThe document changed since the reviewed revision; comments quote the original text.");}
             }
             if let Some(line) = &hold_line {
                 text.push_str(&format!("\n{line}"));
