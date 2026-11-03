@@ -261,8 +261,10 @@ test('drafts on an older revision move to this one only while their passage is u
     markers() {}, renderBar() {}, renderBanner() {}
   };
   vm.runInNewContext(`${sha7}${collapse}${helpers}${carry}\nthis.carryDrafts = carryDrafts; this.done = () => carrying;`, context);
-  context.carryDrafts();
-  await new Promise(resolve => setTimeout(resolve, 0));
+  // A second call while moving waits for the same moves.
+  const first = context.carryDrafts();
+  assert.equal(context.carryDrafts(), first);
+  await first;
   assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
     ['PATCH', '/drafts/line', {sha: 'c3', line: 20}],
     ['PATCH', '/drafts/file', {sha: 'c3', line: null}]

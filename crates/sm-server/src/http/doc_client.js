@@ -899,14 +899,15 @@
     return api('GET', '/drafts').then(function (res) {
       S.drafts = (res && res.drafts) || [];
       markers(); renderBar(); renderBanner();
-      carryDrafts();
+      // Settled before the caller compares drafts: a submit must see moves.
+      return carryDrafts();
     });
   }
   // ---- carrying drafts to a newer revision (sm#2652) ---------------------
   // A draft on an older revision whose quoted passage is still in this one,
   // word for word, moves here; the rest stay, and the banner offers them.
   var carryTried = {};
-  var carrying = false;
+  var carrying = null;
   // The draft's line in this revision: null for a comment on the file,
   // undefined when its passage changed.
   function carriedLine(d) {
@@ -918,18 +919,18 @@
   }
   function carryDrafts() {
     var here = revisionIndex(CONFIG.sha);
-    if (MSG || carrying || here < 0) return;
+    if (carrying) return carrying;
+    if (MSG || here < 0) return Promise.resolve();
     var moves = [];
     S.drafts.forEach(function (d) {
       if (carryTried[d.id] || revisionIndex(d.commit_sha) <= here) return;
       var line = carriedLine(d);
       if (line !== undefined) moves.push({ draft: d, line: line });
     });
-    if (!moves.length) return;
-    carrying = true;
+    if (!moves.length) return Promise.resolve();
     var from = {};
     var count = 0;
-    Promise.all(moves.map(function (m) {
+    carrying = Promise.all(moves.map(function (m) {
       carryTried[m.draft.id] = 1;
       return api('PATCH', '/drafts/' + m.draft.id, { sha: CONFIG.sha, line: m.line }).then(function (d) {
         from[revisionName(m.draft.commit_sha)] = 1;
@@ -937,10 +938,11 @@
         S.drafts = S.drafts.map(function (x) { return x.id === d.id ? d : x; });
       }, function () { /* frozen by an unfinished submission, or full: it stays */ });
     })).then(function () {
-      carrying = false;
+      carrying = null;
       if (count) S.carried = { count: (S.carried ? S.carried.count : 0) + count, from: Object.keys(from).join(', ') };
       markers(); renderBar(); renderBanner();
     });
+    return carrying;
   }
   function openReview() {
     hideChip();
