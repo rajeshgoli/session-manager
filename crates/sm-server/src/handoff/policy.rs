@@ -730,20 +730,83 @@ impl AskReason<'_> {
     }
 }
 
+/// What sm sees the agent still running when it asks for a handoff, so the
+/// ask warns only about work that exists (sm#2650). `None` means sm cannot
+/// see that kind of work for this agent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunningWork {
+    /// Provider-native subagents, as `type (description)`.
+    pub subagents: Option<Vec<String>>,
+    /// Commands left running in the agent's pane that the handoff would kill.
+    pub commands: Option<Vec<String>>,
+}
+
+impl RunningWork {
+    /// sm sees neither kind: the ask keeps the generic warning.
+    pub fn unknown() -> Self {
+        Self::default()
+    }
+
+    /// Named items when sm sees every kind of work, else `None`.
+    fn named(&self) -> Option<Vec<String>> {
+        let (Some(subagents), Some(commands)) = (&self.subagents, &self.commands) else {
+            return None;
+        };
+        Some(
+            subagents
+                .iter()
+                .map(|agent| format!("subagent {agent}"))
+                .chain(commands.iter().map(|command| format!("`{command}`")))
+                .collect(),
+        )
+    }
+
+    fn ask_clause(&self) -> String {
+        match self.named() {
+            None => " Stop at a logical point, but first wait for every background agent, subagent, or background shell command you started to complete: the handoff ends your session and kills them (`sm queue` jobs survive).".to_owned(),
+            Some(items) if items.is_empty() => " Stop at a logical point.".to_owned(),
+            Some(items) => format!(
+                " Stop at a logical point, but first wait for what you still run to finish ({}): the handoff ends your session and kills it (`sm queue` jobs survive).",
+                items.join(", ")
+            ),
+        }
+    }
+
+    fn reminder_clause(&self) -> String {
+        match self.named() {
+            None => " let every background agent, subagent, or background shell command you started complete,".to_owned(),
+            Some(items) if items.is_empty() => String::new(),
+            Some(items) => format!(" let what you still run finish ({}),", items.join(", ")),
+        }
+    }
+}
+
 /// D.1. `claims` is already rendered by [`claims_text`].
 pub fn ask_text(reason: &AskReason<'_>, claims: &str) -> String {
+    ask_text_with(reason, claims, &RunningWork::unknown())
+}
+
+/// D.1, warning only about the running work sm sees.
+pub fn ask_text_with(reason: &AskReason<'_>, claims: &str, work: &RunningWork) -> String {
     format!(
-        "[sm context management] {} Stop at a logical point, but first wait for every background agent, subagent, or background shell command you started to complete: the handoff ends your session and kills them (`sm queue` jobs survive). sm will move your claims ({claims}) and pending wakes to a fresh agent. Post what the next agent needs in your PR, ticket, or a file, then run `sm handoff --link <url>` or `sm handoff --path <file>` and end your turn.",
-        reason.text()
+        "[sm context management] {}{} sm will move your claims ({claims}) and pending wakes to a fresh agent. Post what the next agent needs in your PR, ticket, or a file, then run `sm handoff --link <url>` or `sm handoff --path <file>` and end your turn.",
+        reason.text(),
+        work.ask_clause()
     )
 }
 
 /// D.2.
 pub fn reminder_text(percent: f64, asked_percent: f64) -> String {
+    reminder_text_with(percent, asked_percent, &RunningWork::unknown())
+}
+
+/// D.2, warning only about the running work sm sees.
+pub fn reminder_text_with(percent: f64, asked_percent: f64, work: &RunningWork) -> String {
     format!(
-        "[sm context management] Reminder: your context is at {}% and sm asked you to hand off at {}%. Finish the current step, let every background agent, subagent, or background shell command you started complete, then post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`.",
+        "[sm context management] Reminder: your context is at {}% and sm asked you to hand off at {}%. Finish the current step,{} then post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`.",
         round_percent(percent),
-        round_percent(asked_percent)
+        round_percent(asked_percent),
+        work.reminder_clause()
     )
 }
 
@@ -1156,6 +1219,51 @@ mod tests {
         assert_eq!(
             reminder_text(50.2, 36.4),
             "[sm context management] Reminder: your context is at 50% and sm asked you to hand off at 36%. Finish the current step, let every background agent, subagent, or background shell command you started complete, then post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`."
+        );
+    }
+
+    #[test]
+    fn asks_warn_only_about_running_work_sm_sees() {
+        let reason = AskReason::Context { percent: 41.0 };
+        let tail = " sm will move your claims (none) and pending wakes to a fresh agent. Post what the next agent needs in your PR, ticket, or a file, then run `sm handoff --link <url>` or `sm handoff --path <file>` and end your turn.";
+        let idle = RunningWork {
+            subagents: Some(vec![]),
+            commands: Some(vec![]),
+        };
+        assert_eq!(
+            ask_text_with(&reason, "none", &idle),
+            format!(
+                "[sm context management] Your context is at 41%. Stop at a logical point.{tail}"
+            )
+        );
+        assert_eq!(
+            reminder_text_with(50.0, 36.0, &idle),
+            "[sm context management] Reminder: your context is at 50% and sm asked you to hand off at 36%. Finish the current step, then post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`."
+        );
+        let busy = RunningWork {
+            subagents: Some(vec!["Explore (Find callers)".to_owned()]),
+            commands: Some(vec!["cargo test".to_owned()]),
+        };
+        assert_eq!(
+            ask_text_with(&reason, "none", &busy),
+            format!("[sm context management] Your context is at 41%. Stop at a logical point, but first wait for what you still run to finish (subagent Explore (Find callers), `cargo test`): the handoff ends your session and kills it (`sm queue` jobs survive).{tail}")
+        );
+        assert_eq!(
+            reminder_text_with(50.0, 36.0, &busy),
+            "[sm context management] Reminder: your context is at 50% and sm asked you to hand off at 36%. Finish the current step, let what you still run finish (subagent Explore (Find callers), `cargo test`), then post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`."
+        );
+        // A kind sm cannot see (Codex subagents) keeps the generic warning.
+        let blind = RunningWork {
+            subagents: None,
+            commands: Some(vec![]),
+        };
+        assert_eq!(
+            ask_text_with(&reason, "none", &blind),
+            ask_text(&reason, "none")
+        );
+        assert_eq!(
+            reminder_text_with(50.0, 36.0, &blind),
+            reminder_text(50.0, 36.0)
         );
     }
 

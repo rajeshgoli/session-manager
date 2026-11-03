@@ -4,9 +4,9 @@
 
 use super::*;
 use crate::handoff::policy::{
-    self, ask_text, claims_text, effective_policy_inherited, reminder_text, AskReason,
+    self, ask_text_with, claims_text, effective_policy_inherited, reminder_text_with, AskReason,
     EffectivePolicy, HandoffDefaults, HandoffOverride, HandoffPhase, HandoffRecord, HandoffTrigger,
-    Inherited, PolicyUpdate, SessionRef,
+    Inherited, PolicyUpdate, RunningWork, SessionRef,
 };
 
 use crate::work_claims::HandoffScope;
@@ -67,6 +67,50 @@ fn raw_handoff_context(
             .and_then(Value::as_f64),
         stopped: raw_session_is_stopped(session),
     })
+}
+
+/// The work a handoff would kill, as sm sees it (sm#2650). Claude subagents
+/// come from the start hook and the `Stop` hook's `background_tasks`; sm
+/// tracks no other provider's subagents. Commands come from the agent memory
+/// guard's process snapshot, less shell jobs the queue adopted, which survive.
+fn running_work(state: &Value, session_id: &str) -> RunningWork {
+    let Some(session) = raw_session_object(state, session_id) else {
+        return RunningWork::unknown();
+    };
+    let subagents = (raw_session_provider(session) == "claude").then(|| {
+        session
+            .get("subagents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|agent| {
+                agent.get("status").and_then(Value::as_str) == Some("running")
+                    && !agent.get("stopped_at").is_some_and(Value::is_string)
+            })
+            .map(|agent| {
+                let kind = agent
+                    .get("agent_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                match agent.get("description").and_then(Value::as_str) {
+                    Some(description) if !description.trim().is_empty() => {
+                        format!("{kind} ({description})")
+                    }
+                    _ => kind.to_owned(),
+                }
+            })
+            .collect()
+    });
+    let commands = crate::agent_memory_guard::background_jobs(session_id).map(|jobs| {
+        jobs.into_iter()
+            .filter(|job| job.shell_job_id.is_none())
+            .map(|job| job.command)
+            .collect()
+    });
+    RunningWork {
+        subagents,
+        commands,
+    }
 }
 
 fn raw_session_provider(session: &Map<String, Value>) -> String {
@@ -519,7 +563,11 @@ impl SessionStore {
         };
         let record = HandoffRecord::asked(reason.trigger(), &now_rfc3339(), percent);
         set_handoff_record(&mut state, session_id, Some(&record))?;
-        let text = ask_text(&reason, &self.handoff_claims_text(session_id));
+        let text = ask_text_with(
+            &reason,
+            &self.handoff_claims_text(session_id),
+            &running_work(&state, session_id),
+        );
         let text = self.prepare_handoff_ask(&mut state, session_id, &text, false);
         self.write_raw_json_value(&state)?;
         Ok(Some(text))
@@ -592,7 +640,11 @@ impl SessionStore {
                     .asked_percent
                     .unwrap_or(context.policy.threshold_percent);
                 set_handoff_record(state, session_id, Some(&record))?;
-                let reminder = reminder_text(used_percentage, asked_percent);
+                let reminder = reminder_text_with(
+                    used_percentage,
+                    asked_percent,
+                    &running_work(state, session_id),
+                );
                 let reminder = match self.handoff_draft_raw(state, session_id) {
                     Ok(draft) if self.handoff_draft_file(state, session_id, &draft, "write", None).is_ok() => reminder.replace("post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`", &format!("fill in {}, and run `sm handoff`", draft["path"].as_str().unwrap())),
                     _ => reminder.replace("post your handoff note, and run `sm handoff --link <url>` or `sm handoff --path <file>`", "run `sm handoff` to draft your note"),
@@ -695,7 +747,11 @@ impl SessionStore {
     ) -> Result<()> {
         let record = HandoffRecord::asked(reason.trigger(), &now_rfc3339(), reason.percent());
         set_handoff_record(state, session_id, Some(&record))?;
-        let text = ask_text(reason, &self.handoff_claims_text(session_id));
+        let text = ask_text_with(
+            reason,
+            &self.handoff_claims_text(session_id),
+            &running_work(state, session_id),
+        );
         let text = self.prepare_handoff_ask(state, session_id, &text, true);
         self.queue_handoff_message(state, session_id, &text, runtime)
     }
