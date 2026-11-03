@@ -47,12 +47,10 @@ pub enum HandoffWork {
     },
 }
 
-/// The JSON-store facts the successor's brief and the parent notice need.
+/// The JSON-store facts the successor's brief needs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HandoffFacts {
     pub predecessor_name: String,
-    pub successor_name: String,
-    pub parent_session_id: Option<String>,
     pub percent: Option<f64>,
     pub note: String,
     pub working_dir: String,
@@ -653,14 +651,14 @@ impl SessionStore {
         self.write_raw_json_value(&state)
     }
 
-    /// What the brief and the parent notice say (F.4, D.7), read after the
-    /// transfer so they describe what the successor now holds.
+    /// What the brief says (F.4), read after the transfer so it describes
+    /// what the successor now holds.
     pub fn handoff_facts(&self, predecessor_id: &str, successor_id: &str) -> Result<HandoffFacts> {
         let parsed_state = self.load_parsed_state()?;
         let state = &parsed_state.raw;
         let predecessor = raw_session_object(state, predecessor_id)
             .with_context(|| format!("predecessor {predecessor_id} not found"))?;
-        let successor = raw_session_object(state, successor_id)
+        raw_session_object(state, successor_id)
             .with_context(|| format!("successor {successor_id} not found"))?;
         let record = raw_handoff_record(predecessor);
         let roles = state
@@ -688,8 +686,6 @@ impl SessionStore {
             .collect();
         Ok(HandoffFacts {
             predecessor_name: raw_session_display_name(predecessor, predecessor_id),
-            successor_name: raw_session_display_name(successor, successor_id),
-            parent_session_id: json_text(predecessor.get("parent_session_id")),
             percent: predecessor
                 .get("context_used_percentage")
                 .and_then(Value::as_f64),
@@ -701,10 +697,10 @@ impl SessionStore {
         })
     }
 
-    /// Queue the brief to the successor (G step 3) or the parent notice
-    /// (step 5) under the stable queue id `id`, so a resumed transfer never
-    /// sends it twice. It sorts ahead of every undelivered message for
-    /// `ahead_of`. Both come from the predecessor.
+    /// Queue the brief to the successor (G step 3) under the stable queue id
+    /// `id`, so a resumed transfer never sends it twice. It sorts ahead of
+    /// every undelivered message for `ahead_of`. It comes from the
+    /// predecessor.
     pub fn queue_handoff_notice(
         &self,
         predecessor_id: &str,
@@ -1925,8 +1921,6 @@ exit 0
             facts,
             HandoffFacts {
                 predecessor_name: "pred0001-agent".to_owned(),
-                successor_name: "succ0001-agent".to_owned(),
-                parent_session_id: Some("lead0001".to_owned()),
                 percent: Some(36.4),
                 note: note().value,
                 working_dir: "/repo".to_owned(),
@@ -1982,7 +1976,7 @@ exit 0
     }
 
     #[test]
-    fn a_resumed_transfer_queues_each_notice_once_ahead_of_inherited_messages() {
+    fn a_resumed_transfer_queues_the_brief_once_ahead_of_inherited_messages() {
         let store = store("notice", "idle");
         let queue = store.queue_store.as_ref().unwrap();
         queue
@@ -2004,17 +1998,7 @@ exit 0
                     &["succ0001", "pred0001"],
                 )
                 .unwrap();
-            store
-                .queue_handoff_notice(
-                    "pred0001",
-                    "lead0001",
-                    "notice",
-                    &execute::parent_notice_message_id("pred0001"),
-                    &[],
-                )
-                .unwrap();
         }
-        assert_eq!(queued(&store, "lead0001"), ["notice"]);
         assert_eq!(
             store
                 .hand_off_pending_messages("pred0001", "succ0001")

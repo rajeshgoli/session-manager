@@ -1027,22 +1027,6 @@ async fn complete_handoff(
     state
         .session_store
         .hand_off_pending_messages(predecessor_id, successor_id)?;
-    // Step 5.
-    if let Some(parent_id) = brief.parent_session_id.as_deref() {
-        let notice = execute::parent_notice_text(
-            (&brief.facts.predecessor_name, predecessor_id),
-            (&brief.facts.successor_name, successor_id),
-            brief.facts.percent,
-            &brief.facts.note,
-        );
-        state.session_store.queue_handoff_notice(
-            predecessor_id,
-            parent_id,
-            &notice,
-            &execute::parent_notice_message_id(predecessor_id),
-            &[],
-        )?;
-    }
     // Steps 5 (leftover asks) and 6.
     state.session_store.finish_handoff(predecessor_id)
 }
@@ -1050,8 +1034,6 @@ async fn complete_handoff(
 struct PreparedBrief {
     ordinary: String,
     text: String,
-    parent_session_id: Option<String>,
-    facts: crate::sessions::HandoffFacts,
 }
 
 /// G steps 1 and 2: lineage, then every row of the transfer table. Returns
@@ -1132,8 +1114,6 @@ fn move_work(
                 "Read the handoff note first, then continue the work.",
                 "Run `sm handoff show`, then continue the work.",
             ),
-        parent_session_id: facts.parent_session_id.clone(),
-        facts,
     })
 }
 

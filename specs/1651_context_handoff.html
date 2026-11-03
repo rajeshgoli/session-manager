@@ -176,7 +176,7 @@
 <text class="s" x="456" y="164" text-anchor="middle">turn ends</text>
 <text class="s" x="588" y="150" text-anchor="middle">claims, wakes,</text>
 <text class="s" x="588" y="164" text-anchor="middle">children, roles</text>
-<text class="s" x="720" y="150" text-anchor="middle">parent told;</text>
+<text class="s" x="720" y="150" text-anchor="middle">parent not told;</text>
 <text class="s" x="720" y="164" text-anchor="middle">worktree kept</text>
 
 <text class="s" x="4" y="262">An agent can also run sm handoff without being asked (it enters at “Handing off”).</text>
@@ -193,7 +193,7 @@
 <tbody>
 <tr><td>14:02</td><td>The agent runs <code>sm request-codex-review 1660</code>. Context usage is 24%, above the 20% review floor. The command prints its usual confirmation plus the ask:<br><code>[sm context management] Your context is at 24% and you just requested a review of PR #1660, a good point to hand off. Stop at a logical point. sm will move your claims (ticket #1651, PR #1660) and pending wakes to a fresh agent. Your handoff note is drafted at &lt;draft path&gt; with what sm knows. Fill in the rest, re-read it against the checklist at its end, then run `sm handoff` and end your turn.</code></td></tr>
 <tr><td>14:04</td><td>The agent fills in the pre-filled draft, re-reads it, runs <code>sm handoff</code>, and ends its turn.</td></tr>
-<tr><td>14:04</td><td>sm starts <code>sm-1651-engineer-h2</code>: Claude, same model and effort, same worktree, same parent. sm moves ticket #1651, PR #1660, the pending Codex review wake and the queue job's completion wake onto it. sm retires the old agent and tells the parent <code>[sm handoff] sm-1651-engineer (0f52d06d) handed off to sm-1651-engineer-h2 (7c1e…) at 24% context. Note: &lt;link&gt;</code>. The successor starts with one prompt naming its worktree and everything it now holds, followed by the stored note and Rajesh’s verbatim messages.</td></tr>
+<tr><td>14:04</td><td>sm starts <code>sm-1651-engineer-h2</code>: Claude, same model and effort, same worktree, same parent. sm moves ticket #1651, PR #1660, the pending Codex review wake and the queue job's completion wake onto it. sm retires the old agent. The parent gets no message: it has nothing to do, and anything it sends the old agent reaches the new one. The successor starts with one prompt naming its worktree and everything it now holds, followed by the stored note and Rajesh’s verbatim messages.</td></tr>
 <tr><td>14:11</td><td>Codex's review lands. <code>[sm review] Codex review for PR #1660 is here.</code> wakes the successor, not the retired agent.</td></tr>
 </tbody>
 </table>
@@ -415,12 +415,12 @@ owner: <code>Rajesh asked you to hand off.</code></td></tr>
 <tr><td>D.4 accepted</td><td>agent (CLI stdout)</td><td><code>Handoff accepted.<br>End your turn now; sm will start your successor when it ends and retire this session.</code> For text notes, the preceding line confirms storage and reports source removal or the reason for keeping the file.</td></tr>
 <tr><td>D.5 successor brief</td><td>successor (launch prompt or fallback first message)</td><td>See F.4.</td></tr>
 <tr><td>D.6 failed</td><td>predecessor</td><td><code>[sm context management] sm could not start your successor: &lt;error&gt;. You still hold all your work. Continue, and run `sm handoff` again to retry.</code> With a stored note, append <code>Your note is saved; run `sm handoff` to retry with it.</code></td></tr>
-<tr><td>D.7 parent notice</td><td>parent, if any</td><td><code>[sm handoff] &lt;pred name&gt; (&lt;pred id&gt;) handed off to &lt;succ name&gt; (&lt;succ id&gt;) at &lt;pct&gt;% context. Note: &lt;note&gt;</code>. When there is no reading, <code>at &lt;pct&gt;% context</code> is omitted.</td></tr>
+<tr><td>D.7 parent</td><td>none</td><td>No message. The parent has no action to take: its children list names the successor, which keeps the same parent (F.2), and a send to the predecessor reaches the successor (H.2, D.8).</td></tr>
 <tr><td>D.8 forwarded</td><td>sender (CLI stdout)</td><td><code>&lt;pred name&gt; handed off; delivered to &lt;succ name&gt; (&lt;succ id&gt;).</code> This is printed by <code>sm send</code> when the target resolved through forwarding.</td></tr>
 </tbody>
 </table>
 
-<p>Roots (agents with no parent) produce no D.7. You see the handoff on the surfaces. No message reaches your phone for a handoff or a failure. Failure is visible as <code>handoff failed</code> on the agent's line.</p>
+<p>You see the handoff on the surfaces. No message reaches your phone for a handoff or a failure. Failure is visible as <code>handoff failed</code> on the agent's line.</p>
 
 <h3 id="e">E. The <code>sm handoff</code> command</h3>
 
@@ -464,7 +464,7 @@ sm handoff show [&lt;session&gt;] [--line]</code></pre>
 Earlier notes in this line: sm handoff show --line
 Start from the note's next steps.</code></pre>
 <p>The messages heading is omitted when there are none. The earlier-notes line appears only when the line has more than one note. Appendix E defines the stored note and message selection. The launch prompt carries these bytes directly; no handoff brief is typed or queued for this path.</p>
-<p><b>Queued fallback.</b> Plain Codex, remote nodes and providers without verified initial-brief delivery retain the existing create-and-start path. Plain Codex can take an ordinary initial prompt, but its runtime cannot acknowledge the atomic brief, so it uses this fallback. The successor is created with no initial prompt. sm sends the brief as its first message, with delivery mode <code>important</code>, only after Appendix G completes. That way the successor never acts before it holds the work. sm types the brief only into an empty, ready input box: it first waits for the successor's composer as a spawn brief does. Every delivery path applies the same check to handoff messages (the brief and the D.7 parent notice), so a brief that finds the composer not ready stays queued, and the background retry sweep delivers it once the composer is ready. A drain over all of the successor's messages stops at a held brief; a drain limited to one category (a reminder, a queue completion) can still deliver its message first in that window. Lines whose value is empty are omitted.</p>
+<p><b>Queued fallback.</b> Plain Codex, remote nodes and providers without verified initial-brief delivery retain the existing create-and-start path. Plain Codex can take an ordinary initial prompt, but its runtime cannot acknowledge the atomic brief, so it uses this fallback. The successor is created with no initial prompt. sm sends the brief as its first message, with delivery mode <code>important</code>, only after Appendix G completes. That way the successor never acts before it holds the work. sm types the brief only into an empty, ready input box: it first waits for the successor's composer as a spawn brief does. Every delivery path applies the same check to handoff messages (the brief), so a brief that finds the composer not ready stays queued, and the background retry sweep delivers it once the composer is ready. A drain over all of the successor's messages stops at a held brief; a drain limited to one category (a reminder, a queue completion) can still deliver its message first in that window. Lines whose value is empty are omitted.</p>
 
 <pre><code>[sm handoff] You are taking over from &lt;pred name&gt; (&lt;pred id&gt;), which stopped at &lt;pct&gt;% context.
 Handoff note: run `sm handoff show` (the note, then Rajesh's messages to this line, verbatim).
@@ -482,7 +482,7 @@ Run `sm handoff show`, then continue the work.</code></pre>
 
 <h3 id="g">G. Moving the work</h3>
 
-<p><b>Order.</b> (1) Write <code>successor_session_id</code> on the predecessor, <code>predecessor_session_id</code> on the successor, and state <code>transferring</code>. (2) Apply every row below. (3) Start the deferred runtime with its atomic prompt, or queue the fallback brief (F.4). (4) Retire the predecessor (H). (5) Queue D.7 and cancel leftover <code>context_handoff</code> messages from the predecessor. (6) Set state <code>done</code>.</p>
+<p><b>Order.</b> (1) Write <code>successor_session_id</code> on the predecessor, <code>predecessor_session_id</code> on the successor, and state <code>transferring</code>. (2) Apply every row below. (3) Start the deferred runtime with its atomic prompt, or queue the fallback brief (F.4). (4) Retire the predecessor (H). (5) Cancel leftover <code>context_handoff</code> messages from the predecessor. (6) Set state <code>done</code>.</p>
 
 <p><b>Recovery.</b> On startup, any session in state <code>transferring</code> resumes at step 2. A deferred successor whose runtime has never been attempted starts only after every transfer store succeeds. The top-level <code>handoff_deferred_sessions</code> map records which successors use this path. Once a runtime launch record exists, the existing launch recovery rules own it; the handoff never starts a second runtime or repeats an applied prompt. Failed launches retain the successor and its transferred obligations. When a Claude or codex-fork atomic handoff brief cannot safely be replayed, recovery tears down its exact tmux target before recording it as stopped. Only successful teardown or an authoritative absent-target reply confirms the stop. A transport error, missing socket or disabled runtime recovery leaves the record in <code>error</code> with <code>stopped_at</code> cleared and diagnostics explaining that the process may still be live. Recovery never replays that prompt. Implementation and regression coverage: <code>sessions.rs</code> (record creation, launch and failure recovery), <code>handoff/transfer.rs</code> (restart and retained-work tests), and <code>http/handoff.rs</code> (ordering, prompt and fallback tests). Every row is an update of the form <code>WHERE &lt;column&gt; = predecessor</code>, so repeating it is harmless. A session found in <code>spawning</code> at startup, with no successor id written, goes to <code>failed</code> with error <code>server restarted while starting the successor</code>, and D.6 is queued.</p>
 
