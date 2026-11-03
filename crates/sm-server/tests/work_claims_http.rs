@@ -1409,13 +1409,9 @@ async fn handoff_moves_claims_in_place_and_the_worktree_survives_retire() {
         brief.contains("[sm handoff] You are taking over from eng00001-agent (eng00001).\nHandoff note: run `sm handoff show` (the note, then Owner's messages to this line, verbatim).\nWorking directory: /repo (branch 1-item-1)\nYou now hold: ticket #1, PR #9\n"),
         "{brief}"
     );
-    let notice = queued_texts(&f, "lead0001").join("\n");
-    assert!(
-        notice.contains(&format!(
-            "[sm handoff] eng00001-agent (eng00001) handed off to eng00001-agent-h2 ({successor}). Note: sm handoff show eng00001"
-        )),
-        "{notice}"
-    );
+    // The parent has nothing to act on, so sm does not tell it (#2654).
+    let parent = queued_texts(&f, "lead0001").join("\n");
+    assert!(!parent.contains("[sm handoff]"), "{parent}");
 
     let (status, body) = request(
         &f.app,

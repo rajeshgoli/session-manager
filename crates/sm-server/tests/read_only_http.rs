@@ -16873,12 +16873,6 @@ async fn runtime_core_handoff_starts_a_successor_after_the_turn_ends() {
         "received:[sm handoff] You are taking over from hand-pred (handpred)",
     )
     .await;
-    wait_for_output_contains(
-        app.clone(),
-        "handparent",
-        &format!("handed off to hand-pred-h2 ({successor_id})"),
-    )
-    .await;
     let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     let predecessor = raw_state["sessions"]
         .as_array()
@@ -16936,6 +16930,15 @@ async fn runtime_core_handoff_starts_a_successor_after_the_turn_ends() {
         format!("hand-pred handed off; delivered to hand-pred-h2 ({successor_id}).")
     );
     wait_for_output_contains(app.clone(), &successor_id, "received:after handoff").await;
+    // The parent has nothing to act on, so sm does not tell it (#2654).
+    let (_, parent) = get_json(app.clone(), "/sessions/handparent/output?lines=200").await;
+    assert!(
+        !parent["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[sm handoff]"),
+        "{parent}"
+    );
 
     // Model a restart after the successor accepted the prompt but before the
     // server durably acknowledged it. Recovery must stop the actual surviving

@@ -16,14 +16,9 @@ pub const RETIRE_SOURCE: &str = "handed_off";
 pub const ACCEPTED_TEXT: &str = "Handoff accepted. End your turn now; sm will start your successor when it ends and retire this session.";
 /// F.5 / G recovery: a `spawning` state found at startup.
 pub const RESTARTED_ERROR: &str = "server restarted while starting the successor";
-/// Stable queue ids of the brief and the parent notice, so a resumed
-/// transfer queues each once.
+/// Stable queue id of the brief, so a resumed transfer queues it once.
 pub fn brief_message_id(predecessor_id: &str) -> String {
     format!("handoff-brief-{predecessor_id}")
-}
-
-pub fn parent_notice_message_id(predecessor_id: &str) -> String {
-    format!("handoff-notice-{predecessor_id}")
 }
 
 pub fn detached_worktree_message_id(predecessor_id: &str) -> String {
@@ -152,22 +147,6 @@ pub fn successor_name(predecessor_name: &str) -> String {
 pub fn failed_text(error: &str) -> String {
     format!(
         "[sm context management] sm could not start your successor: {error}. You still hold all your work. Continue, and run `sm handoff` again to retry."
-    )
-}
-
-/// D.7. `percent` is the predecessor's last context reading.
-pub fn parent_notice_text(
-    predecessor: (&str, &str),
-    successor: (&str, &str),
-    percent: Option<f64>,
-    note: &str,
-) -> String {
-    let at = percent
-        .map(|percent| format!(" at {}% context", round_percent(percent)))
-        .unwrap_or_default();
-    format!(
-        "[sm handoff] {} ({}) handed off to {} ({}){at}. Note: {note}",
-        predecessor.0, predecessor.1, successor.0, successor.1
     )
 }
 
@@ -452,14 +431,6 @@ mod tests {
         assert_eq!(
             failed_text("boom"),
             "[sm context management] sm could not start your successor: boom. You still hold all your work. Continue, and run `sm handoff` again to retry."
-        );
-        assert_eq!(
-            parent_notice_text(("a", "1"), ("a-h2", "2"), Some(24.4), "https://n"),
-            "[sm handoff] a (1) handed off to a-h2 (2) at 24% context. Note: https://n"
-        );
-        assert_eq!(
-            parent_notice_text(("a", "1"), ("a-h2", "2"), None, "/n.md"),
-            "[sm handoff] a (1) handed off to a-h2 (2). Note: /n.md"
         );
         assert_eq!(
             forwarded_text("a", "a-h2", "2"),
