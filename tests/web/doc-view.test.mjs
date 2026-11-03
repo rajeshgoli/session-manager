@@ -138,7 +138,7 @@ test('the author chip finds the live author by id or name, else points at Histor
 test('the document view drops Ask and full screen, and puts Review last in the bar', () => {
   assert.doesNotMatch(reader, /Ask|doc-ask|fullScreen|ask-target/);
   const bar = slice(reader, '<header class="bar doc-bar">', '</header>');
-  const order = ['Back', 'doc-title', 'Revision ', 'doc-hold', 'doc-replies', 'doc-note', 'doc-author', 'Open in Claude', '⎙ Print', 'title="More"', '${moon}', 'BugButton', 'No review needed', 'reviewLabel(review?.drafts)'];
+  const order = ['Back', 'doc-title', 'Revision ', 'doc-hold', 'doc-replies', 'doc-note', 'doc-author', 'Open in Claude', '⎙ Print', 'title="More"', '${moon}', 'BugButton', 'No review needed', 'commentsLabel(review.comments)', 'reviewLabel(review?.drafts)'];
   const at = order.map(item => bar.indexOf(item));
   assert.ok(at.every(i => i >= 0), JSON.stringify(Object.fromEntries(order.map((k, i) => [k, at[i]]))));
   assert.deepEqual([...at].sort((a, b) => a - b), at);
@@ -146,7 +146,7 @@ test('the document view drops Ask and full screen, and puts Review last in the b
 
 test('the review client counts unseen changed-passage replies for the app and leaves its banner line out when framed', () => {
   const source = readFileSync('crates/sm-server/src/http/doc_client.js', 'utf8');
-  const note = slice(source, '  function noteReplies(', '  function showChangedThreads(');
+  const note = slice(source, '  function noteReplies(', '  S.history = [];');
   const posts = [];
   const make = framed => {
     const context = {S: {repliesUnseen: 0}, framed, location: {origin}, window: {parent: {postMessage: (...args) => posts.push(args)}}};
@@ -163,7 +163,9 @@ test('the review client counts unseen changed-passage replies for the app and le
   assert.equal(posts.length, 2);
   // The banner line is kept on a direct /docs/… load only.
   assert.match(source, /noteReplies\(unseen\);[\s\S]{0,120}if \(unseen && !framed\) \{/);
-  assert.match(source, /S\.showChangedThreads = showChangedThreads;/);
+  assert.match(source, /S\.showChangedThreads = showHistory;/);
+  // The old name lives only on S; a bare reference would throw while drawing the banner.
+  assert.doesNotMatch(source.replace('S.showChangedThreads = showHistory;', ''), /[^.]showChangedThreads\b(?!\) here)/);
 });
 
 test('inside the app the review client draws no toolbar or pill and hands its state to the document bar (sm#2568)', () => {
@@ -186,12 +188,12 @@ test('inside the app the review client draws no toolbar or pill and hands its st
   const posts = [];
   const make = S => {
     const context = {S, MSG: false, CONFIG: {prNumber: 7, prUrl: 'https://github.com/o/r/pull/7', revisions: [{sha: 'b'}, {sha: 'a'}]},
-      currentDrafts: () => [{}, {}], location: {origin}, window: {parent: {postMessage: (...args) => posts.push(args)}}, Date};
+      currentDrafts: () => [{}, {}], historyCount: () => 3, location: {origin}, window: {parent: {postMessage: (...args) => posts.push(args)}}, Date};
     vm.runInNewContext(`${posting}${state}\nthis.barState = barState; this.postBar = postBar;`, context);
     return context;
   };
   const held = make({canComment: true, docState: 'review_requested', mergeHold: {placed_by: 'sm-1', reason: 'waiting'}, prState: 'open', sentUntil: 0, sub: null});
-  assert.deepEqual(JSON.parse(JSON.stringify(held.barState())), {drafts: 2, canReview: true, reviewRequested: true,
+  assert.deepEqual(JSON.parse(JSON.stringify(held.barState())), {drafts: 2, comments: 3, canReview: true, reviewRequested: true,
     mergeHold: {placed_by: 'sm-1', reason: 'waiting'}, prNumber: 7, prUrl: 'https://github.com/o/r/pull/7', prState: 'open',
     revisions: [{sha: 'b'}, {sha: 'a'}], note: null});
   held.postBar();
@@ -214,4 +216,64 @@ test('Review counts draft comments; Hold merge sits in the ⋯ menu while the PR
   assert.equal(context.reviewLabel(3), 'Review (3)');
   const menu = slice(reader, "${menu === 'more'", '${moon}');
   assert.match(menu, /info\?\.prState === 'open'[\s\S]*hold \? 'Release hold' : 'Hold merge'/);
+});
+
+test('the Comments sheet counts every posted comment and overall note (sm#2652)', () => {
+  const source = readFileSync('crates/sm-server/src/http/doc_client.js', 'utf8');
+  const count = slice(source, '  function historyCount() {', '  var VERDICTS');
+  const context = {S: {history: [{body: 'Tighten it.', comments: [{}, {}]}, {body: '', comments: [{}]}]}};
+  vm.runInNewContext(`${count}\nthis.historyCount = historyCount;`, context);
+  assert.equal(context.historyCount(), 4);
+  context.S.history = [];
+  assert.equal(context.historyCount(), 0);
+  const context2 = {};
+  vm.runInNewContext(`${slice(reader, 'export const commentsLabel', '/** The Review button').replace('export ', '')}\nthis.commentsLabel = commentsLabel;`, context2);
+  assert.equal(context2.commentsLabel(4), 'Comments (4)');
+});
+
+test('drafts on an older revision move to this one only while their passage is unchanged (sm#2652)', async () => {
+  const source = readFileSync('crates/sm-server/src/http/doc_client.js', 'utf8');
+  const helpers = slice(source, '  function revisionIndex(sha) {', '  function currentDrafts() {');
+  const carry = slice(source, '  var carryTried = {};', '  function openReview() {');
+  const collapse = source.match(/  function collapse\(text\) \{[^\n]*\n/)[0];
+  const sha7 = source.match(/  function sha7\(s\) \{[^\n]*\n/)[0];
+  const blocks = [
+    {text: 'Buy the dip.', line: 12},
+    {text: 'Size it at  one   percent.', line: 20}
+  ].map(b => ({textContent: b.text, getAttribute: () => String(b.line)}));
+  const calls = [];
+  const context = {
+    CONFIG: {sha: 'c3', revisions: [{sha: 'c3'}, {sha: 'c2'}, {sha: 'c1'}]},
+    MSG: false,
+    S: {drafts: [
+      {id: 'kept', commit_sha: 'c1', line: 4, quote: 'Sell the rip.', body: 'x'},
+      {id: 'line', commit_sha: 'c2', line: 9, quote: 'Size it at one percent.', body: 'x'},
+      {id: 'file', commit_sha: 'c1', line: null, quote: '', body: 'x'},
+      {id: 'here', commit_sha: 'c3', line: 12, quote: 'Buy the dip.', body: 'x'}
+    ]},
+    document: {body: {textContent: blocks.map(b => b.textContent).join(' ')}},
+    blockForQuote: quote => blocks.find(b => b.textContent.replace(/\s+/g, ' ').includes(quote)) || null,
+    api: (method, path, body) => {
+      calls.push([method, path, body]);
+      const id = path.split('/').pop();
+      return Promise.resolve({...context.S.drafts.find(d => d.id === id), commit_sha: body.sha, line: body.line});
+    },
+    markers() {}, renderBar() {}, renderBanner() {}
+  };
+  vm.runInNewContext(`${sha7}${collapse}${helpers}${carry}\nthis.carryDrafts = carryDrafts; this.done = () => carrying;`, context);
+  // A second call while moving waits for the same moves.
+  const first = context.carryDrafts();
+  assert.equal(context.carryDrafts(), first);
+  await first;
+  assert.deepEqual(JSON.parse(JSON.stringify(calls)), [
+    ['PATCH', '/drafts/line', {sha: 'c3', line: 20}],
+    ['PATCH', '/drafts/file', {sha: 'c3', line: null}]
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(context.S.drafts.map(d => [d.id, d.commit_sha]))), [['kept', 'c1'], ['line', 'c3'], ['file', 'c3'], ['here', 'c3']]);
+  assert.equal(context.S.carried.count, 2);
+  // Each draft is tried once; viewing an older revision moves nothing back.
+  context.carryDrafts();
+  context.CONFIG.sha = 'c1';
+  context.carryDrafts();
+  assert.equal(calls.length, 2);
 });

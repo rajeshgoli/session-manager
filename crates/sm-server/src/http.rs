@@ -402,8 +402,8 @@ mod web;
 mod worktrees;
 pub use auto_retire::sweep_auto_retire;
 pub use docs::{
-    DocFetchError, DocPullRequest, DocReviewOnGitHub, DocReviewReply, OwnerDocSource,
-    ReviewRetryPolicy, SubmittedDocReview,
+    DocFetchError, DocPullRequest, DocReviewComment, DocReviewOnGitHub, DocReviewReply,
+    OwnerDocSource, ReviewRetryPolicy, SubmittedDocReview,
 };
 
 pub trait GitHubReviewPoster: Send + Sync {

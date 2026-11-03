@@ -1485,6 +1485,30 @@ impl OwnerDocStore {
         get_draft_conn(&conn, doc_id, draft_id)
     }
 
+    /// Re-anchors a draft on revision `commit_sha` at `line` (sm#2652).
+    pub fn move_draft(
+        &self,
+        doc_id: &str,
+        draft_id: &str,
+        commit_sha: &str,
+        line: Option<i64>,
+    ) -> Result<Option<OwnerDocDraft>> {
+        let conn = self.open_write()?;
+        conn.execute(
+            "UPDATE owner_doc_drafts SET commit_sha = ?3, line = ?4, updated_at = ?5
+             WHERE doc_id = ?1 AND id = ?2",
+            params![doc_id, draft_id, commit_sha, line, now_rfc3339()],
+        )?;
+        get_draft_conn(&conn, doc_id, draft_id)
+    }
+
+    pub fn draft(&self, doc_id: &str, draft_id: &str) -> Result<Option<OwnerDocDraft>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        get_draft_conn(&conn, doc_id, draft_id)
+    }
+
     pub fn delete_draft(&self, doc_id: &str, draft_id: &str) -> Result<bool> {
         let conn = self.open_write()?;
         Ok(conn.execute(

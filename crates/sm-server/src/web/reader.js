@@ -30,6 +30,9 @@ export function revisionNumber(revisions, sha) {
   return index < 0 ? null : revisions.length - index;
 }
 
+/** Posted review comments, reachable any time (sm#2652). */
+export const commentsLabel = (count) => `Comments (${count})`;
+
 /** The Review button counts this revision's draft comments (sm#2568). */
 export const reviewLabel = (drafts) => (drafts ? `Review (${drafts})` : 'Review');
 
@@ -198,6 +201,8 @@ export function Reader({ id, watch, moon = null }) {
       ${moon}
       <${BugButton} page="Document" />
       ${review?.reviewRequested ? html`<button type="button" class="btn sm" onClick=${() => client('dismissReview')}>No review needed</button>` : null}
+      ${review?.comments ? html`<button type="button" class="btn sm" title="Your posted comments and the agent's replies"
+          onClick=${() => client('showHistory')}>${commentsLabel(review.comments)}</button>` : null}
       ${canReview ? html`<button type="button" class="btn pri" onClick=${() => client('openReview')}>${reviewLabel(review?.drafts)}</button>` : null}
     </header>
     ${error ? html`<p role="alert">${error}</p>` : null}

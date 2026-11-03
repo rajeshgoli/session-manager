@@ -116,18 +116,28 @@ fn forward_one(
     }
 }
 
-/// `GET /docs/{id}/review-replies`: the owner's latest posted review of the
-/// doc, as the threads that have replies. The reader shows each under the
-/// passage it quotes, open when that passage is unchanged (sm#2305).
+/// `GET /docs/{id}/review-replies`: `threads` is the owner's latest posted
+/// review of the doc as the threads that have replies, which the reader shows
+/// under the passage each quotes while it is unchanged (sm#2305). `history`
+/// is every posted review, oldest first, with all its comments and their
+/// replies: the reader's Comments sheet (sm#2652).
 pub(super) async fn reader_threads_response(
     state: &Arc<AppState>,
     doc: OwnerDoc,
 ) -> Result<Response, ApiError> {
+    // Keyed by the posted review count too, so a review just posted is in
+    // the next answer (sm#2652).
+    let posted = owner_doc_store(state)
+        .reviews(&doc.id)?
+        .iter()
+        .filter(|review| review.status == "posted")
+        .count();
+    let key = format!("{}:{posted}", doc.id);
     let cached = state
         .owner_doc_replies_cache
         .lock()
         .unwrap()
-        .get(&doc.id)
+        .get(&key)
         .filter(|(at, _)| at.elapsed() < Duration::from_secs(60))
         .map(|(_, value)| value.clone());
     if let Some(value) = cached {
@@ -146,56 +156,88 @@ pub(super) async fn reader_threads_response(
         .owner_doc_replies_cache
         .lock()
         .unwrap()
-        .insert(doc_id, (std::time::Instant::now(), value.clone()));
+        .insert(key, (std::time::Instant::now(), value.clone()));
     Ok(Json(value).into_response())
 }
 
 fn reader_threads(state: &AppState, doc: &OwnerDoc) -> anyhow::Result<Value> {
     let store = owner_doc_store(state);
-    let Some(review) = store
-        .reviews(&doc.id)?
+    let mut history = Vec::new();
+    // One read of each PR's comments serves every review posted on it.
+    let mut by_pr: BTreeMap<i64, Vec<DocReviewComment>> = BTreeMap::new();
+    for review in store.reviews(&doc.id)? {
+        let (true, Some(github_review_id)) = (review.status == "posted", review.github_review_id)
+        else {
+            continue;
+        };
+        let Some(pr) = store.review_pr(&review)? else {
+            continue;
+        };
+        if let std::collections::btree_map::Entry::Vacant(entry) = by_pr.entry(pr) {
+            entry.insert(
+                state
+                    .owner_doc_source
+                    .review_comments(&doc.repo, pr)
+                    .map_err(anyhow::Error::msg)?,
+            );
+        }
+        history.push(json!({
+            "commit_sha": review.commit_sha,
+            "verdict": review.verdict,
+            "body": review.body.as_deref().map(str::trim).unwrap_or_default(),
+            "posted_at": review.posted_at.as_deref().unwrap_or(&review.submitted_at),
+            "url": review.github_review_url,
+            "pr": pr,
+            "comments": review_threads(&by_pr[&pr], github_review_id),
+        }));
+    }
+    let Some(latest) = history.last() else {
+        return Ok(json!({ "threads": [], "history": [] }));
+    };
+    // The latest review's answered comments sit open in the doc (sm#2305).
+    let threads: Vec<Value> = latest["comments"]
+        .as_array()
         .into_iter()
-        .rfind(|review| review.status == "posted" && review.github_review_id.is_some())
-    else {
-        return Ok(json!({ "threads": [] }));
-    };
-    let (Some(pr), Some(github_review_id)) = (store.review_pr(&review)?, review.github_review_id)
-    else {
-        return Ok(json!({ "threads": [] }));
-    };
-    let since = review.posted_at.as_deref().unwrap_or(&review.submitted_at);
-    let replies = state
-        .owner_doc_source
-        .review_replies(&doc.repo, pr, github_review_id, since)
-        .map_err(anyhow::Error::msg)?;
+        .flatten()
+        .filter(|thread| thread["replies"].as_array().is_some_and(|r| !r.is_empty()))
+        .cloned()
+        .collect();
     Ok(json!({
-        "review": { "commit_sha": review.commit_sha, "url": review.github_review_url },
-        "threads": reader_threads_from(&replies),
+        "review": { "commit_sha": latest["commit_sha"], "url": latest["url"] },
+        "threads": threads,
+        "history": history,
     }))
 }
 
-/// Replies grouped under the comment they answer, in comment order.
-pub(super) fn reader_threads_from(replies: &[DocReviewReply]) -> Vec<Value> {
-    let mut threads: BTreeMap<i64, Value> = BTreeMap::new();
-    for reply in replies {
-        threads.entry(reply.parent_id).or_insert_with(|| {
+/// The comments review `review_id` posted, each with the replies in its
+/// thread, in comment order.
+pub(super) fn review_threads(comments: &[DocReviewComment], review_id: i64) -> Vec<Value> {
+    comments
+        .iter()
+        .filter(|comment| comment.review_id == Some(review_id) && comment.in_reply_to.is_none())
+        .map(|parent| {
+            let replies: Vec<Value> = comments
+                .iter()
+                .filter(|reply| reply.in_reply_to == Some(parent.id))
+                .map(|reply| reply_json(reply.body.trim(), &reply.url))
+                .collect();
             json!({
-                "quote": quoted_selection(&reply.parent_body),
-                "comment": owner_comment(&reply.parent_body),
-                "url": reply.parent_url,
-                "replies": [],
+                "quote": quoted_selection(&parent.body),
+                "comment": owner_comment(&parent.body),
+                "url": parent.url,
+                "replies": replies,
             })
-        })["replies"]
-            .as_array_mut()
-            .expect("replies is an array")
-            .push(json!({
-                "body": reply.body.trim(),
-                // Agents write Markdown; rendered as the Inbox renders it.
-                "html": crate::owner_doc_render::render_markdown_sanitized(reply.body.trim()),
-                "url": reply.url,
-            }));
-    }
-    threads.into_values().collect()
+        })
+        .collect()
+}
+
+fn reply_json(body: &str, url: &str) -> Value {
+    json!({
+        "body": body,
+        // Agents write Markdown; rendered as the Inbox renders it.
+        "html": crate::owner_doc_render::render_markdown_sanitized(body),
+        "url": url,
+    })
 }
 
 /// The selection `comment_body` quoted ahead of the owner's words.
@@ -277,15 +319,28 @@ mod tests {
         assert_eq!(replies[0].url, "u30");
         assert_eq!(replies[0].parent_url, "u10a");
 
-        let threads = reader_threads_from(&replies);
-        assert_eq!(threads.len(), 2);
-        assert_eq!(threads[0]["quote"], "the quote");
-        assert_eq!(threads[0]["comment"], "why rate 0.1?");
-        assert_eq!(threads[0]["url"], "u10a");
-        assert_eq!(threads[0]["replies"][0]["body"], "Rate 1 lags.");
-        assert_eq!(threads[0]["replies"][0]["html"], "<p>Rate 1 lags.</p>\n");
-        assert_eq!(threads[1]["replies"][0]["url"], "u31");
         assert_eq!(quoted_selection("> a\n> b\n\nc"), "a\nb");
+    }
+
+    #[test]
+    fn review_threads_hold_every_comment_of_the_review_with_its_replies() {
+        let comments = super::super::review_comments_from(&json!([
+            {"id": 30, "pull_request_review_id": 7, "in_reply_to_id": 10, "body": " Rate 1 lags. ", "html_url": "u30"},
+            {"id": 10, "pull_request_review_id": 5, "body": "> the quote\n\nwhy rate 0.1?", "html_url": "u10"},
+            {"id": 11, "pull_request_review_id": 5, "body": "file-level note", "html_url": "u11"},
+            {"id": 12, "pull_request_review_id": 6, "body": "> other review\n\nnot this one", "html_url": "u12"}
+        ]));
+        let threads = review_threads(&comments, 5);
+        assert_eq!(
+            Value::Array(threads),
+            json!([
+                {"quote": "the quote", "comment": "why rate 0.1?", "url": "u10", "replies": [
+                    {"body": "Rate 1 lags.", "html": "<p>Rate 1 lags.</p>\n", "url": "u30"}
+                ]},
+                // An unanswered comment is history too (sm#2652).
+                {"quote": "", "comment": "file-level note", "url": "u11", "replies": []}
+            ])
+        );
     }
 
     #[test]

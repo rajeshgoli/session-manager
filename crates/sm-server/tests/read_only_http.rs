@@ -27,9 +27,9 @@ use sm_server::{
         RustCoreConfig, SmSendConfig, ToolLoggingConfig, UsageAccountConfig,
     },
     http::{
-        router, AppState, DocFetchError, DocPullRequest, DocReviewOnGitHub, DocReviewReply,
-        GitHubPullRequestState, GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster,
-        OwnerDocSource, ReviewRetryPolicy, SubmittedDocReview,
+        router, AppState, DocFetchError, DocPullRequest, DocReviewComment, DocReviewOnGitHub,
+        DocReviewReply, GitHubPullRequestState, GitHubReviewComment, GitHubReviewMatch,
+        GitHubReviewPoster, OwnerDocSource, ReviewRetryPolicy, SubmittedDocReview,
     },
     owner_docs::{git_blob_sha, OwnerDocStore, OwnerDocVerdict},
     runtime::TmuxRuntime,
@@ -22723,6 +22723,8 @@ struct FakeGitHub {
     unchanged_paths: std::collections::BTreeSet<String>,
     /// `review_replies` answers, by review database id.
     replies: std::collections::BTreeMap<i64, Vec<DocReviewReply>>,
+    /// `review_comments` answers: every review comment on the PR.
+    comments: Vec<DocReviewComment>,
 }
 
 #[derive(Clone, Debug)]
@@ -22992,6 +22994,12 @@ impl OwnerDocSource for StubDocSource {
         let mut github = self.github.lock().unwrap();
         github.calls.push("review_replies".to_owned());
         Ok(github.replies.get(&review_id).cloned().unwrap_or_default())
+    }
+
+    fn review_comments(&self, _repo: &str, _pr: i64) -> Result<Vec<DocReviewComment>, String> {
+        let mut github = self.github.lock().unwrap();
+        github.calls.push("review_comments".to_owned());
+        Ok(github.comments.clone())
     }
 
     fn viewer_reviews(&self, _repo: &str, _pr: i64) -> Result<Vec<DocReviewOnGitHub>, String> {
@@ -23772,6 +23780,23 @@ async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{edited}");
+    // A draft moves to another revision, keeping its text (sm#2652).
+    let scratch_path = format!("/docs/{id}/drafts/{}", scratch["id"].as_str().unwrap());
+    let (status, moved) =
+        patch_json(app.clone(), &scratch_path, json!({"sha": c2, "line": 7})).await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    assert_eq!(
+        (&moved["commit_sha"], &moved["line"], &moved["body"]),
+        (&json!(c2), &json!(7), &json!("scratch"))
+    );
+    for payload in [
+        json!({}),
+        json!({"sha": "HEAD"}),
+        json!({"sha": c2, "line": 0}),
+    ] {
+        let (status, _) = patch_json(app.clone(), &scratch_path, payload).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
     let (status, _) = delete_json(
         app.clone(),
         &format!("/docs/{id}/drafts/{}", scratch["id"].as_str().unwrap()),
@@ -23849,32 +23874,52 @@ async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
     assert!(drafts["drafts"].as_array().unwrap().is_empty());
 
     // The reader gets the agent's replies grouped under the comment they
-    // answer (sm#2305).
-    source.github.lock().unwrap().replies.insert(
-        posted.database_id,
-        vec![DocReviewReply {
-            id: 501,
-            parent_id: 401,
-            parent_body: "> Buy the dip.\n\nWhy now, exactly?".into(),
-            parent_url: "https://github.com/acme/widgets/pull/12#discussion_r401".into(),
-            body: " Momentum turned on the weekly. ".into(),
-            url: "https://github.com/acme/widgets/pull/12#discussion_r501".into(),
-        }],
-    );
+    // answer (sm#2305), and every comment of every posted review (sm#2652).
+    let comment = |id: i64, review: i64, reply_to: Option<i64>, body: &str| DocReviewComment {
+        id,
+        review_id: Some(review),
+        in_reply_to: reply_to,
+        body: body.into(),
+        url: format!("https://github.com/acme/widgets/pull/12#discussion_r{id}"),
+    };
+    source.github.lock().unwrap().comments = vec![
+        comment(
+            401,
+            posted.database_id,
+            None,
+            "> Buy the dip.\n\nWhy now, exactly?",
+        ),
+        comment(402, posted.database_id, None, "Overall too terse."),
+        comment(501, 9999, Some(401), " Momentum turned on the weekly. "),
+    ];
     let (status, threads) = get_json(app.clone(), &format!("/docs/{id}/review-replies")).await;
     assert_eq!(status, StatusCode::OK, "{threads}");
     assert_eq!(threads["review"]["commit_sha"], c1.as_str());
+    let answered = json!({
+        "quote": "Buy the dip.",
+        "comment": "Why now, exactly?",
+        "url": "https://github.com/acme/widgets/pull/12#discussion_r401",
+        "replies": [{
+            "body": "Momentum turned on the weekly.",
+            "html": "<p>Momentum turned on the weekly.</p>\n",
+            "url": "https://github.com/acme/widgets/pull/12#discussion_r501"
+        }]
+    });
+    assert_eq!(threads["threads"], json!([answered.clone()]));
+    let history = &threads["history"];
+    assert_eq!(history.as_array().unwrap().len(), 1, "{history}");
+    assert_eq!(history[0]["commit_sha"], c1.as_str());
+    assert_eq!(history[0]["verdict"], "changes_requested");
+    assert_eq!(history[0]["body"], "Tighten it.");
+    assert_eq!(history[0]["pr"], 12);
+    assert_eq!(history[0]["url"], url.as_str());
     assert_eq!(
-        threads["threads"],
-        json!([{
-            "quote": "Buy the dip.",
-            "comment": "Why now, exactly?",
-            "url": "https://github.com/acme/widgets/pull/12#discussion_r401",
-            "replies": [{
-                "body": "Momentum turned on the weekly.",
-                "html": "<p>Momentum turned on the weekly.</p>\n",
-                "url": "https://github.com/acme/widgets/pull/12#discussion_r501"
-            }]
+        history[0]["comments"],
+        json!([answered, {
+            "quote": "",
+            "comment": "Overall too terse.",
+            "url": "https://github.com/acme/widgets/pull/12#discussion_r402",
+            "replies": []
         }])
     );
     let wakes = queued_wakes(&dir, "[sm review] Rajesh's review");
