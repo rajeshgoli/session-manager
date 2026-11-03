@@ -381,6 +381,7 @@
     S.docState = 'reviewed';
     S.sub = res.status === 'posted' ? null : { submission_id: res.submission_id, status: res.status, queued_at: new Date().toISOString() };
     if (res.status === 'posted' && res.delivered_to_session_id == null) { S.undelivered = { id: res.submission_id, url: res.github_review_url }; S.assigned = ''; renderBanner(); }
+    if (res.status === 'posted') loadThreads();
     S.sentUntil = Date.now() + 4000;
     setTimeout(renderBar, 4100);
     renderBar();
@@ -398,6 +399,8 @@
       if (!subPosted[sub.submission_id] && was && was.submission_id === sub.submission_id && sub.delivered_to_session_id == null) {
         S.undelivered = { id: sub.submission_id, url: sub.github_review_url }; S.assigned = '';
       }
+      // Its comments join the Comments sheet without a reload.
+      if (!subPosted[sub.submission_id] && was && was.submission_id === sub.submission_id) loadThreads();
       subPosted[sub.submission_id] = 1;
     }
     // A failed review keeps its drafts on the server: show them again,
@@ -490,7 +493,7 @@
     // Inside the web app the document bar carries this note (2543 F.9).
     if (unseen && !framed) {
       lines.push([el('span', { text: 'The agent replied to ' + changed.length + ' comment' + (changed.length === 1 ? '' : 's') + ' on passages it has since changed.' }),
-        el('button', { class: 'lk', text: 'Read', onclick: showChangedThreads })]);
+        el('button', { class: 'lk', text: 'Read', onclick: showHistory })]);
     }
     lines.forEach(function (parts) { var row = el('div', {}, parts); row.style.cssText = 'display:flex;gap:6px 12px;flex-wrap:wrap;width:100%'; banner.appendChild(row); });
     banner.hidden = !lines.length;

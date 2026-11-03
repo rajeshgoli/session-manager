@@ -125,11 +125,19 @@ pub(super) async fn reader_threads_response(
     state: &Arc<AppState>,
     doc: OwnerDoc,
 ) -> Result<Response, ApiError> {
+    // Keyed by the posted review count too, so a review just posted is in
+    // the next answer (sm#2652).
+    let posted = owner_doc_store(state)
+        .reviews(&doc.id)?
+        .iter()
+        .filter(|review| review.status == "posted")
+        .count();
+    let key = format!("{}:{posted}", doc.id);
     let cached = state
         .owner_doc_replies_cache
         .lock()
         .unwrap()
-        .get(&doc.id)
+        .get(&key)
         .filter(|(at, _)| at.elapsed() < Duration::from_secs(60))
         .map(|(_, value)| value.clone());
     if let Some(value) = cached {
@@ -148,7 +156,7 @@ pub(super) async fn reader_threads_response(
         .owner_doc_replies_cache
         .lock()
         .unwrap()
-        .insert(doc_id, (std::time::Instant::now(), value.clone()));
+        .insert(key, (std::time::Instant::now(), value.clone()));
     Ok(Json(value).into_response())
 }
 

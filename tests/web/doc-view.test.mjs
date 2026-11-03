@@ -164,6 +164,8 @@ test('the review client counts unseen changed-passage replies for the app and le
   // The banner line is kept on a direct /docs/… load only.
   assert.match(source, /noteReplies\(unseen\);[\s\S]{0,120}if \(unseen && !framed\) \{/);
   assert.match(source, /S\.showChangedThreads = showHistory;/);
+  // The old name lives only on S; a bare reference would throw while drawing the banner.
+  assert.doesNotMatch(source.replace('S.showChangedThreads = showHistory;', ''), /[^.]showChangedThreads\b(?!\) here)/);
 });
 
 test('inside the app the review client draws no toolbar or pill and hands its state to the document bar (sm#2568)', () => {
