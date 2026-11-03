@@ -1463,6 +1463,111 @@ def test_completed_session_retiring_during_build_is_accounted_for(env):
     assert "session count ok (2 -> 1)" in result.stdout
 
 
+def test_auto_retirement_during_build_is_accounted_for(env):
+    # The idle-child sweep can retire a session that never ran sm task-complete.
+    (env["state"] / "before_sessions_json").write_text(json.dumps({
+        "sessions": [{"id": "retiring", "status": "idle"}],
+    }))
+    _write(env["state"] / "cargo_hook", f"""#!/usr/bin/env python3
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+now = datetime.now(timezone.utc).isoformat()
+Path({str(env['state'] / 'after_sessions_json')!r}).write_text(json.dumps({{
+    "sessions": [{{
+        "id": "retiring", "status": "stopped", "completed_at": now,
+        "agent_task_completed_at": None,
+        "terminal_provenance": {{
+            "cause": "explicit_retire", "authority": "server_lifecycle",
+            "source": "auto_retire", "observed_at": now,
+            "detail": "auto-retire after 10 minutes idle (spawned by an agent)",
+        }},
+    }}],
+}}))
+""", executable=True)
+
+    result = env["run"]()
+
+    assert result.returncode == 0, result.stderr
+    assert "expected retirements: retiring" in result.stdout
+    assert "session count ok (1 -> 0)" in result.stdout
+    assert "Refreshing the installed sm CLI" in result.stdout
+
+
+@pytest.mark.parametrize("observed_at,expected", [
+    ("2026-11-03T07:27:00.100000Z", True),  # inclusive start
+    ("2026-11-03T07:27:03.123456+00:00", True),
+    ("2026-11-02T23:27:03.123456-08:00", True),  # same instant
+    ("2026-11-03T07:27:10.200000Z", True),  # inclusive end
+    ("2026-11-03T07:27:00.099999Z", False),
+    ("2026-11-03T07:27:10.200001Z", False),
+    ("2026-11-03T07:27:03", False),  # no timezone
+    ("not-a-timestamp", False),
+    (None, False),
+    (123, False),
+])
+@pytest.mark.parametrize("source", ["auto_retire", "internal_session_store"])
+def test_server_retirement_requires_timestamp_in_restart_window(observed_at, expected, source):
+    retired = {
+        "id": "retiring", "status": "stopped", "completed_at": "recorded",
+        "terminal_provenance": {
+            "cause": "explicit_retire", "authority": "server_lifecycle",
+            "source": source, "observed_at": observed_at,
+        },
+    }
+    result = _compare_restart_sessions(retired)
+
+    assert (result.returncode == 0) is expected, result.stderr
+    if expected:
+        assert "expected retirements: retiring" in result.stdout
+    else:
+        assert "unaccounted sessions: retiring" in result.stderr
+
+
+@pytest.mark.parametrize("field,value", [
+    ("cause", "provider_natural_exit"),
+    ("cause", "tmux_disappearance"),
+    ("authority", "authenticated_parent"),
+    ("authority", None),
+    ("source", None),
+    ("source", ""),
+    ("source", "handed_off"),  # still needs a reciprocal live successor
+    ("completed_at", None),
+])
+def test_in_window_timestamp_does_not_excuse_unproven_retirement(field, value):
+    retired = {
+        "id": "retiring", "status": "stopped", "completed_at": "recorded",
+        "terminal_provenance": {
+            "cause": "explicit_retire", "authority": "server_lifecycle",
+            "source": "auto_retire", "observed_at": "2026-11-03T07:27:03Z",
+        },
+    }
+    if field == "completed_at":
+        retired[field] = value
+    else:
+        retired["terminal_provenance"][field] = value
+
+    result = _compare_restart_sessions(retired)
+
+    assert result.returncode != 0
+    assert "unaccounted sessions: retiring" in result.stderr
+
+
+def _compare_restart_sessions(retired):
+    # Exercise the production comparison with fixed boundaries without running
+    # the full deployment for every timestamp or malformed-provenance case.
+    function = SCRIPT.read_text().split("compare_sessions() {", 1)[1].split("\n}\n", 1)[0]
+    return subprocess.run(
+        ["bash", "-c", "compare_sessions() {" + function + "\n}\n"
+         'SM_ALLOW_SESSION_DROP=0\n'
+         'RESTART_STARTED_AT=2026-11-03T07:27:00.100000Z\n'
+         'RESTART_FINISHED_AT=2026-11-03T07:27:10.200000Z\n'
+         'compare_sessions "$1" "$2"', "compare-sessions",
+         json.dumps([{"id": "retiring", "status": "idle"}]), json.dumps([retired])],
+        capture_output=True, text=True,
+    )
+
+
 @pytest.mark.parametrize("missing", [None, "completed_at", "observed_at", "source"])
 def test_operator_retirement_during_restart(env, missing):
     retired = {

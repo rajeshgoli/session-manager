@@ -141,8 +141,9 @@ Options:
                         work from production for everyone. Only for a deliberate
                         rollback, or when $SM_DEPLOY_REMOTE cannot be reached.
   --allow-drop N        Tolerate N unaccounted missing session identities after
-                        restart (default: 0). Completed sessions with recorded
-                        retirement do not count toward this allowance.
+                        restart (default: 0). Recorded expected retirements,
+                        including server retirements within the restart window,
+                        do not count toward this allowance.
   --allow-plist-change  Proceed even though restarting would rewrite the launchd
                         plist with different contents. Read the printed diff
                         first: this is how a deployment setting gets dropped.
@@ -519,11 +520,24 @@ print(sum(s["status"] != "stopped" for s in json.load(sys.stdin)))
 compare_sessions() {
   printf '%s\0%s' "$1" "$2" | python3 -c '
 import json, sys
+from datetime import datetime
 before, after = (json.loads(part) for part in sys.stdin.buffer.read().split(b"\0"))
 previous = {s["id"]: s for s in before if s["status"] != "stopped"}
 current = {s["id"]: s for s in after}
 lost = []
 retired = []
+
+def timestamp(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+restart_started = timestamp(sys.argv[2])
+restart_finished = timestamp(sys.argv[3])
 
 def handoff_peer_id(session, relation):
     # SessionResponse exposes lineage as handoff.{successor,predecessor}.id.
@@ -543,6 +557,14 @@ for sid, old in previous.items():
                       and provenance.get("observed_at")
                       and provenance.get("source"))
     operator_retire = explicit_retire and provenance.get("authority") == "operator"
+    observed_at = timestamp(provenance.get("observed_at"))
+    lifecycle_retire = (explicit_retire
+                        and provenance.get("authority") == "server_lifecycle"
+                        # Handoffs still require the reciprocal live successor below.
+                        and provenance.get("source") != "handed_off"
+                        and observed_at is not None
+                        and restart_started is not None and restart_finished is not None
+                        and restart_started <= observed_at <= restart_finished)
     successor_id = handoff_peer_id(new, "successor")
     successor = current.get(successor_id) if isinstance(successor_id, str) else None
     handoff_retire = (explicit_retire
@@ -551,12 +573,13 @@ for sid, old in previous.items():
                       and provenance.get("actor_session_id") == successor_id
                       and successor is not None and successor["status"] != "stopped"
                       and handoff_peer_id(successor, "predecessor") == sid)
-    # Completion, operator retirement, or a handoff to a reciprocal live
-    # successor accounts for this identity. A stopped status alone does not.
+    # Completion, operator retirement, a server retirement in this window, or
+    # a handoff to a reciprocal live successor accounts for this identity.
+    # A stopped status alone does not.
     if (new is not None and new["status"] == "stopped"
             and new.get("completed_at")
             and (old.get("agent_task_completed_at") or new.get("agent_task_completed_at")
-                 or operator_retire or handoff_retire)):
+                 or operator_retire or lifecycle_retire or handoff_retire)):
         retired.append(sid)
     else:
         lost.append(sid)
@@ -564,7 +587,7 @@ print("expected retirements: " + (", ".join(sorted(retired)) or "none"))
 if lost:
     print("unaccounted sessions: " + ", ".join(sorted(lost)), file=sys.stderr)
 sys.exit(0 if len(lost) <= int(sys.argv[1]) else 1)
-' "$SM_ALLOW_SESSION_DROP"
+' "$SM_ALLOW_SESSION_DROP" "$RESTART_STARTED_AT" "$RESTART_FINISHED_AT"
 }
 
 job_loaded() {
@@ -827,6 +850,9 @@ SOURCE_AT_START="$(source_fingerprint)"
 [[ -n "$SOURCE_AT_START" ]] && echo "source: ${SOURCE_AT_START%% *}"
 
 step "Recording pre-restart state"
+# Include retirements racing either snapshot request, as well as the build and
+# cutover. Keep subsecond precision to reject stale provenance in the same second.
+RESTART_STARTED_AT="$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')"
 BEFORE_HEALTHY=0
 BEFORE_SESSIONS=""
 BEFORE_SNAPSHOT=""
@@ -1188,6 +1214,7 @@ echo "queue authority peer verified"
 step "Comparing session identities"
 AFTER_SNAPSHOT="$(session_snapshot || true)"
 [[ -n "$AFTER_SNAPSHOT" ]] || fail "could not read session list after restart"
+RESTART_FINISHED_AT="$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')"
 AFTER_SESSIONS="$(session_count "$AFTER_SNAPSHOT")"
 echo "sessions after: $AFTER_SESSIONS"
 if [[ "$BEFORE_HEALTHY" -eq 1 ]]; then
