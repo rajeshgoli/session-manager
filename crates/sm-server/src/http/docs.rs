@@ -239,6 +239,28 @@ pub trait OwnerDocSource: Send + Sync {
     ) -> Result<Vec<DocReviewReply>, String> {
         Err("this doc source cannot read review replies".to_owned())
     }
+
+    /// Every review comment on the PR, replies included, oldest first: the
+    /// reader's comment history (sm#2652).
+    fn review_comments(
+        &self,
+        _repo: &str,
+        _pr_number: i64,
+    ) -> Result<Vec<DocReviewComment>, String> {
+        Err("this doc source cannot read review comments".to_owned())
+    }
+}
+
+/// One review comment on a PR, as `pulls/{n}/comments` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocReviewComment {
+    pub id: i64,
+    /// The review that posted it; GitHub gives each reply a review of its own.
+    pub review_id: Option<i64>,
+    /// The thread's first comment, on a reply.
+    pub in_reply_to: Option<i64>,
+    pub body: String,
+    pub url: String,
 }
 
 /// A reply in the thread of one of the owner's review comments.
@@ -685,6 +707,35 @@ impl OwnerDocSource for GhCliDocSource {
         )?;
         Ok(review_replies_from(&parents, &comments))
     }
+
+    fn review_comments(&self, repo: &str, pr_number: i64) -> Result<Vec<DocReviewComment>, String> {
+        let comments = gh_api_json(
+            repo,
+            &format!("pulls/{pr_number}/comments?per_page=100"),
+            true,
+        )?;
+        Ok(review_comments_from(&comments))
+    }
+}
+
+pub(super) fn review_comments_from(comments: &Value) -> Vec<DocReviewComment> {
+    let text = |value: &Value, key: &str| value[key].as_str().unwrap_or_default().to_owned();
+    let mut list: Vec<DocReviewComment> = comments
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|comment| {
+            Some(DocReviewComment {
+                id: comment["id"].as_i64()?,
+                review_id: comment["pull_request_review_id"].as_i64(),
+                in_reply_to: comment["in_reply_to_id"].as_i64(),
+                body: text(comment, "body"),
+                url: text(comment, "html_url"),
+            })
+        })
+        .collect();
+    list.sort_by_key(|comment| comment.id);
+    list
 }
 
 /// Comments in `comments` that answer one of `parents`, oldest first. Agents
@@ -2223,7 +2274,9 @@ pub(super) async fn post_owner_doc_subpath(
         .map(|(status, review)| (status, Json(review)).into_response())
 }
 
-/// `PATCH /docs/{id}/drafts/{draft_id}`: edit a draft's text.
+/// `PATCH /docs/{id}/drafts/{draft_id}`: edit a draft's text, or move it to
+/// another revision (`sha` and `line`) whose text still holds its quote
+/// (sm#2652).
 pub(super) async fn patch_owner_doc_subpath(
     State(state): State<Arc<AppState>>,
     Path((doc_id, rest)): Path<(String, String)>,
@@ -2235,18 +2288,58 @@ pub(super) async fn patch_owner_doc_subpath(
     let draft_id = draft_subroute(&rest)?;
     let doc = find_doc(&state, &doc_id)?;
     let payload: UpdateDraftRequest = parse_json_body(&body)?;
-    let text = validated_draft_body(&payload.body)?;
+    let text = payload
+        .body
+        .as_deref()
+        .map(validated_draft_body)
+        .transpose()?;
+    let target = payload
+        .sha
+        .as_deref()
+        .map(|sha| sha.trim().to_ascii_lowercase());
+    if text.is_none() && target.is_none() {
+        return Err(bad_request(
+            "Send a new body, or a sha to move the draft to",
+        ));
+    }
+    if target
+        .as_deref()
+        .is_some_and(|sha| !is_full_commit_sha(sha))
+    {
+        return Err(bad_request("sha must be a full 40-character commit SHA"));
+    }
+    if payload.line.is_some_and(|line| line < 1) {
+        return Err(bad_request("line must be positive"));
+    }
     let _guard = state.owner_doc_review_lock.lock().await;
     let store = owner_doc_store(&state);
-    let existing = store
-        .drafts(&doc.id)?
-        .into_iter()
+    let drafts = store.drafts(&doc.id)?;
+    let existing = drafts
+        .iter()
         .find(|draft| draft.id == draft_id)
         .ok_or(ApiError::NotFound("Draft not found"))?;
     ensure_drafts_unfrozen(&state, &doc, &existing.commit_sha)?;
-    let draft = store
-        .update_draft(&doc.id, draft_id, &text)?
-        .ok_or(ApiError::NotFound("Draft not found"))?;
+    if let Some(sha) = target.as_deref().filter(|sha| *sha != existing.commit_sha) {
+        ensure_drafts_unfrozen(&state, &doc, sha)?;
+        if drafts
+            .iter()
+            .filter(|draft| draft.commit_sha == sha)
+            .count()
+            >= MAX_DRAFTS_PER_REVISION
+        {
+            return Err(bad_request(format!(
+                "A review holds at most {MAX_DRAFTS_PER_REVISION} comments; submit these first"
+            )));
+        }
+    }
+    if let Some(sha) = target.as_deref() {
+        store.move_draft(&doc.id, draft_id, sha, payload.line)?;
+    }
+    let draft = match text {
+        Some(text) => store.update_draft(&doc.id, draft_id, &text)?,
+        None => store.draft(&doc.id, draft_id)?,
+    }
+    .ok_or(ApiError::NotFound("Draft not found"))?;
     Ok(Json(serde_json::to_value(draft)?))
 }
 
@@ -2379,7 +2472,13 @@ struct CreateDraftRequest {
 
 #[derive(Debug, Deserialize)]
 struct UpdateDraftRequest {
-    body: String,
+    #[serde(default)]
+    body: Option<String>,
+    /// Moves the draft to this revision, anchored at `line` there.
+    #[serde(default)]
+    sha: Option<String>,
+    #[serde(default)]
+    line: Option<i64>,
 }
 
 fn create_draft(

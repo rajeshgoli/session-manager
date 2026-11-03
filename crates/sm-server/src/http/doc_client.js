@@ -32,7 +32,9 @@
     // (showChangedThreads) here (2543 F.9).
     repliesUnseen: 0
   };
-  S.showChangedThreads = showChangedThreads;
+  // The Comments sheet: every posted review's comments and replies (sm#2652).
+  S.showHistory = showHistory;
+  S.showChangedThreads = showHistory;
   var coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
   var BLOCK = '[data-sm-line]';
   var INTERACTIVE = 'a,button,input,select,textarea,label,summary,video,audio,[contenteditable],[onclick],[role=button]';
@@ -84,6 +86,16 @@
     if (r) return r.path;
     if (S.head && S.head.pr_head_sha === sha) return S.head.pr_head_reader_path;
     return null;
+  }
+  // Index in CONFIG.revisions, newest first; -1 when it is not a published revision.
+  function revisionIndex(sha) {
+    var list = CONFIG.revisions || [];
+    for (var i = 0; i < list.length; i++) if (list[i].sha === sha) return i;
+    return -1;
+  }
+  function revisionName(sha) {
+    var i = revisionIndex(sha);
+    return i < 0 ? sha7(sha) : 'Revision ' + (CONFIG.revisions.length - i);
   }
   function currentDrafts() { return MSG ? S.drafts : S.drafts.filter(function (d) { return d.commit_sha === CONFIG.sha; }); }
 
@@ -229,6 +241,7 @@
     else if (posting(sub) && Date.now() - Date.parse(sub.queued_at) > 60000) note = { kind: 'posting', text: 'Posting review…' };
     return {
       drafts: currentDrafts().length,
+      comments: historyCount(),
       canReview: !MSG && (S.canComment || currentDrafts().length > 0),
       reviewRequested: !MSG && S.docState === 'review_requested',
       mergeHold: S.mergeHold ? { placed_by: S.mergeHold.placed_by, reason: S.mergeHold.reason || '' } : null,
@@ -290,6 +303,7 @@
       S.docState === 'review_requested' ? el('button', { text: 'No review needed', onclick: function (e) {
         e.currentTarget.disabled = true; dismissReview();
       } }) : null,
+      historyCount() ? el('button', { text: 'Comments (' + historyCount() + ')', onclick: showHistory }) : null,
       (S.canComment || n) ? el('button', { class: 'p', text: 'Review (' + n + ')', onclick: openReview }) : null,
       el('button', { title: 'Hide', text: '▴', onclick: function () { setCollapsed(true); } })
     ].forEach(function (c) { if (c) bar.appendChild(c); });
@@ -440,12 +454,18 @@
       } }));
       lines.push(parts);
     }
+    if (S.carried) {
+      lines.push([el('span', { text: 'Moved ' + S.carried.count + ' draft comment' + (S.carried.count === 1 ? '' : 's') + ' from ' + S.carried.from + ' to this revision: ' + (S.carried.count === 1 ? 'its passage is' : 'their passages are') + ' unchanged.' }),
+        el('button', { class: 'lk', text: 'OK', onclick: function () { S.carried = null; renderBanner(); } })]);
+    }
     var other = {};
     if (!MSG) S.drafts.forEach(function (d) { if (d.commit_sha !== CONFIG.sha) (other[d.commit_sha] = other[d.commit_sha] || []).push(d); });
     Object.keys(other).forEach(function (sha) {
       var list = other[sha];
       var path = pathFor(sha);
-      var parts = [el('span', { text: list.length + ' draft comment' + (list.length === 1 ? '' : 's') + ' on ' + sha7(sha) + (discardError[sha] ? ' (' + discardError[sha] + ')' : '') })];
+      var older = revisionIndex(sha) > revisionIndex(CONFIG.sha) && revisionIndex(CONFIG.sha) >= 0;
+      var parts = [el('span', { text: list.length + ' draft comment' + (list.length === 1 ? '' : 's') + ' on ' + revisionName(sha) +
+        (older ? (list.length === 1 ? ', whose passage changed' : ', whose passages changed') : '') + (discardError[sha] ? ' (' + discardError[sha] + ')' : '') })];
       if (path) parts.push(el('a', { href: path, text: 'Submit them against ' + sha7(sha) }));
       parts.push(el('button', { class: 'lk', text: discardArmed[sha] ? 'Tap again to discard' : 'Discard', onclick: function () {
         if (!discardArmed[sha]) { discardArmed[sha] = 1; renderBanner(); return; }
@@ -655,14 +675,34 @@
       try { window.parent.postMessage({ type: 'sm-doc-replies', count: count }, location.origin); } catch (_) { /* parent gone */ }
     }
   }
-  function showChangedThreads() {
+  S.history = [];
+  function historyCount() {
+    return S.history.reduce(function (n, r) { return n + r.comments.length + (r.body ? 1 : 0); }, 0);
+  }
+  var VERDICTS = { approve: 'Approved', changes_requested: 'Requested changes', comment: 'Commented' };
+  // Newest review first; each comment with the agent's replies and, while its
+  // passage is still in this revision, Show.
+  function showHistory() {
+    closeComposer();
     clear(sheet);
-    sheet.appendChild(el('h3', { text: 'Replies on passages since changed' }));
-    S.changedThreads.forEach(function (t) {
-      sheet.appendChild(el('div', { class: 'item' }, [t.quote ? el('div', { class: 'q', text: t.quote }) : null].concat(threadParts(t))));
+    sheet.appendChild(el('div', { class: 'row' }, [el('h3', { text: 'Your comments' }), el('span', { class: 'sp' }), el('button', { text: 'Close', onclick: closeSheet })]));
+    if (!S.history.length) sheet.appendChild(el('div', { class: 'muted', text: 'No posted reviews of this doc yet.' }));
+    var text = collapse(document.body ? document.body.textContent : '');
+    S.history.slice().reverse().forEach(function (r) {
+      var title = 'Review of ' + revisionName(r.commit_sha) + ' · ' + (r.posted_at || '').slice(0, 16).replace('T', ' ') + ' · ' + (VERDICTS[r.verdict] || r.verdict);
+      sheet.appendChild(el('div', { class: 'row' }, [el('strong', { text: title }), el('span', { class: 'sp' }),
+        r.url ? el('a', { href: r.url, target: '_blank', rel: 'noopener', text: 'GitHub' }) : null]));
+      if (r.body) sheet.appendChild(el('div', { class: 'item' }, [el('span', { class: 'tag', text: 'Overall' }), el('div', { class: 'b', text: r.body })]));
+      r.comments.forEach(function (t) {
+        var quote = collapse(t.quote);
+        var block = quote && text.indexOf(quote) >= 0 ? blockForQuote(quote) : null;
+        var parts = threadParts(t);
+        if (block) parts[parts.length - 1].insertBefore(el('button', { text: 'Show', onclick: function () { closeSheet(); block.scrollIntoView({ block: 'center' }); } }), parts[parts.length - 1].firstChild);
+        sheet.appendChild(el('div', { class: 'item' }, [t.quote ? el('div', { class: 'q', text: t.quote }) : null].concat(parts)));
+      });
     });
-    sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
     sheet.hidden = false;
+    placeSheet();
     store(repliesSeenKey(), '1');
     renderBanner();
   }
@@ -671,7 +711,9 @@
     api('GET', '/review-replies').then(function (res) {
       S.threads = (res && res.threads) || [];
       S.threadsReview = (res && res.review) || null;
+      S.history = (res && res.history) || [];
       renderThreads();
+      renderBar();
     }).catch(function () { /* offline or GitHub down: show none */ });
   }
 
@@ -853,6 +895,47 @@
   function refreshDrafts() {
     return api('GET', '/drafts').then(function (res) {
       S.drafts = (res && res.drafts) || [];
+      markers(); renderBar(); renderBanner();
+      carryDrafts();
+    });
+  }
+  // ---- carrying drafts to a newer revision (sm#2652) ---------------------
+  // A draft on an older revision whose quoted passage is still in this one,
+  // word for word, moves here; the rest stay, and the banner offers them.
+  var carryTried = {};
+  var carrying = false;
+  // The draft's line in this revision: null for a comment on the file,
+  // undefined when its passage changed.
+  function carriedLine(d) {
+    var quote = collapse(d.quote);
+    if (d.line == null) return quote && collapse(document.body.textContent).indexOf(quote) < 0 ? undefined : null;
+    if (!quote || collapse(document.body.textContent).indexOf(quote) < 0) return undefined;
+    var block = blockForQuote(quote);
+    return block ? parseInt(block.getAttribute('data-sm-line'), 10) : undefined;
+  }
+  function carryDrafts() {
+    var here = revisionIndex(CONFIG.sha);
+    if (MSG || carrying || here < 0) return;
+    var moves = [];
+    S.drafts.forEach(function (d) {
+      if (carryTried[d.id] || revisionIndex(d.commit_sha) <= here) return;
+      var line = carriedLine(d);
+      if (line !== undefined) moves.push({ draft: d, line: line });
+    });
+    if (!moves.length) return;
+    carrying = true;
+    var from = {};
+    var count = 0;
+    Promise.all(moves.map(function (m) {
+      carryTried[m.draft.id] = 1;
+      return api('PATCH', '/drafts/' + m.draft.id, { sha: CONFIG.sha, line: m.line }).then(function (d) {
+        from[revisionName(m.draft.commit_sha)] = 1;
+        count++;
+        S.drafts = S.drafts.map(function (x) { return x.id === d.id ? d : x; });
+      }, function () { /* frozen by an unfinished submission, or full: it stays */ });
+    })).then(function () {
+      carrying = false;
+      if (count) S.carried = { count: (S.carried ? S.carried.count : 0) + count, from: Object.keys(from).join(', ') };
       markers(); renderBar(); renderBanner();
     });
   }
@@ -1056,6 +1139,7 @@
   renderBar();
   renderBanner();
   markers();
+  carryDrafts();
   pollHead();
   loadThreads();
   setInterval(pollHead, 60000);
