@@ -4011,6 +4011,14 @@ async fn inbound_email_webhook(
             None => return Err(ApiError::NotFound("Session not found")),
         }
     }
+    if restored && state.config.rust_core.runtime_enabled {
+        let work = state.clone();
+        let restored_session = session.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            auto_retire::wait_for_restored_input(&work, &restored_session)
+        })
+        .await;
+    }
     let input = SendCoreInputRequest {
         text: body,
         delivery_mode: "sequential".to_owned(),
