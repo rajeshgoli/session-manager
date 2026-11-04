@@ -431,6 +431,9 @@ pub(super) fn restore_session_with_work(
             })
         }
     };
+    if runtime_enabled {
+        wait_for_restored_input(state, &session);
+    }
     if let Some(retired_at) = before
         .completed_at
         .as_deref()
@@ -451,6 +454,26 @@ pub(super) fn restore_session_with_work(
     }
     super::host_restart::after_restore(state, session_id);
     Ok(session)
+}
+
+/// Block until a just-restored agent's composer takes input. Restore marks
+/// the session live as soon as tmux starts the provider, and an ordinary
+/// send trusts that; typed while Claude was still loading its resumed
+/// conversation, an `sm send --restore` message sat unsent in the composer
+/// (sm#2658). A timeout is logged, not fatal: the restore itself succeeded.
+pub(super) fn wait_for_restored_input(state: &AppState, session: &SessionRecord) {
+    if !is_primary_node(&session.node) {
+        return;
+    }
+    let runtime = TmuxRuntime::from_app_config(&state.config)
+        .for_socket_name(session.tmux_socket_name.as_deref());
+    if let Err(error) = runtime.wait_for_restore_readiness(&session.tmux_session, &session.provider)
+    {
+        eprintln!(
+            "restored {} never showed a ready composer: {error:#}",
+            session.id
+        );
+    }
 }
 
 /// A message is about to be addressed to `recipient`: when that is an

@@ -44,6 +44,8 @@ const CLAUDE_SUBMIT_CHECK_POLL: Duration = Duration::from_millis(50);
 const CLAUDE_SUBMIT_MAX_RETRIES: usize = 3;
 const CODEX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INITIAL_BRIEF_READY_TIMEOUT: Duration = Duration::from_secs(10);
+// A resumed provider reloads its whole conversation before it takes input.
+const RESTORE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_INITIAL_BRIEF_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVER_ANCHOR_SESSION: &str = "__sm_server_anchor";
 const DEFAULT_TMUX_BINARY: &str = "tmux";
@@ -2018,6 +2020,16 @@ impl TmuxRuntime {
         Some((x.parse().ok()?, y.parse().ok()?))
     }
 
+    /// Wait until a restored provider's composer accepts input, allowing at
+    /// least `RESTORE_READY_TIMEOUT` for it to reload its conversation.
+    pub fn wait_for_restore_readiness(&self, tmux_session: &str, provider: &str) -> Result<()> {
+        let mut runtime = self.clone();
+        runtime.initial_brief_ready_timeout = runtime
+            .initial_brief_ready_timeout
+            .max(RESTORE_READY_TIMEOUT);
+        runtime.wait_for_initial_brief_readiness(tmux_session, provider)
+    }
+
     /// Wait, up to the initial-brief readiness timeout, until the provider's
     /// composer accepts input. A handoff successor's brief waits on this too.
     pub fn wait_for_initial_brief_readiness(
@@ -3940,6 +3952,70 @@ esac
         .unwrap();
         fs::write(&cursor_path, "32,2\n").unwrap();
         assert!(!runtime.session_input_ready("sm-test", "claude"));
+    }
+
+    #[test]
+    fn restore_readiness_waits_for_the_resumed_claude_composer() {
+        let (tmux_binary, _log_path, temp_dir) = fake_tmux_binary();
+        let pane_path = temp_dir.join("pane");
+        let styled_pane_path = temp_dir.join("styled-pane");
+        let cursor_path = temp_dir.join("cursor");
+        // Claude is still reloading the resumed conversation: no composer.
+        fs::write(&pane_path, "Resuming conversation…\n").unwrap();
+        fs::write(&styled_pane_path, "Resuming conversation…\n").unwrap();
+        fs::write(&cursor_path, "0,0\n").unwrap();
+        fs::write(
+            &tmux_binary,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "-L" ]; then
+  shift 2
+fi
+case "$1" in
+  capture-pane)
+    case " $* " in
+      *' -e '*) cat "{}" ;;
+      *) cat "{}" ;;
+    esac
+    exit 0
+    ;;
+  display-message) cat "{}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+                styled_pane_path.display(),
+                pane_path.display(),
+                cursor_path.display(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux_binary, permissions).unwrap();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        let delay = Duration::from_millis(400);
+        let writer = thread::spawn(move || {
+            thread::sleep(delay);
+            fs::write(
+                &pane_path,
+                "✻ Finished\n────────────────────\n❯\u{a0}fix the horizon.rs comment too\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+            )
+            .unwrap();
+            fs::write(
+                &styled_pane_path,
+                "✻ Finished\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+            )
+            .unwrap();
+            fs::write(&cursor_path, "2,2\n").unwrap();
+        });
+        let started = Instant::now();
+        runtime
+            .wait_for_restore_readiness("sm-test", "claude")
+            .unwrap();
+        assert!(started.elapsed() >= delay);
+        writer.join().unwrap();
     }
 
     #[test]
