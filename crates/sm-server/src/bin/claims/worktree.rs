@@ -449,17 +449,39 @@ pub(crate) fn setup_worktree(
     if !fetch.success {
         bail!("git fetch origin failed: {}", fetch.stderr);
     }
-    let base = match base_flag.map(str::trim).filter(|base| !base.is_empty()) {
-        Some(base) => base.to_owned(),
-        None => run_ok(
-            tools,
+    // Prefer the ticket's own commits over the requested starting base.
+    // The fetch above must succeed before absence of a remote ref is trusted.
+    let local_ref = format!("refs/heads/{}", plan.branch);
+    let remote_ref = format!("refs/remotes/origin/{}", plan.branch);
+    let has_branch = tools
+        .run(
             "git",
             repo_root,
-            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        )
-        .ok()
-        .filter(|base| !base.is_empty())
-        .unwrap_or_else(|| "origin/main".to_owned()),
+            &["show-ref", "--verify", "--quiet", &local_ref],
+        )?
+        .success;
+    let has_remote = tools
+        .run(
+            "git",
+            repo_root,
+            &["show-ref", "--verify", "--quiet", &remote_ref],
+        )?
+        .success;
+    let base = if !has_branch && has_remote {
+        remote_ref
+    } else {
+        match base_flag.map(str::trim).filter(|base| !base.is_empty()) {
+            Some(base) => base.to_owned(),
+            None => run_ok(
+                tools,
+                "git",
+                repo_root,
+                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            )
+            .ok()
+            .filter(|base| !base.is_empty())
+            .unwrap_or_else(|| "origin/main".to_owned()),
+        }
     };
     let base_sha = run_ok(
         tools,
@@ -480,24 +502,30 @@ pub(crate) fn setup_worktree(
     } else {
         false
     };
-    let recorded_base = (!existing).then_some(base_sha.as_str());
+    let recorded_base = (!existing && claim.recorded.is_none()).then_some(base_sha.as_str());
     recorder
         .record("intent", &plan, recorded_base)
         .context("could not record the worktree on the claim; nothing was created")?;
     if !existing {
-        let branch_ref = format!("refs/heads/{}", plan.branch);
-        let has_branch = tools
-            .run(
-                "git",
-                repo_root,
-                &["show-ref", "--verify", "--quiet", &branch_ref],
-            )?
-            .success;
         let add = if has_branch {
             tools.run(
                 "git",
                 repo_root,
                 &["worktree", "add", &path_text, &plan.branch],
+            )?
+        } else if has_remote {
+            tools.run(
+                "git",
+                repo_root,
+                &[
+                    "worktree",
+                    "add",
+                    "--track",
+                    "-b",
+                    &plan.branch,
+                    &path_text,
+                    &base,
+                ],
             )?
         } else {
             tools.run(

@@ -416,3 +416,36 @@ fn list_and_delete_output() {
         vec!["Deleted 1 build-output folder in /nowhere/wt."]
     );
 }
+
+#[test]
+fn missing_worktree_recovers_pushed_branch_and_preserves_recorded_base() {
+    let c = checkout();
+    let root = c.dir.join("worktrees");
+    let plan = plan_worktree(1452, &claim(&root, None).title, None, &root, "sm").unwrap();
+    let seed = c.dir.join("seed");
+    git(&seed, &["checkout", "-b", &plan.branch]);
+    git(
+        &seed,
+        &["commit", "-q", "--allow-empty", "-m", "ticket work"],
+    );
+    git(&seed, &["push", "origin", &plan.branch]);
+    let pushed = git(&seed, &["rev-parse", "HEAD"]);
+    let mut recorder = Recorded::default();
+    let result = setup_worktree(
+        &ProcessTools,
+        &c.checkout,
+        &claim(&root, Some(plan.clone())),
+        None,
+        Some("origin/main"),
+        &mut recorder,
+    )
+    .unwrap();
+    assert_eq!(git(&plan.path, &["rev-parse", "HEAD"]), pushed);
+    assert_eq!(
+        git(&plan.path, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+        format!("origin/{}", plan.branch)
+    );
+    assert!(recorder.calls.iter().all(|call| call.3.is_empty()));
+    assert!(result.line().contains(&pushed[..7]));
+    fs::remove_dir_all(c.dir).unwrap();
+}

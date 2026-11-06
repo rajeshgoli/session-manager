@@ -842,6 +842,21 @@ fn in_use(
     processes: &mut Option<ProcessListing>,
     grace: bool,
 ) -> Result<Option<String>> {
+    // Claims are durable ownership evidence even if the session snapshot is
+    // stale, missing, or marks the candidate's own session as retired.
+    for claim in query_claims(
+        conn,
+        "WHERE ended_at IS NULL AND reserved_at IS NULL AND worktree_path IS NOT NULL",
+        [],
+    )? {
+        if claim
+            .worktree_path
+            .as_deref()
+            .is_some_and(|path| is_inside(&path_key(path), &candidate.path))
+        {
+            return Ok(Some(format!("held by active claim {}", claim.id)));
+        }
+    }
     // No other session that is not retired works inside it.
     for session in request.sessions {
         if !session.local

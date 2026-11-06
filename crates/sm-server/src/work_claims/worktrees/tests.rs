@@ -1667,3 +1667,46 @@ fn interrupted_investigation_directory_cleanup_preserves_work_keeps_and_processe
         }
     }
 }
+
+#[test]
+fn active_claim_blocks_cleanup_and_explicit_delete_despite_retired_snapshot() {
+    let repo = Repo::new();
+    let (path, head) = repo.worktree("wt", "5-feature");
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        5,
+        Some(&path),
+        Some("5-feature"),
+        Some(&head),
+    );
+    repo.conn()
+        .execute(
+            "UPDATE work_claims SET ended_at=NULL, end_reason=NULL WHERE id='c1'",
+            [],
+        )
+        .unwrap();
+    let sessions = [session("eng1", "/elsewhere", true)];
+    assert_eq!(
+        repo.pass(&sessions),
+        vec![outcome(&path, false, "held by active claim c1")]
+    );
+    for scope in [DeleteScope::Worktree, DeleteScope::BuildOutput] {
+        assert_eq!(
+            delete_leftover(&repo.store, &sessions, &path, scope, "owner").unwrap(),
+            Err("held by active claim c1".into())
+        );
+    }
+    assert!(Path::new(&path).exists());
+    repo.conn()
+        .execute(
+            "UPDATE work_claims SET ended_at=?1, end_reason='retired' WHERE id='c1'",
+            [retired_at()],
+        )
+        .unwrap();
+    assert_eq!(
+        repo.pass(&sessions),
+        vec![outcome(&path, true, "no commits")]
+    );
+}
