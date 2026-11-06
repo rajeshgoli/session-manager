@@ -445,7 +445,7 @@ pub(crate) fn setup_worktree(
         }
         None => plan_worktree(claim.number, &claim.title, slug, &root, &claim.prefix)?,
     };
-    let fetch = tools.run("git", repo_root, &["fetch", "origin"])?;
+    let fetch = tools.run("git", repo_root, &["fetch", "--prune", "origin"])?;
     if !fetch.success {
         bail!("git fetch origin failed: {}", fetch.stderr);
     }
@@ -467,21 +467,17 @@ pub(crate) fn setup_worktree(
             &["show-ref", "--verify", "--quiet", &remote_ref],
         )?
         .success;
-    let base = if !has_branch && has_remote {
-        remote_ref
-    } else {
-        match base_flag.map(str::trim).filter(|base| !base.is_empty()) {
-            Some(base) => base.to_owned(),
-            None => run_ok(
-                tools,
-                "git",
-                repo_root,
-                &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-            )
-            .ok()
-            .filter(|base| !base.is_empty())
-            .unwrap_or_else(|| "origin/main".to_owned()),
-        }
+    let base = match base_flag.map(str::trim).filter(|base| !base.is_empty()) {
+        Some(base) => base.to_owned(),
+        None => run_ok(
+            tools,
+            "git",
+            repo_root,
+            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        )
+        .ok()
+        .filter(|base| !base.is_empty())
+        .unwrap_or_else(|| "origin/main".to_owned()),
     };
     let base_sha = run_ok(
         tools,
@@ -524,7 +520,7 @@ pub(crate) fn setup_worktree(
                     "-b",
                     &plan.branch,
                     &path_text,
-                    &base,
+                    &remote_ref,
                 ],
             )?
         } else {
@@ -543,6 +539,18 @@ pub(crate) fn setup_worktree(
     if let Err(error) = recorder.record("created", &plan, recorded_base) {
         eprintln!("Warning: could not confirm the worktree on the claim: {error:#}");
     }
+    // Report the recovered tip without persisting it as the cleanup base.
+    let (base, base_sha) = if !has_branch && has_remote {
+        let sha = run_ok(
+            tools,
+            "git",
+            repo_root,
+            &["rev-parse", "--verify", &remote_ref],
+        )?;
+        (remote_ref, sha)
+    } else {
+        (base, base_sha)
+    };
     Ok(if existing {
         SetupOutcome::Existing { plan }
     } else {

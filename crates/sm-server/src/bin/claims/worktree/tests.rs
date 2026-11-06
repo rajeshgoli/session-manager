@@ -449,3 +449,60 @@ fn missing_worktree_recovers_pushed_branch_and_preserves_recorded_base() {
     assert!(result.line().contains(&pushed[..7]));
     fs::remove_dir_all(c.dir).unwrap();
 }
+
+#[test]
+fn recovery_without_recorded_worktree_keeps_starting_base_and_prunes_deleted_remote() {
+    let c = checkout();
+    let root = c.dir.join("worktrees");
+    let plan = plan_worktree(1452, &claim(&root, None).title, None, &root, "sm").unwrap();
+    let seed = c.dir.join("seed");
+    git(&seed, &["checkout", "-b", &plan.branch]);
+    git(
+        &seed,
+        &["commit", "-q", "--allow-empty", "-m", "unmerged work"],
+    );
+    git(&seed, &["push", "origin", &plan.branch]);
+    let pushed = git(&seed, &["rev-parse", "HEAD"]);
+    let mut recorder = Recorded::default();
+    setup_worktree(
+        &ProcessTools,
+        &c.checkout,
+        &claim(&root, None),
+        None,
+        Some("origin/main"),
+        &mut recorder,
+    )
+    .unwrap();
+    assert_eq!(git(&plan.path, &["rev-parse", "HEAD"]), pushed);
+    assert!(recorder.calls.iter().all(|call| call.3 == c.origin_head));
+    assert_ne!(
+        recorder.calls[0].3, pushed,
+        "unmerged work is not an empty cleanup base"
+    );
+
+    git(
+        &c.checkout,
+        &["worktree", "remove", plan.path.to_str().unwrap()],
+    );
+    git(&c.checkout, &["branch", "-D", &plan.branch]);
+    git(&seed, &["push", "origin", "--delete", &plan.branch]);
+    // The checkout still has the cached remote ref until setup fetches/prunes.
+    assert_eq!(
+        git(
+            &c.checkout,
+            &["rev-parse", &format!("origin/{}", plan.branch)]
+        ),
+        pushed
+    );
+    setup_worktree(
+        &ProcessTools,
+        &c.checkout,
+        &claim(&root, None),
+        None,
+        Some("origin/main"),
+        &mut Recorded::default(),
+    )
+    .unwrap();
+    assert_eq!(git(&plan.path, &["rev-parse", "HEAD"]), c.origin_head);
+    fs::remove_dir_all(c.dir).unwrap();
+}
