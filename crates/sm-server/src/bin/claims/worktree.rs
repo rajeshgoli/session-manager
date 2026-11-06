@@ -445,10 +445,28 @@ pub(crate) fn setup_worktree(
         }
         None => plan_worktree(claim.number, &claim.title, slug, &root, &claim.prefix)?,
     };
-    let fetch = tools.run("git", repo_root, &["fetch", "origin"])?;
+    let fetch = tools.run("git", repo_root, &["fetch", "--prune", "origin"])?;
     if !fetch.success {
         bail!("git fetch origin failed: {}", fetch.stderr);
     }
+    // Prefer the ticket's own commits over the requested starting base.
+    // The fetch above must succeed before absence of a remote ref is trusted.
+    let local_ref = format!("refs/heads/{}", plan.branch);
+    let remote_ref = format!("refs/remotes/origin/{}", plan.branch);
+    let has_branch = tools
+        .run(
+            "git",
+            repo_root,
+            &["show-ref", "--verify", "--quiet", &local_ref],
+        )?
+        .success;
+    let has_remote = tools
+        .run(
+            "git",
+            repo_root,
+            &["show-ref", "--verify", "--quiet", &remote_ref],
+        )?
+        .success;
     let base = match base_flag.map(str::trim).filter(|base| !base.is_empty()) {
         Some(base) => base.to_owned(),
         None => run_ok(
@@ -480,24 +498,30 @@ pub(crate) fn setup_worktree(
     } else {
         false
     };
-    let recorded_base = (!existing).then_some(base_sha.as_str());
+    let recorded_base = (!existing && claim.recorded.is_none()).then_some(base_sha.as_str());
     recorder
         .record("intent", &plan, recorded_base)
         .context("could not record the worktree on the claim; nothing was created")?;
     if !existing {
-        let branch_ref = format!("refs/heads/{}", plan.branch);
-        let has_branch = tools
-            .run(
-                "git",
-                repo_root,
-                &["show-ref", "--verify", "--quiet", &branch_ref],
-            )?
-            .success;
         let add = if has_branch {
             tools.run(
                 "git",
                 repo_root,
                 &["worktree", "add", &path_text, &plan.branch],
+            )?
+        } else if has_remote {
+            tools.run(
+                "git",
+                repo_root,
+                &[
+                    "worktree",
+                    "add",
+                    "--track",
+                    "-b",
+                    &plan.branch,
+                    &path_text,
+                    &remote_ref,
+                ],
             )?
         } else {
             tools.run(
@@ -515,6 +539,18 @@ pub(crate) fn setup_worktree(
     if let Err(error) = recorder.record("created", &plan, recorded_base) {
         eprintln!("Warning: could not confirm the worktree on the claim: {error:#}");
     }
+    // Report the recovered tip without persisting it as the cleanup base.
+    let (base, base_sha) = if !has_branch && has_remote {
+        let sha = run_ok(
+            tools,
+            "git",
+            repo_root,
+            &["rev-parse", "--verify", &remote_ref],
+        )?;
+        (remote_ref, sha)
+    } else {
+        (base, base_sha)
+    };
     Ok(if existing {
         SetupOutcome::Existing { plan }
     } else {
