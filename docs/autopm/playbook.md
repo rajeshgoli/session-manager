@@ -22,6 +22,10 @@ merge or drop the weakest entries. Keep these six sections.
 - Decision cards for stalled doc asks: 18 of 154 asks waited ≥4 h, 5 of them overnight; ask load barely moves
   the rate (11% → 16%); 3 of 71 in Oct 9–23. Dropped before planning. (readout 2026-W43)
 - A push class for awaited replies: those replies are already read fastest (1–3 min). Dropped. (readout 2026-W43)
+- Reserving memory from a repeat job's earlier peak: 26 of 96 repeat jobs declaring ≥64 GiB exceeded 1.5× their
+  prior peak; small jobs fit (92%) but were not the blockers. Dropped. (readout 2026-W46)
+- Manual queue starts are episodic, not standing: 178 in Oct 19–Nov 1, 1 in Nov 2–9 despite 269 memory-held
+  jobs. Check a burst's next week before planning on it. (readout 2026-W46)
 
 ## Rules
 - Never infer disuse or backlog from stored state; check activity by surface. (two misreadings, session 8bbcb31a, 2026-10-15)
@@ -45,7 +49,5 @@ merge or drop the weakest entries. Keep these six sections.
   get killed (#2507; 29 memory-pressure kills Oct 19–Nov 2, 28 in fractal-algo-rust). (readout 2026-W45)
 
 ## Open hypotheses
-1. Queue memory: a repeat job's own earlier peak predicts its use (renders declare 16–28 GiB, use 1–7), so sm
-   could reserve less without admitting anything before a past kill. Test on 30 days of job samples. (readout 2026-W45)
-2. At-desk pushes are redundant: now `x-2026w44-desk-push-hold`, replay drops 62 of 79 held; asked 2026-11-02.
+1. At-desk pushes are redundant: now `x-2026w44-desk-push-hold`, replay drops 62 of 79 held; asked 2026-11-02.
    (readout 2026-W45)
