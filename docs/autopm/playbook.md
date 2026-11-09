@@ -30,6 +30,8 @@ merge or drop the weakest entries. Keep these six sections.
 ## Rules
 - Never infer disuse or backlog from stored state; check activity by surface. (two misreadings, session 8bbcb31a, 2026-10-15)
 - Hide a feature only after 30 days of zero use on every surface. (Auto PM spec B.3, 2026-10-15)
+- Act without Rajesh: pick changes that ship behind a switch, not ones needing his yes, and never hand him a
+  next step. x-2026w44 was asked Nov 2, opened, unanswered. (his review of readout 2026-W46, 2026-11-09)
 - Exclude web `owner_events` before 2026-10-15 22:00 PDT: a tab loaded before the header deploy logged
   minute polls as inbox and queue opens. (readout 2026-W42)
 - Exclude `doc.head` rows written before #2517 deploys: the doc reader's 60 s revision poll, 7% of rows.
