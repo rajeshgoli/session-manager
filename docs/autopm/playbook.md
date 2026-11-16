@@ -15,6 +15,8 @@ merge or drop the weakest entries. Keep these six sections.
   in 10–14 min. Does doc reviews mostly on web: 71 web, 16 Android, Oct 16–23. (readout 2026-W43)
 - Overrides the queue by hand in bursts: 178 Start presses Oct 19–Nov 1 on four days; 87 on jobs held for memory
   another running job had declared, 62 on concurrency limits. No kill followed. (readout 2026-W45)
+- Works mainly in the web terminal: 1,066 terminal switches across 162 sessions Nov 2–16; scanning bursts
+  of 3+ quick switches are modest (83 in two weeks). (readout 2026-W47)
 
 ## What worked
 
@@ -26,6 +28,8 @@ merge or drop the weakest entries. Keep these six sections.
   prior peak; small jobs fit (92%) but were not the blockers. Dropped. (readout 2026-W46)
 - Manual queue starts are episodic, not standing: 178 in Oct 19–Nov 1, 1 in Nov 2–9 despite 269 memory-held
   jobs. Check a burst's next week before planning on it. (readout 2026-W46)
+- Holding pushes while he is at his desk: asked 2026-11-02, opened, never answered; sm abandoned it 2026-11-16
+  and its build (PR #2536) closed unmerged. (readout 2026-W47)
 
 ## Rules
 - Never infer disuse or backlog from stored state; check activity by surface. (two misreadings, session 8bbcb31a, 2026-10-15)
@@ -49,7 +53,13 @@ merge or drop the weakest entries. Keep these six sections.
   `-readonly` (it runs in WAL mode, so never `cp`). Queue jobs: `queue-runner/queue_runner.db`. (2026-11-02)
 - Treat a change that loosens queue memory admission as ask-only in practice: it decides whether trading jobs
   get killed (#2507; 29 memory-pressure kills Oct 19–Nov 2, 28 in fractal-algo-rust). (readout 2026-W45)
+- Rank owner actions by p90 `duration_ms` (handler time) to find waits he feels: retire's 10 s cleanup wait
+  showed as p90 10.1 s (x-2026w47-retire-no-wait). (readout 2026-W47)
+- `note.search` rows follow each note autosave, not an owner search; Android logged 1,901 doc-screen rows as
+  nav on 2026-11-02 (23–36 on other days). Exclude both from counts. (readout 2026-W47)
+- After `sm autopm start`, move the experiment `planned → building` yourself; sm moves only
+  `building → dark`, on its timer. x-2026w47 sat in planned after its build deployed. (2026-11-16)
 
 ## Open hypotheses
-1. At-desk pushes are redundant: now `x-2026w44-desk-push-hold`, replay drops 62 of 79 held; asked 2026-11-02.
-   (readout 2026-W45)
+1. Board open and start-from-board are slow in the tail: p90 4.1 s and 4.6 s, Nov 2–15. Find where the time
+   goes before planning. (readout 2026-W47)
