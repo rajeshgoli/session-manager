@@ -14,7 +14,9 @@
 
 use super::claims::work_claim_store;
 use super::*;
-use crate::work_claims::worktrees::{rebuild_worktree, WorktreeRebuild};
+use crate::work_claims::worktrees::{
+    cleanup_lock, rebuild_worktree, rebuild_worktree_locked, WorktreeRebuild,
+};
 
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 /// Providers History can restore; others are never auto-retired.
@@ -364,6 +366,9 @@ pub(super) fn restore_session_with_work(
     state: &AppState,
     session_id: &str,
 ) -> Result<SessionRecord, ApiError> {
+    let _cleanup_guard = cleanup_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(before) = state.session_store.get_session(session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
@@ -371,7 +376,7 @@ pub(super) fn restore_session_with_work(
     let mut note = None;
     if before.is_stopped() && is_primary_node(&before.node) {
         let working_dir = expand_home(&before.working_dir).display().to_string();
-        match rebuild_worktree(
+        match rebuild_worktree_locked(
             &work_claim_store(state),
             &before.id,
             &working_dir,

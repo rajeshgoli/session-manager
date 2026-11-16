@@ -505,6 +505,10 @@ pub(super) async fn post_leave(
             if_finished_idle: false,
         },
         owner,
+        RetireCleanupPolicy {
+            allow_no_wait: false,
+            wait: worktrees::RETIRE_CLEANUP_WAIT,
+        },
     )
     .await?;
     if let Some(error) = retired.get("error") {

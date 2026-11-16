@@ -222,6 +222,16 @@ fn question_text(
 /// A reader has no ticket claim, so ordinary claim-worktree cleanup does not
 /// see its detached checkout. Preserve it if the reader changed files.
 pub(super) fn cleanup_reader_worktree(state: &AppState, session_id: &str) -> anyhow::Result<()> {
+    let _cleanup_guard = crate::work_claims::worktrees::cleanup_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state
+        .session_store
+        .get_session(session_id)?
+        .is_some_and(|session| !session.is_stopped())
+    {
+        return Ok(());
+    }
     let Some(path) = docs::owner_doc_store(state).reader_worktree_for_session(session_id)? else {
         return Ok(());
     };
@@ -414,6 +424,84 @@ pub(super) async fn send(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_reader_cleanup_preserves_a_restored_reader() {
+        let base = std::env::temp_dir().join(format!(
+            "sm-reader-cleanup-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let root = base.join("repo");
+        let checkout = base.join("reader");
+        fs::create_dir_all(&root).unwrap();
+        let git = |dir: &StdPath, args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "Test"]);
+        fs::write(root.join("memo.html"), "memo").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "first"]);
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+        checkout_reader_worktree(&root, &checkout, &head).unwrap();
+
+        let state_file = base.join("sessions.json");
+        fs::write(
+            &state_file,
+            json!({"sessions": [{
+                "id": "reader1", "name": "reader1", "working_dir": checkout,
+                "tmux_session": "reader1", "provider": "claude", "status": "stopped",
+                "completion_status": "retired", "completed_at": "2026-11-01T00:00:00Z",
+                "created_at": "2026-10-01T00:00:00Z", "last_activity": "2026-11-01T00:00:00Z"
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut config = AppConfig::default();
+        config.paths.state_file = state_file.display().to_string();
+        config.sm_send.db_path = base.join("queue.db").display().to_string();
+        config.rust_core.fixture_writes_enabled = true;
+        let state = AppState::new(config);
+        let conn = rusqlite::Connection::open(base.join("queue.db")).unwrap();
+        crate::owner_docs::init_owner_docs_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO owner_docs (id, repo, path, author_session_id, title, created_at, updated_at)
+             VALUES ('doc1', 'acme/repo', 'memo.html', 'author1', 'Memo', ?1, ?1)",
+            ["2026-11-01T00:00:00Z"],
+        )
+        .unwrap();
+        let docs = docs::owner_doc_store(&state);
+        docs.set_reader("doc1", "reader1", checkout.to_str().unwrap())
+            .unwrap();
+
+        cleanup_reader_worktree(&state, "reader1").unwrap();
+        assert!(!checkout.exists(), "stopped reader was not cleaned up");
+        checkout_reader_worktree(&root, &checkout, &head).unwrap();
+        let restored = auto_retire::restore_session_with_work(&state, "reader1").unwrap();
+        assert!(!restored.is_stopped());
+        cleanup_reader_worktree(&state, "reader1").unwrap();
+        assert!(checkout.exists(), "late cleanup removed a live reader");
+        git(&root, &["worktree", "remove", checkout.to_str().unwrap()]);
+        fs::remove_dir_all(base).unwrap();
+    }
     #[test]
     fn live_author_takes_priority_and_ended_author_does_not() {
         assert_eq!(choose_default(false), "reader");

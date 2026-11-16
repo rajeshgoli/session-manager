@@ -2251,6 +2251,10 @@ pub(super) async fn post_owner_doc_subpath(
             headers,
             payload,
             None,
+            super::RetireCleanupPolicy {
+                allow_no_wait: false,
+                wait: super::worktrees::RETIRE_CLEANUP_WAIT,
+            },
         )
         .await?
         .into_response());

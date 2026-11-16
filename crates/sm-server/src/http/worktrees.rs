@@ -14,7 +14,7 @@ use super::*;
 use crate::work_claims::{
     worktrees::{
         delete_leftover, keep_path_key, keep_pr_refs, leftover_build_dirs, leftover_worktrees,
-        run_worktree_cleanup, CleanupProgress, CleanupRequest, CleanupSession, DeleteScope,
+        run_worktree_cleanup_locked, CleanupProgress, CleanupRequest, CleanupSession, DeleteScope,
         WorktreeOutcome, RECHECK_INTERVAL,
     },
     WorkKind, MAX_ALIASES_PER_QUERY,
@@ -22,7 +22,7 @@ use crate::work_claims::{
 
 /// How long `sm retire` waits for its worktree results; the rest report
 /// `cleanup pending` and finish in the background.
-const RETIRE_CLEANUP_WAIT: Duration = Duration::from_secs(10);
+pub(super) const RETIRE_CLEANUP_WAIT: Duration = Duration::from_secs(10);
 const CLEANUP_PENDING: &str = "cleanup pending";
 
 use crate::work_claims::worktrees::loose;
@@ -461,14 +461,20 @@ fn cleanup_sessions(state: &AppState) -> anyhow::Result<Vec<CleanupSession>> {
 /// every sync pass.
 pub(super) fn run_cleanup_pass(state: &AppState) -> anyhow::Result<()> {
     refresh_keep_prs(state);
-    let sessions = cleanup_sessions(state)?;
-    run_worktree_cleanup(
-        &work_claim_store(state),
-        CleanupRequest {
-            sessions: &sessions,
-            ..CleanupRequest::default()
-        },
-    )?;
+    let sessions = {
+        let _cleanup_guard = crate::work_claims::worktrees::cleanup_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sessions = cleanup_sessions(state)?;
+        run_worktree_cleanup_locked(
+            &work_claim_store(state),
+            CleanupRequest {
+                sessions: &sessions,
+                ..CleanupRequest::default()
+            },
+        )?;
+        sessions
+    };
     static LAST_LOOSE: StdMutex<Option<Instant>> = StdMutex::new(None);
     let mut last = LAST_LOOSE.lock().unwrap_or_else(|p| p.into_inner());
     if last.is_some_and(|at| at.elapsed() < RECHECK_INTERVAL) {
@@ -562,30 +568,27 @@ pub(super) async fn cleanup_after_retire(
     state: &Arc<AppState>,
     session_id: &str,
 ) -> Vec<WorktreeOutcome> {
-    if !expand_home(&state.config.sm_send.db_path).exists() {
+    cleanup_after_retire_with_wait(state, session_id, RETIRE_CLEANUP_WAIT).await
+}
+
+pub(super) async fn cleanup_after_retire_with_wait(
+    state: &Arc<AppState>,
+    session_id: &str,
+    wait: Duration,
+) -> Vec<WorktreeOutcome> {
+    let Some((progress, task)) = spawn_cleanup_after_retire(state, session_id) else {
         return Vec::new();
-    }
-    let progress = Arc::new(StdMutex::new(CleanupProgress::default()));
-    let task_state = state.clone();
-    let task_progress = progress.clone();
-    let task_session = session_id.to_owned();
-    let task = tokio::task::spawn_blocking(move || {
-        if let Err(error) = super::ask::cleanup_reader_worktree(&task_state, &task_session) {
-            eprintln!("reader worktree cleanup after retiring {task_session} failed: {error:#}");
-        }
-        refresh_open_prs(&task_state, &task_session);
-        let sessions = cleanup_sessions(&task_state)?;
-        run_worktree_cleanup(
-            &work_claim_store(&task_state),
-            CleanupRequest {
-                sessions: &sessions,
-                first: Some(&task_session),
-                progress: Some(&task_progress),
-                recheck_after: None,
-            },
-        )
-    });
-    match tokio::time::timeout(RETIRE_CLEANUP_WAIT, task).await {
+    };
+    wait_for_cleanup(progress, task, session_id, wait).await
+}
+
+async fn wait_for_cleanup(
+    progress: Arc<StdMutex<CleanupProgress>>,
+    task: tokio::task::JoinHandle<anyhow::Result<Vec<WorktreeOutcome>>>,
+    session_id: &str,
+    wait: Duration,
+) -> Vec<WorktreeOutcome> {
+    match tokio::time::timeout(wait, task).await {
         Ok(Ok(Err(error))) => {
             eprintln!("worktree cleanup after retiring {session_id} failed: {error:#}")
         }
@@ -617,6 +620,66 @@ pub(super) async fn cleanup_after_retire(
         .collect()
 }
 
+/// Start identical cleanup without holding the owner retire response open.
+pub(super) fn start_cleanup_after_retire(state: &Arc<AppState>, session_id: &str) {
+    let Some((_, task)) = spawn_cleanup_after_retire(state, session_id) else {
+        return;
+    };
+    finish_cleanup_in_background(task, session_id.to_owned());
+}
+
+fn finish_cleanup_in_background(
+    task: tokio::task::JoinHandle<anyhow::Result<Vec<WorktreeOutcome>>>,
+    session_id: String,
+) {
+    tokio::spawn(async move {
+        match task.await {
+            Ok(Err(error)) => {
+                eprintln!("worktree cleanup after retiring {session_id} failed: {error:#}")
+            }
+            Err(error) => {
+                eprintln!("worktree cleanup task after retiring {session_id} failed: {error}")
+            }
+            _ => {}
+        }
+    });
+}
+
+type RetireCleanupTask = tokio::task::JoinHandle<anyhow::Result<Vec<WorktreeOutcome>>>;
+
+fn spawn_cleanup_after_retire(
+    state: &Arc<AppState>,
+    session_id: &str,
+) -> Option<(Arc<StdMutex<CleanupProgress>>, RetireCleanupTask)> {
+    if !expand_home(&state.config.sm_send.db_path).exists() {
+        return None;
+    }
+    let progress = Arc::new(StdMutex::new(CleanupProgress::default()));
+    let task_state = state.clone();
+    let task_progress = progress.clone();
+    let task_session = session_id.to_owned();
+    let task = tokio::task::spawn_blocking(move || {
+        if let Err(error) = super::ask::cleanup_reader_worktree(&task_state, &task_session) {
+            eprintln!("reader worktree cleanup after retiring {task_session} failed: {error:#}");
+        }
+        refresh_open_prs(&task_state, &task_session);
+        let _cleanup_guard = crate::work_claims::worktrees::cleanup_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sessions = cleanup_sessions(&task_state)?;
+        run_worktree_cleanup_locked(
+            &work_claim_store(&task_state),
+            CleanupRequest {
+                sessions: &sessions,
+                first: Some(&task_session),
+                progress: Some(&task_progress),
+                recheck_after: None,
+            },
+        )
+    });
+    Some((progress, task))
+}
+
 /// `worktree_naming` in a ticket claim's response: where
 /// `sm ticket --setup-worktree` puts the worktree.
 pub(super) fn worktree_naming(config: &AppConfig, repo: &str) -> Value {
@@ -624,4 +687,72 @@ pub(super) fn worktree_naming(config: &AppConfig, repo: &str) -> Value {
         "root": config.work_claims.worktree_root_path().display().to_string(),
         "prefix": config.work_claims.worktree_prefix(repo),
     })
+}
+
+#[cfg(test)]
+mod retire_wait_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn waited_cleanup_returns_completed_outcomes() {
+        let outcome = WorktreeOutcome {
+            path: "/tmp/retire-complete-test".to_owned(),
+            removed: true,
+            reason: "removed".to_owned(),
+        };
+        let progress = Arc::new(StdMutex::new(CleanupProgress {
+            first_paths: Some(vec![outcome.path.clone()]),
+            outcomes: vec![outcome.clone()],
+        }));
+        let result = outcome.clone();
+        let task = tokio::spawn(async move { Ok(vec![result]) });
+        assert_eq!(
+            wait_for_cleanup(progress, task, "session", Duration::from_secs(1)).await,
+            vec![outcome]
+        );
+    }
+
+    #[tokio::test]
+    async fn waited_cleanup_reports_pending_then_finishes_without_ten_second_sleep() {
+        let path = "/tmp/retire-wait-test".to_owned();
+        let progress = Arc::new(StdMutex::new(CleanupProgress {
+            first_paths: Some(vec![path.clone()]),
+            outcomes: Vec::new(),
+        }));
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let (done, finished) = tokio::sync::oneshot::channel::<()>();
+        let task_progress = progress.clone();
+        let task = tokio::spawn(async move {
+            held.await.unwrap();
+            let outcome = WorktreeOutcome {
+                path,
+                removed: true,
+                reason: "removed".to_owned(),
+            };
+            task_progress.lock().unwrap().outcomes.push(outcome.clone());
+            done.send(()).unwrap();
+            Ok(vec![outcome])
+        });
+        let response = wait_for_cleanup(progress.clone(), task, "session", Duration::ZERO).await;
+        assert_eq!(response.len(), 1);
+        assert!(!response[0].removed);
+        assert_eq!(response[0].reason, CLEANUP_PENDING);
+        release.send(()).unwrap();
+        finished.await.unwrap();
+        assert!(progress.lock().unwrap().outcomes[0].removed);
+    }
+
+    #[tokio::test]
+    async fn unawaited_cleanup_still_finishes() {
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let (done, finished) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            held.await.unwrap();
+            done.send(()).unwrap();
+            Ok(Vec::new())
+        });
+        finish_cleanup_in_background(task, "session".to_owned());
+        release.send(()).unwrap();
+        finished.await.unwrap();
+    }
 }
