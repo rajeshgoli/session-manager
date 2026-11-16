@@ -366,7 +366,7 @@ pub(super) fn restore_session_with_work(
     state: &AppState,
     session_id: &str,
 ) -> Result<SessionRecord, ApiError> {
-    let _cleanup_guard = cleanup_lock()
+    let cleanup_guard = cleanup_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(before) = state.session_store.get_session(session_id)? else {
@@ -436,9 +436,6 @@ pub(super) fn restore_session_with_work(
             })
         }
     };
-    if runtime_enabled {
-        wait_for_restored_input(state, &session);
-    }
     if let Some(retired_at) = before
         .completed_at
         .as_deref()
@@ -449,6 +446,10 @@ pub(super) fn restore_session_with_work(
             Ok(_) => {}
             Err(error) => eprintln!("reopening the claims of {session_id} failed: {error:#}"),
         }
+    }
+    drop(cleanup_guard);
+    if runtime_enabled {
+        wait_for_restored_input(state, &session);
     }
     if let Some(note) = note {
         if let Err(error) = RetainedQueueStore::new(expand_home(&state.config.sm_send.db_path))
