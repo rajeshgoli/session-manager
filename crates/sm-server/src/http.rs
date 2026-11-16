@@ -12265,11 +12265,22 @@ async fn arm_stop_notify(
 }
 
 async fn retire_session(
+    state: State<Arc<AppState>>,
+    session_id: Path<String>,
+    peer_addr: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    payload: Json<RetireSessionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    retire_session_inner(state, session_id, peer_addr, headers, payload, true).await
+}
+
+async fn retire_session_inner(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<RetireSessionRequest>,
+    allow_no_wait: bool,
 ) -> Result<Json<Value>, ApiError> {
     let web_owner = owner_web_guard(&state, &headers, Some(peer_addr), "POST")?;
     if web_owner.is_none() {
@@ -12281,7 +12292,25 @@ async fn retire_session(
         )?;
     }
     ensure_core_writes_enabled(&state)?;
-    retire_session_after_auth(state, session_id, peer_addr, headers, payload, web_owner).await
+    retire_session_after_auth(
+        state,
+        session_id,
+        peer_addr,
+        headers,
+        payload,
+        web_owner,
+        RetireCleanupPolicy {
+            allow_no_wait,
+            wait: worktrees::RETIRE_CLEANUP_WAIT,
+        },
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct RetireCleanupPolicy {
+    allow_no_wait: bool,
+    wait: Duration,
 }
 
 async fn retire_session_after_auth(
@@ -12291,12 +12320,20 @@ async fn retire_session_after_auth(
     headers: HeaderMap,
     payload: RetireSessionRequest,
     web_owner: Option<String>,
+    cleanup_policy: RetireCleanupPolicy,
 ) -> Result<Json<Value>, ApiError> {
     let requester_session_id = payload
         .requester_session_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let no_wait = retire_without_cleanup_wait(
+        cleanup_policy.allow_no_wait,
+        requester_session_id,
+        state.autopm_switches.is_on("autopm.retire-no-wait"),
+        owner_events::from_agent(&headers),
+        owner_events::owner_surface(&state, &headers, Some(peer_addr)).map(|(surface, _)| surface),
+    );
     let (authority, session_credential) = match requester_session_id {
         Some(requester_session_id) => (
             RetireAuthority::authenticated_parent(requester_session_id),
@@ -12351,8 +12388,19 @@ async fn retire_session_after_auth(
                 eprintln!("retired session {session_id} but BTW teardown failed: {error:#}");
             }
             let mut response = serde_json::to_value(result)?;
-            response["worktrees"] =
-                serde_json::to_value(worktrees::cleanup_after_retire(&state, &session_id).await)?;
+            response["worktrees"] = if no_wait {
+                worktrees::start_cleanup_after_retire(&state, &session_id);
+                json!([])
+            } else {
+                serde_json::to_value(
+                    worktrees::cleanup_after_retire_with_wait(
+                        &state,
+                        &session_id,
+                        cleanup_policy.wait,
+                    )
+                    .await,
+                )?
+            };
             Ok(Json(response))
         }
         CoreRetireOutcome::PreconditionFailed => Err(ApiError::Status {
@@ -12380,6 +12428,20 @@ async fn retire_session_after_auth(
     }
 }
 
+fn retire_without_cleanup_wait(
+    allow_no_wait: bool,
+    requester_session_id: Option<&str>,
+    switch_on: bool,
+    from_agent: bool,
+    surface: Option<&str>,
+) -> bool {
+    allow_no_wait
+        && requester_session_id.is_none()
+        && switch_on
+        && !from_agent
+        && matches!(surface, Some("web" | "android"))
+}
+
 async fn retire_session_legacy(
     state: State<Arc<AppState>>,
     session_id: Path<String>,
@@ -12387,7 +12449,8 @@ async fn retire_session_legacy(
     headers: HeaderMap,
     payload: Json<RetireSessionRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(mut response) = retire_session(state, session_id, peer_addr, headers, payload).await?;
+    let Json(mut response) =
+        retire_session_inner(state, session_id, peer_addr, headers, payload, false).await?;
     if response.get("status").and_then(Value::as_str) == Some("retired") {
         response["status"] = Value::String("killed".to_owned());
     }
@@ -18585,6 +18648,224 @@ mod tests {
     use serde::Serialize;
     use std::{env, fs, process};
     use tower::ServiceExt;
+
+    #[test]
+    fn only_owner_app_retires_can_skip_cleanup_wait() {
+        assert!(retire_without_cleanup_wait(
+            true,
+            None,
+            true,
+            false,
+            Some("web")
+        ));
+        assert!(retire_without_cleanup_wait(
+            true,
+            None,
+            true,
+            false,
+            Some("android")
+        ));
+        assert!(!retire_without_cleanup_wait(
+            true,
+            Some("parent-session"),
+            true,
+            false,
+            Some("web")
+        ));
+        assert!(!retire_without_cleanup_wait(
+            true,
+            None,
+            false,
+            false,
+            Some("web")
+        ));
+        assert!(!retire_without_cleanup_wait(
+            true,
+            None,
+            true,
+            true,
+            Some("web")
+        ));
+        assert!(!retire_without_cleanup_wait(true, None, true, false, None));
+        assert!(!retire_without_cleanup_wait(
+            true,
+            None,
+            true,
+            false,
+            Some("guest")
+        ));
+        assert!(!retire_without_cleanup_wait(
+            false,
+            None,
+            true,
+            false,
+            Some("web")
+        ));
+    }
+
+    #[tokio::test]
+    async fn owner_retire_skips_wait_but_finishes_reader_cleanup() {
+        for (surface, switch_on, expect_fast) in [
+            ("web", true, true),
+            ("android", true, true),
+            ("web", false, false),
+            ("loopback", true, false),
+        ] {
+            let base = env::temp_dir().join(format!(
+                "sm-retire-no-wait-{}-{}",
+                process::id(),
+                OffsetDateTime::now_utc().unix_timestamp_nanos()
+            ));
+            let repo = base.join("repo");
+            let checkout = base.join("reader");
+            fs::create_dir_all(&repo).unwrap();
+            let git = |args: &[&str]| {
+                let output = process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            };
+            git(&["init", "-q"]);
+            git(&["config", "user.email", "test@example.com"]);
+            git(&["config", "user.name", "Test"]);
+            fs::write(repo.join("memo"), "memo").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", "first"]);
+            git(&[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                checkout.to_str().unwrap(),
+            ]);
+            let state_file = base.join("sessions.json");
+            fs::write(
+                &state_file,
+                json!({"sessions": [{
+                    "id": "reader1", "name": "reader1", "working_dir": checkout,
+                    "tmux_session": "reader1", "provider": "claude", "status": "running",
+                    "created_at": "2026-10-01T00:00:00Z", "last_activity": "2026-11-01T00:00:00Z"
+                }]})
+                .to_string(),
+            )
+            .unwrap();
+            let mut config = google_auth_config();
+            config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+            config.paths.state_file = state_file.display().to_string();
+            config.sm_send.db_path = base.join("queue.db").display().to_string();
+            config.rust_core.fixture_writes_enabled = true;
+            let state = Arc::new(AppState::new(config));
+            seed_cloudflare_access_jwks(&state);
+            let conn = Connection::open(&state.config.sm_send.db_path).unwrap();
+            crate::owner_docs::init_owner_docs_schema(&conn).unwrap();
+            conn.execute("INSERT INTO owner_docs (id, repo, path, author_session_id, title, created_at, updated_at)
+                          VALUES ('doc1', 'acme/repo', 'memo', 'author1', 'Memo', ?1, ?1)",
+                ["2026-11-01T00:00:00Z"]).unwrap();
+            docs::owner_doc_store(&state)
+                .set_reader("doc1", "reader1", checkout.to_str().unwrap())
+                .unwrap();
+            let conn = autopm::store(&state).open().unwrap();
+            conn.execute(
+                "INSERT INTO experiment_switches VALUES
+                ('autopm.retire-no-wait', 'test-retire', 1, 0, 1, 'test', NULL)",
+                [],
+            )
+            .unwrap();
+            state.autopm_switches.reload(&conn).unwrap();
+            state.autopm_switches.set_enabled(switch_on);
+
+            let mut headers = HeaderMap::new();
+            let peer = if surface == "loopback" {
+                headers.insert("host", "localhost:8420".parse().unwrap());
+                SocketAddr::from(([127, 0, 0, 1], 4200))
+            } else if surface == "web" {
+                headers.insert("host", "sm.example.com".parse().unwrap());
+                headers.insert(
+                    "cf-access-jwt-assertion",
+                    test_browser_access_assertion(
+                        "sm-browser-aud",
+                        "rajeshgoli@gmail.com",
+                        4_102_444_800,
+                    )
+                    .parse()
+                    .unwrap(),
+                );
+                SocketAddr::from(([203, 0, 113, 10], 4200))
+            } else {
+                headers.insert("host", "sm-app.example.com".parse().unwrap());
+                let token =
+                    issue_device_access_token(&state.config, "rajeshgoli@gmail.com", "Rajesh")
+                        .unwrap();
+                headers.insert(
+                    AUTHORIZATION,
+                    format!("Bearer {}", token.access_token).parse().unwrap(),
+                );
+                SocketAddr::from(([203, 0, 113, 10], 4200))
+            };
+            if surface != "loopback" {
+                assert_eq!(
+                    owner_events::owner_surface(&state, &headers, Some(peer)).map(|(kind, _)| kind),
+                    Some(surface),
+                    "{surface} owner authentication"
+                );
+                assert!(!owner_events::from_agent(&headers));
+            }
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let _guard = crate::work_claims::worktrees::cleanup_lock()
+                    .lock()
+                    .unwrap();
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            held_rx.recv().unwrap();
+            let started = Instant::now();
+            let Json(response) = retire_session_after_auth(
+                state.clone(),
+                "reader1".to_owned(),
+                peer,
+                headers,
+                RetireSessionRequest {
+                    requester_session_id: None,
+                    if_finished_idle: false,
+                },
+                None,
+                RetireCleanupPolicy {
+                    allow_no_wait: true,
+                    wait: Duration::from_secs(2),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(response["status"], "retired", "{surface}: {response}");
+            assert_eq!(response["worktrees"], json!([]));
+            let elapsed = started.elapsed();
+            assert!(checkout.exists(), "cleanup passed while lock was held");
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            assert_eq!(
+                elapsed < Duration::from_millis(1500),
+                expect_fast,
+                "{surface} switch_on={switch_on} elapsed={elapsed:?}"
+            );
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while checkout.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            fs::remove_dir_all(base).unwrap();
+        }
+    }
 
     const DIRECT_HARNESS_PROBE_ENV: &str = "SM_DIRECT_HARNESS_ISOLATION_PROBE";
 

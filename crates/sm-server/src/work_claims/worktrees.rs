@@ -317,7 +317,7 @@ enum Decision {
     },
 }
 
-fn cleanup_lock() -> &'static Mutex<()> {
+pub(crate) fn cleanup_lock() -> &'static Mutex<()> {
     static LOCK: Mutex<()> = Mutex::new(());
     &LOCK
 }
@@ -354,6 +354,14 @@ pub fn run_worktree_cleanup(
     let _guard = cleanup_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run_worktree_cleanup_locked(store, request)
+}
+
+/// The caller holds `cleanup_lock` while collecting the session snapshot.
+pub(crate) fn run_worktree_cleanup_locked(
+    store: &WorkClaimStore,
+    request: CleanupRequest<'_>,
+) -> Result<Vec<WorktreeOutcome>> {
     let Some(conn) = store.open_existing()? else {
         if let Some(progress) = request.progress {
             lock(progress).first_paths = Some(Vec::new());
@@ -1766,12 +1774,22 @@ pub fn rebuild_worktree(
     working_dir: &str,
     repo_dirs: &[String],
 ) -> std::result::Result<WorktreeRebuild, String> {
-    if Path::new(working_dir).exists() {
-        return Ok(WorktreeRebuild::Present);
-    }
     let _guard = cleanup_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    rebuild_worktree_locked(store, session_id, working_dir, repo_dirs)
+}
+
+/// The caller holds `cleanup_lock` across the worktree check and restore.
+pub(crate) fn rebuild_worktree_locked(
+    store: &WorkClaimStore,
+    session_id: &str,
+    working_dir: &str,
+    repo_dirs: &[String],
+) -> std::result::Result<WorktreeRebuild, String> {
+    if Path::new(working_dir).exists() {
+        return Ok(WorktreeRebuild::Present);
+    }
     let path = missing_path_key(working_dir);
     let gone = || format!("worktree {path} is gone and has no branch to rebuild from");
     let conn = store

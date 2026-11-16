@@ -246,6 +246,140 @@ fn state_with(sessions: Value) -> (AppState, std::path::PathBuf) {
 }
 
 #[test]
+fn restore_waits_for_cleanup_even_when_worktree_is_still_present() {
+    let base = std::env::temp_dir().join(format!(
+        "sm-restore-lock-{}-{}",
+        std::process::id(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    fs::create_dir_all(&base).unwrap();
+    let base = fs::canonicalize(base).unwrap();
+    let main = base.join("main");
+    let working_dir = base.join("worktree");
+    fs::create_dir_all(&main).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    git(&main, &["init", "-q"]);
+    git(&main, &["config", "user.email", "test@example.com"]);
+    git(&main, &["config", "user.name", "Test"]);
+    fs::write(main.join("memo"), "content").unwrap();
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "-qm", "first"]);
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "restore-branch",
+            working_dir.to_str().unwrap(),
+        ],
+    );
+    let git_common_dir = git(
+        &main,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    let (state, state_dir) = state_with(json!([{
+        "id": "restore1", "name": "restore1", "working_dir": working_dir,
+        "tmux_session": "restore1", "provider": "claude", "status": "stopped",
+        "completion_status": "retired", "completed_at": NOW,
+        "created_at": COMPLETED, "last_activity": NOW
+    }]));
+    let state = std::sync::Arc::new(state);
+    let store = work_claim_store(&state);
+    store.ensure_schema().unwrap();
+    let conn = rusqlite::Connection::open(&state.config.sm_send.db_path).unwrap();
+    conn.execute(
+        "INSERT INTO work_claims (id, repo, number, kind, session_id, source, worktree_path,
+         branch, claimed_at, ended_at, end_reason)
+         VALUES ('claim1', 'acme/repo', 1, 'ticket', 'restore1', 'explicit', ?1,
+         'restore-branch', ?2, ?2, 'retired')",
+        rusqlite::params![working_dir.to_str().unwrap(), NOW],
+    )
+    .unwrap();
+    let guard = cleanup_lock().lock().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let work = state.clone();
+    let restore = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        done_tx
+            .send(restore_session_with_work(&work, "restore1"))
+            .unwrap();
+    });
+    started_rx.recv().unwrap();
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "restore returned while cleanup held the lock"
+    );
+    git(
+        &main,
+        &["worktree", "remove", working_dir.to_str().unwrap()],
+    );
+    conn.execute(
+        "INSERT INTO events (ts, kind, session_id, repo, payload)
+         VALUES (?1, 'worktree.removed', 'restore1', 'acme/repo', ?2)",
+        rusqlite::params![
+            NOW,
+            json!({
+                "path": working_dir, "branch": "restore-branch", "git_common_dir": git_common_dir
+            })
+            .to_string()
+        ],
+    )
+    .unwrap();
+    drop(guard);
+    let restored = done_rx.recv().unwrap().unwrap();
+    restore.join().unwrap();
+    assert!(!restored.is_stopped());
+    assert!(
+        working_dir.exists(),
+        "restore did not rebuild the removed worktree"
+    );
+    crate::work_claims::worktrees::run_worktree_cleanup(
+        &store,
+        crate::work_claims::worktrees::CleanupRequest {
+            sessions: &[crate::work_claims::worktrees::CleanupSession {
+                id: restored.id.clone(),
+                name: restored.name.clone(),
+                working_dir: working_dir.display().to_string(),
+                retired: false,
+                stopped: false,
+                retired_at: None,
+                local: true,
+            }],
+            first: Some("restore1"),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        working_dir.exists(),
+        "a later pass removed the restored worktree"
+    );
+    git(
+        &main,
+        &["worktree", "remove", working_dir.to_str().unwrap()],
+    );
+    fs::remove_dir_all(base).unwrap();
+    fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[test]
 fn a_doc_review_wakes_its_auto_retired_author_by_restoring_it() {
     let retired = |id: &str, source: &str| {
         json!({"id": id, "name": id, "working_dir": "/repo", "tmux_session": id,
