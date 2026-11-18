@@ -693,7 +693,7 @@ sm: woke far-1848</div>
 { "kind": "paired", "provider": "codex", "model": "gpt-6-astra", "effort": "high" }   // ticket scope only</code></pre>
 <p>A <code>paired</code> reviewer at any scope other than a ticket is refused with 400, <code>A paired reviewer can only be set on a ticket.</code>, because it needs one author's checkout.</p>
 <ul>
-  <li><code>model</code> must be in <code>GET /client/session-models</code> for that provider (<code>codex-fork</code> for <code>codex</code>).</li>
+  <li><code>model</code> must be in <code>GET /client/session-models</code> for that provider (<code>codex-fork</code> for <code>codex</code>). sm checks a Codex model against that live list when a reviewer is written (<code>PUT /review-policies</code>, <code>PUT /client/settings</code>, Board start, bug-report start), and refuses one it does not list with 400, or 503 when the list cannot be read. A stored reviewer is read back with only a shape check, so a model Codex later drops falls to the next reviewer at review time rather than breaking reads.</li>
   <li><code>effort</code> must be one of Codex's <code>medium high xhigh</code> or Claude's <code>low medium high xhigh max</code>. Claude Code accepts <code>xhigh</code> (A5), which <code>owner_settings.rs</code> <code>CLAUDE_EFFORTS</code> does not list yet; ticket 2 adds it.</li>
   <li>A failed check returns 400 and names the field, as owner settings do.</li>
 </ul>
@@ -703,16 +703,16 @@ sm: woke far-1848</div>
 <thead><tr><th>Chosen</th><th>Tier</th><th>Fallback 1</th><th>Fallback 2</th></tr></thead>
 <tbody>
 <tr><td>GitHub Codex</td><td>—</td><td>Codex run gpt-6-sol, medium</td><td>Claude run opus, high</td></tr>
-<tr><td>Codex run gpt-6-astra (any effort)</td><td>top</td><td>Claude run fable, xhigh</td><td>—</td></tr>
-<tr><td>Codex run gpt-6-sol, gpt-5.6-sol, gpt-5.6-terra, gpt-5.5</td><td>mid</td><td>Claude run opus, high</td><td>—</td></tr>
-<tr><td>Codex run gpt-6-luna, gpt-5.6-luna</td><td>low</td><td>Claude run sonnet, high</td><td>—</td></tr>
+<tr><td>Codex run of a model ending <code>-astra</code>, e.g. gpt-6-astra, gpt-6.2-astra (any effort)</td><td>top</td><td>Claude run fable, xhigh</td><td>—</td></tr>
+<tr><td>Codex run of any other model, e.g. gpt-6-sol, gpt-6.1-terra, gpt-5.5</td><td>mid</td><td>Claude run opus, high</td><td>—</td></tr>
+<tr><td>Codex run of a model ending <code>-luna</code>, e.g. gpt-6-luna, gpt-5.6-luna</td><td>low</td><td>Claude run sonnet, high</td><td>—</td></tr>
 <tr><td>Claude run fable</td><td>top</td><td>Codex run gpt-6-astra, high</td><td>—</td></tr>
 <tr><td>Claude run opus, opus[1m]</td><td>mid</td><td>Codex run gpt-6-sol, medium</td><td>—</td></tr>
 <tr><td>Claude run sonnet, haiku</td><td>low</td><td>Codex run gpt-6-luna, high</td><td>—</td></tr>
 <tr><td>Paired, provider P, model M, effort E</td><td>of M</td><td>P run M, E</td><td>the other provider's run at M's tier, per the rows above</td></tr>
 </tbody>
 </table>
-<p>A model that is not in the table is treated as mid tier. The map is a constant in the review module. It changes with CLAUDE.md's tier table, and is not a setting.</p>
+<p>A Codex model's tier is the CLAUDE.md tier its name ends in, so a new version such as gpt-6.2-astra falls back like gpt-6-astra with no code change. A Claude model not in the table is treated as mid tier. The rule is code in the review module (<code>review::tier</code>), mirrored by the web and phone pickers, and is not a setting.</p>
 <ul>
   <li><b>Default</b>: a new owner-settings key <code>reviews</code> (added to the key list at <code>owner_settings.rs:24</code>):
 <pre><code>"reviews": {

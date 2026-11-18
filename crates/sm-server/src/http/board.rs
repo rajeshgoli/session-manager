@@ -2017,6 +2017,7 @@ pub(super) async fn start(
     let key = ticket_key(&payload.repo, payload.number)?;
     if let Some(reviewer) = &payload.reviewer {
         crate::review::policy::validate("ticket", reviewer).map_err(bad_request)?;
+        super::review_policies::check_reviewer_model(&state, reviewer).await?;
     }
     let checked_key = key.clone();
     let (options, lanes) = blocking(&state, move |state| {

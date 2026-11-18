@@ -330,6 +330,12 @@ as one GitHub review with each comment quoting its sentence, and wakes the
 agent with `[sm review]`. **Ask** puts a question to the document's author,
 who answers in your Inbox.
 
+An agent that forgets to publish is covered for reading: when it runs `sm pr`
+or `sm request-review`, sm publishes each HTML file the PR adds or changes
+under a `docs/` directory that is not published yet (at most three; past that
+it lists them for the agent instead), and tells the agent the `--review`
+command. Only the agent can ask for your review.
+
 ### Rebuild the demo
 
 <https://sm-demo.rajeshgo.li> replays a recorded sprint in this dashboard,

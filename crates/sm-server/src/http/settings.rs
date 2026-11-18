@@ -35,6 +35,10 @@ pub(super) async fn put_settings(
 ) -> Result<Json<Value>, ApiError> {
     board::owner_guard(&state, &headers, peer_addr, "PUT", &uri, true)?;
     ensure_core_writes_enabled(&state)?;
+    // The default reviewer is stored whole, so the patch carries all of it.
+    if let Some(reviewer) = body.get("reviews").and_then(|r| r.get("reviewer")) {
+        review_policies::check_reviewer_model(&state, reviewer).await?;
+    }
     let _launch_guard = if body.get("new_agent").is_some() {
         Some(state.board_auto_start_gate.lock().await)
     } else {

@@ -286,8 +286,10 @@ mod tests {
         // split across rows (#2580) add ~3 KiB.
         // Queue review rows with Next reviewer (#2586) add ~4 KiB.
         // main had since reached 524 KiB; the terminal's needs-you pill (#2591) adds ~2 KiB.
+        // main at 9a327f4 had reached 528.3 KiB unbudgeted; review tiers by
+        // model name (#2674) add under 0.1 KiB.
         // An agent's own review policy in its ⋯ menu (#2672) adds ~2 KiB.
-        const BUDGET: usize = 530 * 1024;
+        const BUDGET: usize = 532 * 1024;
         assert!(
             own <= BUDGET,
             "own JS is {own} bytes (budget {BUDGET}); assets: {:?}",
