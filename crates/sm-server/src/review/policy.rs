@@ -447,7 +447,9 @@ mod tests {
             "A paired reviewer can only be set on a ticket."
         );
         assert!(validate("ticket", &reviewer).is_ok());
-        let bad = json!({"kind":"codex","model":"unknown","effort":"high"});
+        // A well-formed Codex model passes here; the write route checks the
+        // live catalog (#2674). A malformed one fails the shape check.
+        let bad = json!({"kind":"codex","model":"not a model","effort":"high"});
         assert!(validate("ticket", &bad).unwrap_err().contains("model"));
     }
 }

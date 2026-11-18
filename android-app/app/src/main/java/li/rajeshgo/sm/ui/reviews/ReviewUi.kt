@@ -31,20 +31,27 @@ fun defaultRun(provider: String): Reviewer =
 
 private fun run(provider: String, model: String, effort: String) = Reviewer(provider, model = model, effort = effort)
 
+/** A model's tier; Codex models name it last (`gpt-6.2-astra`). Mirrors the server's `review::tier`. */
+fun reviewTier(model: String?): String = when {
+    model == "fable" || model?.endsWith("-astra") == true -> "top"
+    model == "sonnet" || model == "haiku" || model?.endsWith("-luna") == true -> "low"
+    else -> "mid"
+}
+
 /** The fallback after [chosen], as the server computes it (appendix C2). */
 fun reviewFallback(chosen: Reviewer): List<Reviewer> = when (chosen.kind) {
     "github_codex" -> listOf(run("codex", "gpt-6-sol", "medium"), run("claude", "opus", "high"))
     "codex" -> listOf(
-        when (chosen.model) {
-            "gpt-6-astra" -> run("claude", "fable", "xhigh")
-            "gpt-6-luna", "gpt-5.6-luna" -> run("claude", "sonnet", "high")
+        when (reviewTier(chosen.model)) {
+            "top" -> run("claude", "fable", "xhigh")
+            "low" -> run("claude", "sonnet", "high")
             else -> run("claude", "opus", "high")
         },
     )
     "claude" -> listOf(
-        when (chosen.model) {
-            "fable" -> run("codex", "gpt-6-astra", "high")
-            "sonnet", "haiku" -> run("codex", "gpt-6-luna", "high")
+        when (reviewTier(chosen.model)) {
+            "top" -> run("codex", "gpt-6-astra", "high")
+            "low" -> run("codex", "gpt-6-luna", "high")
             else -> run("codex", "gpt-6-sol", "medium")
         },
     )

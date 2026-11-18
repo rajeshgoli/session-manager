@@ -11,25 +11,26 @@ pub mod policy;
 pub const RUBRIC: &str = include_str!("rubric.md");
 pub const SCHEMA: &str = include_str!("schema.json");
 
+/// The shape check of C1. A Codex model only has to look like a model name
+/// here: whether the live Codex catalog lists it is checked where a reviewer
+/// is written ([`codex_model`]), because the catalog comes from a subprocess.
 pub fn validate_reviewer(v: &Value) -> Result<(), String> {
     let kind = v["kind"].as_str().unwrap_or("");
     if kind == "github_codex" && v == &json!({"kind":"github_codex"}) {
         return Ok(());
     }
-    let models: &[&str] = match kind {
-        "codex" => &[
-            "gpt-6-astra",
-            "gpt-6-sol",
-            "gpt-6-luna",
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.5",
-        ],
-        "claude" => &["fable", "opus", "opus[1m]", "sonnet", "haiku"],
+    let model = v["model"].as_str().unwrap_or("");
+    let supported = match kind {
+        "codex" => {
+            (1..=64).contains(&model.len())
+                && model
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        }
+        "claude" => ["fable", "opus", "opus[1m]", "sonnet", "haiku"].contains(&model),
         _ => return Err("reviews.reviewer.kind must be github_codex, codex or claude".into()),
     };
-    if !v["model"].as_str().is_some_and(|m| models.contains(&m)) {
+    if !supported {
         return Err("reviews.reviewer.model is not supported for this provider".into());
     }
     let efforts: &[&str] = if kind == "codex" {
@@ -46,29 +47,61 @@ pub fn validate_reviewer(v: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// A reviewer's Codex model, when it runs on Codex (a Codex run or a paired
+/// Codex reviewer). Writers check it against the live Codex catalog.
+pub fn codex_model(reviewer: &Value) -> Option<&str> {
+    let provider = match reviewer["kind"].as_str() {
+        Some("paired") => reviewer["provider"].as_str(),
+        kind => kind,
+    };
+    (provider == Some("codex"))
+        .then(|| reviewer["model"].as_str())
+        .flatten()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tier {
+    Top,
+    Mid,
+    Low,
+}
+
+/// The CLAUDE.md tier of a model. Codex models name their tier last
+/// (`gpt-6.2-astra`), so a new version keeps its tier without a code change.
+fn tier(model: &str) -> Tier {
+    match model {
+        "fable" => Tier::Top,
+        "sonnet" | "haiku" => Tier::Low,
+        m if m.ends_with("-astra") => Tier::Top,
+        m if m.ends_with("-luna") => Tier::Low,
+        _ => Tier::Mid,
+    }
+}
+
 pub fn chain(chosen: &Value) -> Vec<Value> {
     let run = |kind, model, effort| json!({"kind":kind,"model":model,"effort":effort});
     let mut result = vec![chosen.clone()];
+    let model = chosen["model"].as_str().unwrap_or("");
     match chosen["kind"].as_str() {
         Some("github_codex") => {
             result.push(run("codex", "gpt-6-sol", "medium"));
             result.push(run("claude", "opus", "high"));
         }
-        Some("codex") => result.push(match chosen["model"].as_str() {
-            Some("gpt-6-astra") => run("claude", "fable", "xhigh"),
-            Some("gpt-6-luna" | "gpt-5.6-luna") => run("claude", "sonnet", "high"),
-            _ => run("claude", "opus", "high"),
+        Some("codex") => result.push(match tier(model) {
+            Tier::Top => run("claude", "fable", "xhigh"),
+            Tier::Low => run("claude", "sonnet", "high"),
+            Tier::Mid => run("claude", "opus", "high"),
         }),
-        Some("claude") => result.push(match chosen["model"].as_str() {
-            Some("fable") => run("codex", "gpt-6-astra", "high"),
-            Some("sonnet" | "haiku") => run("codex", "gpt-6-luna", "high"),
-            _ => run("codex", "gpt-6-sol", "medium"),
+        Some("claude") => result.push(match tier(model) {
+            Tier::Top => run("codex", "gpt-6-astra", "high"),
+            Tier::Low => run("codex", "gpt-6-luna", "high"),
+            Tier::Mid => run("codex", "gpt-6-sol", "medium"),
         }),
         Some("paired") => {
             // A run of the same model takes over, then that run's own fallback.
             result.extend(chain(&run(
                 chosen["provider"].as_str().unwrap_or("codex"),
-                chosen["model"].as_str().unwrap_or(""),
+                model,
                 chosen["effort"].as_str().unwrap_or(""),
             )));
         }
@@ -488,6 +521,10 @@ mod tests {
             ("codex", "gpt-6-astra", "fable"),
             ("codex", "gpt-6-luna", "sonnet"),
             ("codex", "new-model", "opus"),
+            // A newer version keeps its tier from the name (#2674).
+            ("codex", "gpt-6.2-astra", "fable"),
+            ("codex", "gpt-6.2-sol", "opus"),
+            ("codex", "gpt-6.3-luna", "sonnet"),
             ("claude", "fable", "gpt-6-astra"),
             ("claude", "haiku", "gpt-6-luna"),
             ("claude", "opus[1m]", "gpt-6-sol"),
@@ -501,6 +538,29 @@ mod tests {
         assert!(!should_skip(None, 95));
         assert!(should_skip(Some(95.0), 95));
     }
+
+    #[test]
+    fn shape_check_takes_any_codex_model_name_and_only_known_claude_models() {
+        let codex = |model: &str| json!({"kind":"codex","model":model,"effort":"high"});
+        assert_eq!(validate_reviewer(&codex("gpt-6.2-astra")), Ok(()));
+        for bad in ["", "gpt 6", "gpt-6;rm"] {
+            assert!(validate_reviewer(&codex(bad)).is_err(), "{bad}");
+        }
+        let claude = json!({"kind":"claude","model":"gpt-6-sol","effort":"high"});
+        assert_eq!(
+            validate_reviewer(&claude),
+            Err("reviews.reviewer.model is not supported for this provider".into())
+        );
+        let paired =
+            json!({"kind":"paired","provider":"codex","model":"gpt-6.2-astra","effort":"high"});
+        assert_eq!(codex_model(&paired), Some("gpt-6.2-astra"));
+        assert_eq!(codex_model(&codex("gpt-6-sol")), Some("gpt-6-sol"));
+        let claude_paired =
+            json!({"kind":"paired","provider":"claude","model":"fable","effort":"high"});
+        assert_eq!(codex_model(&claude_paired), None);
+        assert_eq!(codex_model(&json!({"kind":"github_codex"})), None);
+    }
+
     #[test]
     fn submissions_name_their_first_problem_and_counts_read_like_the_review() {
         assert_eq!(
