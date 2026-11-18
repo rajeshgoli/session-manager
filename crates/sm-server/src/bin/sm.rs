@@ -2619,7 +2619,7 @@ fn run_request_codex_review_create(client: &ApiClient, args: RequestReviewArgs) 
     }
     let payload = codex_review_create_payload(
         pr_number,
-        resolved_repo,
+        resolved_repo.clone(),
         args.steer.as_deref(),
         &effective_notify,
         current_session_id.as_deref(),
@@ -2638,6 +2638,13 @@ fn run_request_codex_review_create(client: &ApiClient, args: RequestReviewArgs) 
     );
     if let Some(warning) = response["claim_warning"].as_str() {
         eprintln!("{warning}");
+    }
+    let repo = response["repo"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or(resolved_repo);
+    if let (Some(session_id), Some(repo)) = (current_session_id.as_deref(), repo.as_deref()) {
+        doc::publish_pr_docs(client, session_id, repo, pr_number);
     }
     print_review_handoff_ask(&response);
     Ok(())

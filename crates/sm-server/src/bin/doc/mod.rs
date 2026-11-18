@@ -534,6 +534,176 @@ pub(crate) fn main_checkout_root(tools: &dyn DocTools, dir: &Path) -> Option<Str
     )
 }
 
+/// More unpublished docs than this in one PR and sm lists them for the agent
+/// instead of publishing: a PR touching many HTML files under `docs/` is
+/// more likely generated output than memos for the owner.
+const MAX_AUTO_PUBLISHED_DOCS: usize = 3;
+
+/// A file a PR changes that is a doc for the owner (sm#2673): HTML in a
+/// `docs/` directory, which is where agents write memos and specs.
+fn is_pr_doc(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let mut dirs = lower.split('/').collect::<Vec<_>>();
+    dirs.pop();
+    (lower.ends_with(".html") || lower.ends_with(".htm")) && dirs.contains(&"docs")
+}
+
+/// The docs an open PR adds or changes at its head, and that head; `None`
+/// when the PR is not open. Removed files are not docs to read.
+fn pr_changed_docs(
+    tools: &dyn DocTools,
+    cwd: &Path,
+    repo: &str,
+    pr: i64,
+) -> Result<Option<(String, Vec<String>)>> {
+    let view = run_ok(
+        tools,
+        "gh",
+        cwd,
+        &[
+            "pr",
+            "view",
+            &pr.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            "headRefOid,state",
+        ],
+    )?;
+    let view: Value = serde_json::from_str(&view).context("gh pr view returned invalid JSON")?;
+    let head = view["headRefOid"].as_str().unwrap_or_default();
+    if view["state"].as_str() != Some("OPEN") || !is_full_sha(head) {
+        return Ok(None);
+    }
+    let files = run_ok(
+        tools,
+        "gh",
+        cwd,
+        &[
+            "api",
+            "--paginate",
+            &format!("repos/{repo}/pulls/{pr}/files?per_page=100"),
+            "--jq",
+            ".[] | select(.status != \"removed\") | .filename",
+        ],
+    )?;
+    let docs = files
+        .lines()
+        .map(str::trim)
+        .filter(|path| is_pr_doc(path))
+        .map(ToOwned::to_owned)
+        .collect();
+    Ok(Some((head.to_ascii_lowercase(), docs)))
+}
+
+fn is_full_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// `changed` less the docs already published from `repo`, retracted ones
+/// included: a retracted doc was hidden on purpose.
+fn unpublished_docs(changed: Vec<String>, published: &Value, repo: &str) -> Vec<String> {
+    let known = published["docs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|doc| doc["repo"].as_str() == Some(repo))
+        .filter_map(|doc| doc["path"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    changed
+        .into_iter()
+        .filter(|path| !known.contains(path.as_str()))
+        .collect()
+}
+
+fn auto_published_line(path: &str, pr: i64, owner: &str, url: &str) -> String {
+    format!(
+        "Published {path} from PR #{pr} for {owner} to read → {url}\n  \
+         sm publishes the HTML docs a PR changes under docs/. To ask {owner} to review it, run: \
+         sm doc publish {path} --pr {pr} --review"
+    )
+}
+
+fn too_many_docs_line(paths: &[String], pr: i64) -> String {
+    format!(
+        "PR #{pr} changes {} HTML docs under docs/ that are not published, too many to publish \
+         on a guess:\n{}\n  Publish each one the owner should read: sm doc publish <path> --pr {pr} \
+         (add --review to ask for a review)",
+        paths.len(),
+        paths
+            .iter()
+            .map(|path| format!("  {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+/// After `sm pr` or `sm request-review` (sm#2673): publish, for the owner to
+/// read, the docs the PR changes that nobody published, so the agent need
+/// not remember `sm doc publish`. It never fails the command it follows.
+pub(crate) fn publish_pr_docs(client: &ApiClient, session_id: &str, repo: &str, pr: i64) {
+    if let Err(error) = try_publish_pr_docs(client, &ProcessTools, session_id, repo, pr) {
+        eprintln!("Could not check PR #{pr} for unpublished docs: {error:#}");
+    }
+}
+
+fn try_publish_pr_docs(
+    client: &ApiClient,
+    tools: &dyn DocTools,
+    session_id: &str,
+    repo: &str,
+    pr: i64,
+) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let Some((head, changed)) = pr_changed_docs(tools, &cwd, repo, pr)? else {
+        return Ok(());
+    };
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let paths = unpublished_docs(
+        changed,
+        &client.get_json("/docs?include_retracted=true")?,
+        repo,
+    );
+    if paths.len() > MAX_AUTO_PUBLISHED_DOCS {
+        eprintln!("{}", too_many_docs_line(&paths, pr));
+        return Ok(());
+    }
+    // Only a checkout of this repo is the doc's checkout (sm#1580).
+    let checkout_root = resolve_repo_slug(tools, &cwd)
+        .ok()
+        .filter(|slug| slug == repo)
+        .and_then(|_| main_checkout_root(tools, &cwd));
+    for path in paths {
+        let published = client.post_json(
+            "/docs",
+            json!({
+                "repo": repo,
+                "path": path,
+                "pr_number": pr,
+                "commit_sha": head,
+                "session_id": session_id,
+                "review": false,
+                "checkout_root": checkout_root,
+            }),
+        );
+        match published {
+            Ok(doc) => println!(
+                "{}",
+                auto_published_line(
+                    &path,
+                    pr,
+                    doc["owner_name"].as_str().unwrap_or("the owner"),
+                    &reader_url(client, &doc)
+                )
+            ),
+            Err(error) => eprintln!("Could not publish {path} from PR #{pr}: {error:#}"),
+        }
+    }
+    Ok(())
+}
+
 fn doc_location(doc: &Value) -> String {
     let mut location = format!("{}:{}", json_string(doc, "repo"), json_string(doc, "path"));
     if let Some(pr) = doc["pr_number"].as_i64() {
@@ -1140,5 +1310,96 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.repo, "acme/mirror");
         assert_eq!(resolved.path, "specs/memo.md");
+    }
+
+    #[test]
+    fn pr_docs_are_html_under_a_docs_directory() {
+        for path in [
+            "docs/working/2673_memo.html",
+            "docs/specs/a.HTML",
+            "web/docs/guide.htm",
+        ] {
+            assert!(is_pr_doc(path), "{path}");
+        }
+        for path in [
+            "docs/product/lessons.md",
+            "web-demo/index.html",
+            "docs.html",
+            "crates/sm-server/src/http/fixtures/page.html",
+            "docs",
+        ] {
+            assert!(!is_pr_doc(path), "{path}");
+        }
+    }
+
+    const VIEW: &str = "gh pr view 7 --repo acme/widgets --json headRefOid,state";
+    const FILES: &str = "gh api --paginate repos/acme/widgets/pulls/7/files?per_page=100 \
+        --jq .[] | select(.status != \"removed\") | .filename";
+
+    #[test]
+    fn pr_changed_docs_reads_the_open_pr_head_and_its_docs() {
+        let root = repo_dir();
+        let tools = FakeTools::default()
+            .with(
+                VIEW,
+                true,
+                &format!(
+                    r#"{{"headRefOid":"{}","state":"OPEN"}}"#,
+                    PR_HEAD.to_uppercase()
+                ),
+            )
+            .with(
+                FILES,
+                true,
+                "src/lib.rs\ndocs/working/memo.html\ndocs/product/lessons.md",
+            );
+        let (head, docs) = pr_changed_docs(&tools, &root, "acme/widgets", 7)
+            .unwrap()
+            .unwrap();
+        assert_eq!(head, PR_HEAD);
+        assert_eq!(docs, vec!["docs/working/memo.html".to_owned()]);
+    }
+
+    #[test]
+    fn pr_changed_docs_skips_a_closed_pr_without_listing_files() {
+        let root = repo_dir();
+        let tools = FakeTools::default().with(
+            VIEW,
+            true,
+            &format!(r#"{{"headRefOid":"{PR_HEAD}","state":"MERGED"}}"#),
+        );
+        assert!(pr_changed_docs(&tools, &root, "acme/widgets", 7)
+            .unwrap()
+            .is_none());
+        assert_eq!(tools.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn unpublished_docs_leaves_out_published_and_retracted_docs_of_the_repo() {
+        let published = json!({"docs": [
+            {"repo": "acme/widgets", "path": "docs/working/old.html"},
+            {"repo": "acme/other", "path": "docs/working/new.html"},
+        ]});
+        let left = unpublished_docs(
+            vec![
+                "docs/working/old.html".to_owned(),
+                "docs/working/new.html".to_owned(),
+            ],
+            &published,
+            "acme/widgets",
+        );
+        assert_eq!(left, vec!["docs/working/new.html".to_owned()]);
+    }
+
+    #[test]
+    fn auto_publish_lines_name_the_review_command() {
+        let line = auto_published_line("docs/working/m.html", 7, "Rajesh", "https://sm/docs/x");
+        assert!(line.starts_with(
+            "Published docs/working/m.html from PR #7 for Rajesh to read → https://sm/docs/x"
+        ));
+        assert!(line.ends_with("sm doc publish docs/working/m.html --pr 7 --review"));
+        let many = too_many_docs_line(&["docs/a.html".to_owned(), "docs/b.html".to_owned()], 7);
+        assert!(many.contains("\n  docs/a.html\n  docs/b.html\n"));
+        assert!(many.contains("sm doc publish <path> --pr 7"));
     }
 }
