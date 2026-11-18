@@ -494,6 +494,7 @@ pub(super) async fn file_bug_report(
         }
         if let Some(reviewer) = &start.reviewer {
             crate::review::policy::validate("ticket", reviewer).map_err(bad_request)?;
+            super::review_policies::check_reviewer_model(&state, reviewer).await?;
         }
     }
     let repo = filing_repo(&state.config)?;

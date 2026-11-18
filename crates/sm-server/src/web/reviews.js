@@ -5,23 +5,24 @@ import { html, api, Seg, Popover } from './ui.js';
 
 export const REVIEW_EFFORTS = { codex: ['medium', 'high', 'xhigh'], claude: ['low', 'medium', 'high', 'xhigh', 'max'] };
 const FIRST = { codex: { model: 'gpt-6-sol', effort: 'medium' }, claude: { model: 'opus', effort: 'high' } };
-const TIERS = { 'gpt-6-astra': 'top', fable: 'top', 'gpt-6-luna': 'low', 'gpt-5.6-luna': 'low', sonnet: 'low', haiku: 'low' };
-export const tier = (model) => TIERS[model] || 'mid';
+/** A model's tier; Codex models name it last (`gpt-6.2-astra`). Mirrors `review::tier`. */
+export function tier(model) {
+  if (model === 'fable' || /-astra$/.test(model || '')) return 'top';
+  if (model === 'sonnet' || model === 'haiku' || /-luna$/.test(model || '')) return 'low';
+  return 'mid';
+}
 const run = (kind, model, effort) => ({ kind, model, effort });
+const OTHER = {
+  codex: { top: run('claude', 'fable', 'xhigh'), mid: run('claude', 'opus', 'high'), low: run('claude', 'sonnet', 'high') },
+  claude: { top: run('codex', 'gpt-6-astra', 'high'), mid: run('codex', 'gpt-6-sol', 'medium'), low: run('codex', 'gpt-6-luna', 'high') },
+};
 
 /** The fallback sm computes for `reviewer`; mirrors `review::chain` (spec 1768 C2). */
 export function reviewFallback(reviewer) {
   if (!reviewer) return [];
   const { kind, model } = reviewer;
   if (kind === 'github_codex') return [run('codex', 'gpt-6-sol', 'medium'), run('claude', 'opus', 'high')];
-  if (kind === 'codex') {
-    return [model === 'gpt-6-astra' ? run('claude', 'fable', 'xhigh')
-      : ['gpt-6-luna', 'gpt-5.6-luna'].includes(model) ? run('claude', 'sonnet', 'high') : run('claude', 'opus', 'high')];
-  }
-  if (kind === 'claude') {
-    return [model === 'fable' ? run('codex', 'gpt-6-astra', 'high')
-      : ['sonnet', 'haiku'].includes(model) ? run('codex', 'gpt-6-luna', 'high') : run('codex', 'gpt-6-sol', 'medium')];
-  }
+  if (kind === 'codex' || kind === 'claude') return [OTHER[kind][tier(model)]];
   if (kind === 'paired') {
     const same = run(reviewer.provider === 'claude' ? 'claude' : 'codex', reviewer.model, reviewer.effort);
     return [same, ...reviewFallback(same)];

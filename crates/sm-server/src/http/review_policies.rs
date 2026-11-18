@@ -26,6 +26,26 @@ fn bad(detail: impl Into<String>) -> ApiError {
     }
 }
 
+/// C1: a reviewer that runs on Codex must name a model the live Codex
+/// catalog lists, the same list `GET /client/session-models?provider=codex-fork`
+/// gives the pickers. Call after the shape check, before storing the reviewer.
+pub(super) async fn check_reviewer_model(
+    state: &AppState,
+    reviewer: &Value,
+) -> Result<(), ApiError> {
+    let Some(model) = crate::review::codex_model(reviewer).map(str::to_owned) else {
+        return Ok(());
+    };
+    let runtime = TmuxRuntime::from_app_config(&state.config);
+    tokio::task::spawn_blocking(move || {
+        runtime.validate_codex_fork_model(&model, &std::env::current_dir()?)
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?
+    // 400 for a model the catalog does not list, 503 when it cannot be read.
+    .map_err(core_session_create_api_error)
+}
+
 fn forbidden(detail: impl Into<String>) -> ApiError {
     ApiError::Status {
         status: StatusCode::FORBIDDEN,
@@ -159,6 +179,7 @@ pub(super) async fn put_policy(
     };
     if let Some(value) = &body.reviewer {
         policy::validate(&body.scope, value).map_err(bad)?;
+        check_reviewer_model(&state, value).await?;
     }
     if let Some(id) = caller.as_deref() {
         let credential = reparent_session_credential(&headers)?;

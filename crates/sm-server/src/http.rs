@@ -23024,10 +23024,15 @@ mod tests {
     /// The browser app on `sm.example.com` over a state with one running
     /// agent, `fork1001`.
     fn owner_web_app() -> Router {
+        owner_web_app_with(|_| {})
+    }
+
+    fn owner_web_app_with(adjust: impl FnOnce(&mut AppConfig)) -> Router {
         let mut config = google_auth_config();
         config.cloudflare_access = cloudflare_access_config().cloudflare_access;
         config.paths.state_file = write_session_state("fork1001", "running");
         config.rust_core.fixture_writes_enabled = true;
+        adjust(&mut config);
         let state = AppState::new(config);
         seed_cloudflare_access_jwks(&state);
         router(state)
@@ -23432,24 +23437,52 @@ mod tests {
 
     #[tokio::test]
     async fn browser_owner_sets_and_reads_review_policies() {
-        let app = owner_web_app();
+        use std::os::unix::fs::PermissionsExt;
+        // The live Codex catalog lists a model newer than any built into sm (#2674).
+        let app = owner_web_app_with(|config| {
+            let command = std::path::Path::new(&config.paths.state_file)
+                .parent()
+                .unwrap()
+                .join("codex");
+            fs::write(
+                &command,
+                "#!/bin/sh\nprintf '%s' '{\"models\":[{\"slug\":\"gpt-6.2-astra\",\"visibility\":\"list\"},{\"slug\":\"gpt-hidden\",\"visibility\":\"hide\"}]}'\n",
+            )
+            .unwrap();
+            fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+            config.codex_fork.command = command.display().to_string();
+        });
         let owner =
             test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
-        let reviewer = json!({"kind": "codex", "model": "gpt-6-astra", "effort": "high"});
-        let request = owner_web_request(
-            Method::PUT,
-            "/review-policies",
-            "sm.example.com",
-            Some(&owner),
-            &[("origin", "https://sm.example.com")],
-            &json!({"scope": "repo", "repo": "owner/repo", "reviewer": reviewer}),
-        );
-        let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+        let put = |reviewer: &Value| {
+            owner_web_request(
+                Method::PUT,
+                "/review-policies",
+                "sm.example.com",
+                Some(&owner),
+                &[("origin", "https://sm.example.com")],
+                &json!({"scope": "repo", "repo": "owner/repo", "reviewer": reviewer}),
+            )
+        };
+        for model in ["gpt-hidden", "gpt-6-astra"] {
+            let refused = json!({"kind": "codex", "model": model, "effort": "high"});
+            let (status, body) =
+                response_json(app.clone().oneshot(put(&refused)).await.unwrap()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{model}: {body}");
+            assert!(body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Supported models: gpt-6.2-astra"));
+        }
+        let reviewer = json!({"kind": "codex", "model": "gpt-6.2-astra", "effort": "high"});
+        let (status, body) =
+            response_json(app.clone().oneshot(put(&reviewer)).await.unwrap()).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let (status, body) = browser_host_get(&app, "/review-policies", Some(&owner)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["policies"][0]["reviewer"], reviewer);
         assert_eq!(body["policies"][0]["set_by_session_id"], Value::Null);
+        assert_eq!(body["policies"][0]["fallback"][0]["model"], "fable");
     }
 
     #[tokio::test]

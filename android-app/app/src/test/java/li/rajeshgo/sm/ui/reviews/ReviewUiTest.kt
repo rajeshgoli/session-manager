@@ -34,6 +34,9 @@ class ReviewUiTest {
         assertEquals(listOf(Reviewer("claude", model = "fable", effort = "xhigh")), reviewFallback(Reviewer("codex", model = "gpt-6-astra", effort = "medium")))
         assertEquals("sonnet", reviewFallback(Reviewer("codex", model = "gpt-5.6-luna", effort = "high")).single().model)
         assertEquals("opus", reviewFallback(Reviewer("codex", model = "gpt-5.5", effort = "high")).single().model)
+        // A newer Codex version keeps the tier its name ends in (#2674).
+        assertEquals("fable", reviewFallback(Reviewer("codex", model = "gpt-6.2-astra", effort = "medium")).single().model)
+        assertEquals("sonnet", reviewFallback(Reviewer("codex", model = "gpt-6.3-luna", effort = "high")).single().model)
         assertEquals(listOf(Reviewer("codex", model = "gpt-6-astra", effort = "high")), reviewFallback(Reviewer("claude", model = "fable", effort = "max")))
         assertEquals("gpt-6-luna", reviewFallback(Reviewer("claude", model = "haiku", effort = "low")).single().model)
         assertEquals("gpt-6-sol", reviewFallback(Reviewer("claude", model = "opus[1m]", effort = "high")).single().model)

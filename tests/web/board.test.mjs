@@ -144,6 +144,10 @@ test('the shown fallback matches the spec table (1768 C2)', () => {
   for (const model of ['sonnet', 'haiku']) assert.equal(text({ kind: 'claude', model, effort: 'low' }), 'Codex run · gpt-6-luna · high');
   assert.equal(text({ kind: 'paired', provider: 'codex', model: 'gpt-6-astra', effort: 'high' }), 'Codex run · gpt-6-astra · high > Claude run · fable · xhigh');
   assert.equal(tier('fable'), 'top'); assert.equal(tier('opus'), 'mid'); assert.equal(tier('haiku'), 'low');
+  // A newer Codex version keeps the tier its name ends in (#2674).
+  assert.equal(text({ kind: 'paired', provider: 'codex', model: 'gpt-6.2-astra', effort: 'medium' }), 'Codex run · gpt-6.2-astra · medium > Claude run · fable · xhigh');
+  assert.equal(text({ kind: 'codex', model: 'gpt-6.3-luna', effort: 'high' }), 'Claude run · sonnet · high');
+  assert.equal(tier('gpt-6.2-astra'), 'top'); assert.equal(tier('gpt-6.1-terra'), 'mid');
 });
 
 test('switching reviewer kind keeps model and effort only on the same provider', () => {
