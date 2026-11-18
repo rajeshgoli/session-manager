@@ -2619,7 +2619,7 @@ fn run_request_codex_review_create(client: &ApiClient, args: RequestReviewArgs) 
     }
     let payload = codex_review_create_payload(
         pr_number,
-        resolved_repo,
+        resolved_repo.clone(),
         args.steer.as_deref(),
         &effective_notify,
         current_session_id.as_deref(),
@@ -2627,6 +2627,13 @@ fn run_request_codex_review_create(client: &ApiClient, args: RequestReviewArgs) 
         args.retry_interval_seconds,
     );
     let response = client.post_json("/review-requests", payload)?;
+    let repo = response["repo"]
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or(resolved_repo);
+    if let (Some(session_id), Some(repo)) = (current_session_id.as_deref(), repo.as_deref()) {
+        doc::publish_pr_docs(client, session_id, repo, pr_number, args.json);
+    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&response)?);
         return Ok(());
