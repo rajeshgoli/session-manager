@@ -8,6 +8,7 @@ pub(super) struct QueryPolicy {
     pr: Option<i64>,
     ticket: Option<i64>,
     lane: Option<i64>,
+    agent: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -17,6 +18,8 @@ pub(super) struct PutPolicy {
     number: Option<i64>,
     reviewer: Option<Value>,
     session_id: Option<String>,
+    /// The agent an `agent` policy is for (#2672).
+    agent: Option<String>,
 }
 
 fn bad(detail: impl Into<String>) -> ApiError {
@@ -71,6 +74,11 @@ pub(super) async fn get_policy(
         ensure_session_allowed_from_parts(&state.config, &headers, Some(peer), "/review-policies")?;
     }
     let db = expand_home(&state.config.sm_send.db_path);
+    if let Some(agent) = query.agent.as_deref() {
+        return Ok(Json(
+            json!({"policy":policy::list_agents(&db)?.remove(agent)}),
+        ));
+    }
     let selected = [query.pr, query.ticket, query.lane]
         .into_iter()
         .flatten()
@@ -159,6 +167,9 @@ pub(super) async fn put_policy(
     if caller.as_deref() != body.session_id.as_deref() {
         return Err(forbidden("Session identity does not match the request"));
     }
+    if body.scope == "agent" {
+        return put_agent_policy(&state, &headers, peer, &uri, caller.as_deref(), body).await;
+    }
     let repo = if body.scope == "default" {
         body.repo
             .as_deref()
@@ -175,7 +186,7 @@ pub(super) async fn put_policy(
             .filter(|n| *n > 0)
             .ok_or_else(|| bad("number must be positive"))?,
         "default" => 0,
-        _ => return Err(bad("scope must be default, repo, lane or ticket")),
+        _ => return Err(bad("scope must be default, repo, lane, ticket or agent")),
     };
     if let Some(value) = &body.reviewer {
         policy::validate(&body.scope, value).map_err(bad)?;
@@ -237,6 +248,64 @@ pub(super) async fn put_policy(
             session_id: caller.as_deref(),
             name: &name,
             now: &now,
+        },
+    )?;
+    Ok(Json(json!({"policy":saved})))
+}
+
+/// An agent's own reviewer: the owner sets it, or another agent outside its
+/// handoff family. An agent cannot choose its own reviewer.
+async fn put_agent_policy(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    uri: &Uri,
+    caller: Option<&str>,
+    body: PutPolicy,
+) -> Result<Json<Value>, ApiError> {
+    let agent = body
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| bad("agent is required"))?;
+    let target = state
+        .session_store
+        .get_session(agent)?
+        .ok_or_else(|| bad(format!("Session {agent} not found")))?;
+    if let Some(value) = &body.reviewer {
+        policy::validate("agent", value).map_err(bad)?;
+        check_reviewer_model(state, value).await?;
+    }
+    let name = if let Some(id) = caller {
+        let credential = reparent_session_credential(headers)?;
+        if !state
+            .session_store
+            .session_credential_matches(id, &credential)?
+        {
+            return Err(forbidden("Session credential does not match the caller"));
+        }
+        if session_family(state, &target.id)?.contains(id) {
+            return Err(forbidden("An agent cannot choose its own reviewer."));
+        }
+        state
+            .session_store
+            .get_session(id)?
+            .map(|s| claims::session_info(&s).name)
+            .unwrap_or_else(|| id.to_owned())
+    } else {
+        board::owner_guard(state, headers, peer, "PUT", uri, true)?;
+        state.config.owner_name.clone()
+    };
+    let db = expand_home(&state.config.sm_send.db_path);
+    let saved = policy::set_agent(
+        &db,
+        policy::AgentPolicyChange {
+            agent_session_id: &target.id,
+            reviewer: body.reviewer.as_ref(),
+            session_id: caller,
+            name: &name,
+            now: &now_rfc3339(),
         },
     )?;
     Ok(Json(json!({"policy":saved})))
@@ -344,12 +413,68 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            app.oneshot(send(None, None, "repo", 0))
+            app.clone()
+                .oneshot(send(None, None, "repo", 0))
                 .await
                 .unwrap()
                 .status(),
             StatusCode::FORBIDDEN
         );
+        // #2672: an agent policy is set by another agent, never by the agent itself.
+        let agent_put = |session: &str, credential: &str, agent: &str| {
+            let body = json!({"scope":"agent","agent":agent,"session_id":session,
+                "reviewer":{"kind":"paired","provider":"claude","model":"opus","effort":"high"}});
+            let mut request = Request::builder()
+                .method(Method::PUT)
+                .uri("/review-policies")
+                .header("host", "testserver")
+                .header("content-type", "application/json")
+                .header("x-sm-session", session)
+                .header("x-sm-session-credential", credential)
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4200))));
+            request
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(agent_put("author", "author-secret", "author"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(agent_put("planner", "planner-secret", "missing"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(agent_put("planner", "planner-secret", "author"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let saved = policy::list_agents(&db).unwrap();
+        assert_eq!(saved["author"]["reviewer"]["kind"], "paired");
+        assert_eq!(saved["author"]["set_by_name"], "planner");
+        let mut read = Request::builder()
+            .uri("/review-policies?agent=author")
+            .header("host", "testserver")
+            .header("x-sm-session", "planner")
+            .body(Body::empty())
+            .unwrap();
+        read.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4200))));
+        let response = app.oneshot(read).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

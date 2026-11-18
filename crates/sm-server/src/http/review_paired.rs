@@ -94,6 +94,11 @@ pub(super) fn stop(state: &AppState, r: &CodexReviewRequestRegistration, reason:
     }
 }
 
+/// The author session when the agent's own policy chose this reviewer (#2672).
+fn step_agent(step: &Value) -> Option<String> {
+    step["agent"]["session_id"].as_str().map(str::to_owned)
+}
+
 fn step_ticket(step: &Value) -> Option<(String, i64)> {
     Some((
         step["ticket"]["repo"].as_str()?.to_owned(),
@@ -123,6 +128,40 @@ fn author_checkout(
     Ok(found
         .map(|(path, session)| (expand_home(&path), session))
         .filter(|(path, _)| path.is_dir()))
+}
+
+/// An agent's own reviewer works where the agent does: a worktree on a claim
+/// of this PR, else the agent's newest claimed worktree, else its working
+/// directory. Each must be a git checkout.
+fn agent_checkout(
+    state: &AppState,
+    db: &FsPath,
+    r: &CodexReviewRequestRegistration,
+    agent: &str,
+) -> Result<Option<PathBuf>> {
+    let conn = rusqlite::Connection::open(db)?;
+    crate::work_claims::init_work_claims_schema(&conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT worktree_path FROM work_claims WHERE ended_at IS NULL \
+         AND worktree_path IS NOT NULL AND worktree_path != '' AND \
+         ((kind='pr' AND repo=?1 AND number=?2) OR session_id=?3) \
+         ORDER BY CASE WHEN kind='pr' AND repo=?1 AND number=?2 THEN 0 ELSE 1 END, \
+         CASE WHEN session_id=?3 THEN 0 ELSE 1 END, claimed_at DESC",
+    )?;
+    let mut paths = stmt
+        .query_map(rusqlite::params![r.repo, r.pr_number, agent], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|p| expand_home(&p))
+        .collect::<Vec<_>>();
+    if let Some(session) = live_session(state, agent)? {
+        paths.push(expand_home(&session.working_dir));
+    }
+    Ok(paths
+        .into_iter()
+        .find(|p| p.is_dir() && p.join(".git").exists()))
 }
 
 fn advance(
@@ -162,17 +201,42 @@ async fn start(
     if let Some(reason) = review_runs::meter_skip(state, provider).map_err(|e| e.to_string())? {
         return advance(state, db, r, &reason);
     }
-    let Some(ticket) = step_ticket(step) else {
-        return advance(state, db, r, "failed to start: the policy names no ticket");
+    // The chain stores the agent as it was at request time; a handoff since
+    // then moved its policy to the successor, so key the reviewer there.
+    let agent = match step_agent(step) {
+        Some(id) => Some(
+            live_session(state, &id)
+                .map_err(|e| e.to_string())?
+                .map_or(id, |session| session.id),
+        ),
+        None => None,
     };
-    let Some((checkout, _author)) = author_checkout(db, r, &ticket).map_err(|e| e.to_string())?
-    else {
+    let ticket = match (&agent, step_ticket(step)) {
+        // An agent's reviewer is keyed on the agent; ticket 0 marks that.
+        (Some(_), _) => (r.repo.clone(), 0),
+        (None, Some(ticket)) => ticket,
+        (None, None) => {
+            return advance(state, db, r, "failed to start: the policy names no ticket")
+        }
+    };
+    let checkout = match &agent {
+        Some(agent) => agent_checkout(state, db, r, agent).map_err(|e| e.to_string())?,
+        None => author_checkout(db, r, &ticket)
+            .map_err(|e| e.to_string())?
+            .map(|(path, _)| path),
+    };
+    let Some(checkout) = checkout else {
         return advance(state, db, r, "no author checkout");
     };
     let model = step["model"].as_str().unwrap_or_default();
     let effort = step["effort"].as_str().unwrap_or_default();
     let checkout_text = checkout.to_string_lossy().into_owned();
-    if let Some(existing) = paired::live(db, &ticket.0, ticket.1).map_err(|e| e.to_string())? {
+    let existing = match &agent {
+        Some(agent) => paired::live_for_agent(db, agent),
+        None => paired::live(db, &ticket.0, ticket.1),
+    }
+    .map_err(|e| e.to_string())?;
+    if let Some(existing) = existing {
         let session = live_session(state, &existing.session_id).map_err(|e| e.to_string())?;
         let matches = existing.provider == provider
             && existing.model == model
@@ -222,7 +286,18 @@ async fn start(
         .filter(|s| !s.is_retired())
         .map(|s| s.name)
         .collect();
-    let name = paired::reviewer_name(&short, ticket.1, &|n| taken.contains(n));
+    let name = match &agent {
+        Some(agent) => {
+            let author = state
+                .session_store
+                .get_session(agent)
+                .map_err(|e| e.to_string())?
+                .map(session_display_name)
+                .unwrap_or_else(|| agent.clone());
+            paired::agent_reviewer_name(&author, &|n| taken.contains(n))
+        }
+        None => paired::reviewer_name(&short, ticket.1, &|n| taken.contains(n)),
+    };
     let created = async {
         let id = state.session_store.allocate_session_id()?;
         create_session_from_request(
@@ -277,6 +352,7 @@ async fn start(
             retired_at: None,
             rounds: 0,
             last_review_url: None,
+            author_session_id: agent.clone(),
         },
     )
     .map_err(|e| e.to_string())?;
@@ -361,10 +437,14 @@ fn prepare_round(
     let snapshot = paired::snapshot(&checkout)?;
     let checkout_text = checkout.to_string_lossy();
     let text = if row.rounds == 0 {
+        let serves = if row.author_session_id.is_some() {
+            author.to_owned()
+        } else {
+            format!("ticket #{}", row.ticket)
+        };
         let mut text = format!(
-            "You are {}, the paired reviewer for ticket #{} in {}. You work in the author's checkout, {checkout_text}, so that you can build the code and run its tests. You must not edit, commit, push, or change branches there, and you must not comment on GitHub. The author, {author}, is idle while you review.\n\n{}\n\n{}",
+            "You are {}, the paired reviewer for {serves} in {}. You work in the author's checkout, {checkout_text}, so that you can build the code and run its tests. You must not edit, commit, push, or change branches there, and you must not comment on GitHub. The author, {author}, is idle while you review.\n\n{}\n\n{}",
             session_display_name(reviewer.clone()),
-            row.ticket,
             row.repo,
             review::RUBRIC.trim_end(),
             review_runs::prompt(state, r, &pr, base, &merge_base)?.trim_end(),
@@ -713,6 +793,24 @@ fn retire_reason(
         )
         .optional()?
         .unwrap_or_else(|| row.repo.clone());
+    if let Some(author) = &row.author_session_id {
+        // An agent's own reviewer lasts while the agent and its policy do.
+        if live_session(state, author)?.is_none() {
+            return Ok(Some("the author retired"));
+        }
+        let still = crate::review::policy::list_agents(db)?
+            .get(author)
+            .is_some_and(|p| {
+                p["reviewer"]["kind"] == "paired"
+                    && p["reviewer"]["provider"] == row.provider.as_str()
+                    && p["reviewer"]["model"] == row.model.as_str()
+                    && p["reviewer"]["effort"] == row.effort.as_str()
+            });
+        if !still {
+            return Ok(Some("the agent's policy changed"));
+        }
+        return pr_closed(state, &pr_repo, row.pr_number);
+    }
     // The author is whoever holds a claim in the reviewer's checkout; a
     // handoff successor keeps the worktree, another agent's takeover does not.
     let mut stmt = conn.prepare(
@@ -743,9 +841,13 @@ fn retire_reason(
     if !still {
         return Ok(Some("the ticket's policy changed"));
     }
+    pr_closed(state, &pr_repo, row.pr_number)
+}
+
+fn pr_closed(state: &AppState, repo: &str, pr: i64) -> Result<Option<&'static str>> {
     if let GitHubPullRequestState::Closed { .. } = state
         .github_review_poster
-        .current_pr_state(&pr_repo, row.pr_number)
+        .current_pr_state(repo, pr)
         .map_err(anyhow::Error::msg)?
     {
         return Ok(Some("the PR is merged or closed"));
@@ -804,6 +906,10 @@ pub(super) fn session_fields_with_requests(
     let db = expand_home(&state.config.sm_send.db_path);
     let mut fields: BTreeMap<String, Value> = BTreeMap::new();
     let active: Vec<_> = requests.iter().filter(|r| r.is_active).collect();
+    // The agent's own reviewer choice (#2672), for its ⋯ menu.
+    for (id, policy) in crate::review::policy::list_agents(&db)? {
+        fields.entry(id).or_insert_with(|| json!({}))["review_policy"] = policy;
+    }
     for r in &active {
         let author = r
             .requester_session_id
@@ -823,6 +929,7 @@ pub(super) fn session_fields_with_requests(
                     .clone()
                     .unwrap_or_else(|| r.notify_session_id.clone())
             })
+            .or_else(|| row.author_session_id.clone())
             .and_then(|id| state.session_store.get_session(&id).ok().flatten())
             .map(session_display_name);
         let (round, request_state) = match current {
@@ -835,6 +942,7 @@ pub(super) fn session_fields_with_requests(
             .entry(row.session_id.clone())
             .or_insert_with(|| json!({}))["paired_reviewer"] = json!({
             "repo": row.repo, "ticket": row.ticket, "pr_number": row.pr_number, "round": round,
+            "author_session_id": row.author_session_id,
             "author_name": author_name, "request_state": request_state,
         });
     }
@@ -920,6 +1028,7 @@ mod tests {
             retired_at: None,
             rounds: 1,
             last_review_url: None,
+            author_session_id: None,
         };
         let mut config = AppConfig::default();
         config.sm_send.db_path = db.display().to_string();
@@ -1007,6 +1116,7 @@ mod tests {
                 retired_at: None,
                 rounds: 0,
                 last_review_url: None,
+                author_session_id: None,
             },
         )
         .unwrap();

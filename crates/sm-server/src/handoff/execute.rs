@@ -235,6 +235,9 @@ pub const MOVED_COLUMNS: &[(&str, &str)] = &[
     // A paired reviewer's successor keeps its ticket and current round.
     ("codex_review_request_registrations", "reviewer_session_id"),
     ("paired_reviewers", "session_id"),
+    // An agent's own review policy, and the reviewer it started, follow it (#2672).
+    ("paired_reviewers", "author_session_id"),
+    ("agent_review_policies", "session_id"),
     ("queue_jobs", "notify_session_id"),
     ("queue_jobs", "requester_session_id"),
     ("scheduled_reminders", "target_session_id"),
@@ -261,6 +264,11 @@ pub const NOT_MOVED_COLUMNS: &[(&str, &str, &str)] = &[
     ),
     (
         "review_policies",
+        "set_by_session_id",
+        "history of who chose the policy",
+    ),
+    (
+        "agent_review_policies",
         "set_by_session_id",
         "history of who chose the policy",
     ),

@@ -1,5 +1,5 @@
 //! The `paired_reviewers` registry (#1779): one row per reviewer agent that
-//! works in an author's checkout for one ticket.
+//! works in an author's checkout for one ticket, or for one agent (#2672).
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -18,8 +18,29 @@ pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS paired_reviewers (
     created_at TEXT NOT NULL,
     retired_at TEXT,
     rounds INTEGER NOT NULL DEFAULT 0,
-    last_review_url TEXT
+    last_review_url TEXT,
+    author_session_id TEXT
 )";
+
+/// Set when an agent's own policy started the reviewer: it then serves that
+/// agent across PRs, and `ticket` is 0. A handoff moves it to the successor.
+fn ensure_author_column(conn: &Connection) -> Result<()> {
+    let has = conn
+        .prepare("PRAGMA table_info(paired_reviewers)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|c| c == "author_session_id");
+    if !has {
+        conn.execute_batch("ALTER TABLE paired_reviewers ADD COLUMN author_session_id TEXT")?;
+    }
+    Ok(())
+}
+
+pub fn ensure_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA)?;
+    ensure_author_column(conn)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PairedReviewer {
@@ -36,10 +57,11 @@ pub struct PairedReviewer {
     /// Rounds sent to this reviewer: the first gets the full brief (E5).
     pub rounds: i64,
     pub last_review_url: Option<String>,
+    pub author_session_id: Option<String>,
 }
 
 const COLUMNS: &str = "session_id,repo,ticket,pr_number,provider,model,effort,checkout,\
-    created_at,retired_at,rounds,last_review_url";
+    created_at,retired_at,rounds,last_review_url,author_session_id";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PairedReviewer> {
     Ok(PairedReviewer {
@@ -55,13 +77,14 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PairedReviewer> {
         retired_at: r.get(9)?,
         rounds: r.get(10)?,
         last_review_url: r.get(11)?,
+        author_session_id: r.get(12)?,
     })
 }
 
 fn open(db: &Path) -> Result<Connection> {
     let conn = Connection::open(db)?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
-    conn.execute_batch(SCHEMA)?;
+    ensure_schema(&conn)?;
     Ok(conn)
 }
 
@@ -71,9 +94,24 @@ pub fn live(db: &Path, repo: &str, ticket: i64) -> Result<Option<PairedReviewer>
         .query_row(
             &format!(
                 "SELECT {COLUMNS} FROM paired_reviewers WHERE repo=?1 AND ticket=?2 \
-                 AND retired_at IS NULL ORDER BY created_at DESC LIMIT 1"
+                 AND author_session_id IS NULL AND retired_at IS NULL \
+                 ORDER BY created_at DESC LIMIT 1"
             ),
             params![repo, ticket],
+            row,
+        )
+        .optional()?)
+}
+
+/// The reviewer still registered for an agent's own policy, if any.
+pub fn live_for_agent(db: &Path, author_session_id: &str) -> Result<Option<PairedReviewer>> {
+    Ok(open(db)?
+        .query_row(
+            &format!(
+                "SELECT {COLUMNS} FROM paired_reviewers WHERE author_session_id=?1 \
+                 AND retired_at IS NULL ORDER BY created_at DESC LIMIT 1"
+            ),
+            [author_session_id],
             row,
         )
         .optional()?)
@@ -103,7 +141,7 @@ pub fn list_live(db: &Path) -> Result<Vec<PairedReviewer>> {
 
 pub fn insert(db: &Path, r: &PairedReviewer) -> Result<()> {
     open(db)?.execute(
-        &format!("INSERT INTO paired_reviewers ({COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"),
+        &format!("INSERT INTO paired_reviewers ({COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"),
         params![
             r.session_id,
             r.repo,
@@ -116,7 +154,8 @@ pub fn insert(db: &Path, r: &PairedReviewer) -> Result<()> {
             r.created_at,
             r.retired_at,
             r.rounds,
-            r.last_review_url
+            r.last_review_url,
+            r.author_session_id
         ],
     )?;
     Ok(())
@@ -150,13 +189,20 @@ pub fn record_review(db: &Path, session_id: &str, url: Option<&str>) -> Result<(
 /// `{repo_short}-{ticket}-reviewer`, cut to 32 characters, with the first
 /// numeric suffix that no live session uses.
 pub fn reviewer_name(short: &str, ticket: i64, taken: &dyn Fn(&str) -> bool) -> String {
-    let base: String = format!("{short}-{ticket}-reviewer")
-        .chars()
-        .take(32)
-        .collect();
+    unique_name(&format!("{short}-{ticket}-reviewer"), taken)
+}
+
+/// `{author}-reviewer` for an agent's own reviewer, cut and suffixed alike.
+pub fn agent_reviewer_name(author: &str, taken: &dyn Fn(&str) -> bool) -> String {
+    unique_name(&format!("{author}-reviewer"), taken)
+}
+
+fn unique_name(base: &str, taken: &dyn Fn(&str) -> bool) -> String {
+    let base: String = base.chars().take(32).collect();
     if !taken(&base) {
         return base;
     }
+    let base = base.as_str();
     (2..)
         .map(|n| {
             let suffix = format!("-{n}");
@@ -250,6 +296,10 @@ mod tests {
         assert_eq!(long.chars().count(), 32);
         let taken = |n: &str| n == "far-1848-reviewer";
         assert_eq!(reviewer_name("far", 1848, &taken), "far-1848-reviewer-2");
+        assert_eq!(
+            agent_reviewer_name("far-artifacts", &|_| false),
+            "far-artifacts-reviewer"
+        );
         let long_taken = |n: &str| n.chars().count() == 32 && !n.ends_with("-2");
         assert!(reviewer_name("fractal-algo-rust-long", 1848, &long_taken).ends_with("-2"));
     }
@@ -340,8 +390,22 @@ mod tests {
             retired_at: None,
             rounds: 0,
             last_review_url: None,
+            author_session_id: None,
         };
         insert(&db, &reviewer).unwrap();
+        let agent = PairedReviewer {
+            session_id: "r2".into(),
+            ticket: 0,
+            author_session_id: Some("author".into()),
+            ..reviewer.clone()
+        };
+        insert(&db, &agent).unwrap();
+        assert_eq!(
+            live_for_agent(&db, "author").unwrap().unwrap().session_id,
+            "r2"
+        );
+        retire(&db, "r2", "later").unwrap();
+        assert!(live_for_agent(&db, "author").unwrap().is_none());
         record_round(&db, "r1", 1851).unwrap();
         record_review(&db, "r1", Some("https://x/1")).unwrap();
         let live_row = live(&db, "far/repo", 1848).unwrap().unwrap();

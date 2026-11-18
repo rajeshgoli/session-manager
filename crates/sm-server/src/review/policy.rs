@@ -19,7 +19,103 @@ pub fn ensure_schema(db: &Path) -> Result<()> {
          set_by_name TEXT NOT NULL, set_at TEXT NOT NULL,\
          PRIMARY KEY(scope,repo,number))",
     )?;
+    conn.execute_batch(AGENT_SCHEMA)?;
     Ok(())
+}
+
+/// One owner-chosen reviewer per agent (#2672). It follows the agent through
+/// a handoff and wins over ticket, lane and repo policies, so it applies
+/// before the agent has filed a ticket or opened a PR.
+pub const AGENT_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS agent_review_policies (\
+    session_id TEXT PRIMARY KEY, reviewer_json TEXT NOT NULL, set_by_session_id TEXT,\
+    set_by_name TEXT NOT NULL, set_at TEXT NOT NULL)";
+
+fn agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
+    let reviewer: String = row.get(1)?;
+    let reviewer: Value = serde_json::from_str(&reviewer).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(json!({"scope":"agent","session_id":row.get::<_,String>(0)?,
+        "fallback":chain(&reviewer).into_iter().skip(1).collect::<Vec<_>>(),"reviewer":reviewer,
+        "set_by_session_id":row.get::<_,Option<String>>(2)?,"set_by_name":row.get::<_,String>(3)?,
+        "set_at":row.get::<_,String>(4)?}))
+}
+
+fn get_agent(conn: &Connection, session_id: &str) -> Result<Option<Value>> {
+    Ok(conn
+        .query_row(
+            "SELECT session_id,reviewer_json,set_by_session_id,set_by_name,set_at \
+             FROM agent_review_policies WHERE session_id=?1",
+            [session_id],
+            agent_row,
+        )
+        .optional()?)
+}
+
+/// Every agent policy, keyed by the agent's session id.
+pub fn list_agents(db: &Path) -> Result<std::collections::BTreeMap<String, Value>> {
+    if !db.exists() {
+        return Ok(Default::default());
+    }
+    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_review_policies'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(Default::default());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT session_id,reviewer_json,set_by_session_id,set_by_name,set_at \
+         FROM agent_review_policies ORDER BY session_id",
+    )?;
+    let rows = stmt
+        .query_map([], agent_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|p| (p["session_id"].as_str().unwrap_or_default().to_owned(), p))
+        .collect())
+}
+
+pub struct AgentPolicyChange<'a> {
+    pub agent_session_id: &'a str,
+    pub reviewer: Option<&'a Value>,
+    pub session_id: Option<&'a str>,
+    pub name: &'a str,
+    pub now: &'a str,
+}
+
+pub fn set_agent(db: &Path, change: AgentPolicyChange<'_>) -> Result<Option<Value>> {
+    ensure_schema(db)?;
+    let conn = Connection::open(db)?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    if let Some(reviewer) = change.reviewer {
+        conn.execute(
+            "INSERT INTO agent_review_policies (session_id,reviewer_json,set_by_session_id,set_by_name,set_at) \
+             VALUES (?1,?2,?3,?4,?5) ON CONFLICT(session_id) DO UPDATE SET \
+             reviewer_json=excluded.reviewer_json,set_by_session_id=excluded.set_by_session_id,\
+             set_by_name=excluded.set_by_name,set_at=excluded.set_at",
+            params![change.agent_session_id, reviewer.to_string(), change.session_id, change.name, change.now],
+        )?;
+    } else {
+        conn.execute(
+            "DELETE FROM agent_review_policies WHERE session_id=?1",
+            [change.agent_session_id],
+        )?;
+    }
+    get_agent(&conn, change.agent_session_id)
+}
+
+/// The agent whose review is being requested: the requester's session id
+/// and the name that review sources show.
+pub struct AgentRef<'a> {
+    pub session_id: &'a str,
+    pub name: &'a str,
 }
 
 fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
@@ -177,8 +273,29 @@ pub fn resolve(
     lane: Option<i64>,
     default: &Value,
 ) -> Result<Value> {
+    resolve_for(db, repo, pr, ticket, lane, None, default)
+}
+
+/// `resolve`, with the requesting agent's own policy first (#2672).
+pub fn resolve_for(
+    db: &Path,
+    repo: &str,
+    pr: Option<i64>,
+    ticket: Option<i64>,
+    lane: Option<i64>,
+    agent: Option<&AgentRef<'_>>,
+    default: &Value,
+) -> Result<Value> {
     ensure_schema(db)?;
     let conn = Connection::open(db)?;
+    if let Some(agent) = agent {
+        if let Some(p) = get_agent(&conn, agent.session_id)? {
+            // A paired reviewer for an agent is keyed on the agent, not a ticket.
+            return Ok(json!({"reviewer":p["reviewer"],"fallback":p["fallback"],
+                "source":format!("agent {}", agent.name),
+                "agent":{"session_id":agent.session_id,"name":agent.name}}));
+        }
+    }
     let mut tickets = if let Some(pr) = pr {
         linked_tickets(&conn, repo, pr)?
     } else {
@@ -242,8 +359,8 @@ pub fn resolve(
 
 pub fn validate(scope: &str, reviewer: &Value) -> Result<(), String> {
     if reviewer["kind"] == "paired" {
-        if scope != "ticket" {
-            return Err("A paired reviewer can only be set on a ticket.".into());
+        if scope != "ticket" && scope != "agent" {
+            return Err("A paired reviewer can only be set on a ticket or an agent.".into());
         }
         let mut run = reviewer.clone();
         let provider = reviewer["provider"].as_str().unwrap_or("");
@@ -439,14 +556,109 @@ mod tests {
     }
 
     #[test]
-    fn paired_is_ticket_only_and_fields_are_validated() {
+    fn agent_policy_wins_and_clears() {
+        let (_dir, db) = setup();
+        let default = json!({"kind":"github_codex"});
+        let ticket = json!({"kind":"claude","model":"fable","effort":"max"});
+        let paired = json!({"kind":"paired","provider":"claude","model":"opus","effort":"high"});
+        set(
+            &db,
+            "ticket",
+            "far/repo",
+            1848,
+            Some(&ticket),
+            None,
+            "Rajesh",
+            "now",
+        )
+        .unwrap();
+        let agent = AgentRef {
+            session_id: "a1",
+            name: "far-artifacts",
+        };
+        // No agent policy yet: the PR's ticket decides.
+        let before = resolve_for(
+            &db,
+            "far/repo",
+            Some(1851),
+            None,
+            None,
+            Some(&agent),
+            &default,
+        )
+        .unwrap();
+        assert_eq!(before["source"], "ticket #1848");
+        let saved = set_agent(
+            &db,
+            AgentPolicyChange {
+                agent_session_id: "a1",
+                reviewer: Some(&paired),
+                session_id: None,
+                name: "Rajesh",
+                now: "now",
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(saved["scope"], "agent");
+        assert_eq!(saved["fallback"][0]["kind"], "claude");
+        // The agent's policy wins over the ticket's, and applies to a PR with no ticket.
+        for pr in [1851, 4242] {
+            let result = resolve_for(
+                &db,
+                "far/repo",
+                Some(pr),
+                None,
+                None,
+                Some(&agent),
+                &default,
+            )
+            .unwrap();
+            assert_eq!(result["source"], "agent far-artifacts");
+            assert_eq!(result["reviewer"]["kind"], "paired");
+            assert_eq!(result["agent"]["session_id"], "a1");
+        }
+        // Another agent's request is untouched.
+        let other = AgentRef {
+            session_id: "a2",
+            name: "other",
+        };
+        let result = resolve_for(
+            &db,
+            "far/repo",
+            Some(4242),
+            None,
+            None,
+            Some(&other),
+            &default,
+        )
+        .unwrap();
+        assert_eq!(result["source"], "default");
+        assert_eq!(list_agents(&db).unwrap().len(), 1);
+        set_agent(
+            &db,
+            AgentPolicyChange {
+                agent_session_id: "a1",
+                reviewer: None,
+                session_id: None,
+                name: "Rajesh",
+                now: "later",
+            },
+        )
+        .unwrap();
+        assert!(list_agents(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn paired_is_ticket_or_agent_only_and_fields_are_validated() {
         let reviewer =
             json!({"kind":"paired","provider":"codex","model":"gpt-6-astra","effort":"high"});
         assert_eq!(
             validate("repo", &reviewer).unwrap_err(),
-            "A paired reviewer can only be set on a ticket."
+            "A paired reviewer can only be set on a ticket or an agent."
         );
         assert!(validate("ticket", &reviewer).is_ok());
+        assert!(validate("agent", &reviewer).is_ok());
         // A well-formed Codex model passes here; the write route checks the
         // live catalog (#2674). A malformed one fails the shape check.
         let bad = json!({"kind":"codex","model":"not a model","effort":"high"});

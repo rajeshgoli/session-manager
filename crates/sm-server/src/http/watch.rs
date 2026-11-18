@@ -329,6 +329,7 @@ pub(super) fn watch_state(state: &AppState, params: &WatchParams) -> Result<Valu
             "waiting_on": waiting_on,
             "waiting_on_review": reviews.get(id).map_or(Value::Null, |r| r["waiting_on_review"].clone()),
             "paired_reviewer": reviews.get(id).map_or(Value::Null, |r| r["paired_reviewer"].clone()),
+            "review_policy": reviews.get(id).map_or(Value::Null, |r| r["review_policy"].clone()),
             "review_history": field("review_history"),
             "jobs": own_jobs,
             "background_jobs": background,
