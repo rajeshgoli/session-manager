@@ -193,7 +193,7 @@ pub(crate) fn run_pr(client: &ApiClient, args: PrArgs) -> Result<()> {
         args.take,
         &args.ticket,
     )?;
-    super::doc::publish_pr_docs(client, &session_id, &target.repo, number);
+    super::doc::publish_pr_docs(client, &session_id, &target.repo, number, false);
     Ok(())
 }
 

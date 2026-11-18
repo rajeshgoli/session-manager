@@ -641,8 +641,16 @@ fn too_many_docs_line(paths: &[String], pr: i64) -> String {
 /// After `sm pr` or `sm request-review` (sm#2673): publish, for the owner to
 /// read, the docs the PR changes that nobody published, so the agent need
 /// not remember `sm doc publish`. It never fails the command it follows.
-pub(crate) fn publish_pr_docs(client: &ApiClient, session_id: &str, repo: &str, pr: i64) {
-    if let Err(error) = try_publish_pr_docs(client, &ProcessTools, session_id, repo, pr) {
+/// `json_stdout`: the command prints JSON, so every line goes to stderr.
+pub(crate) fn publish_pr_docs(
+    client: &ApiClient,
+    session_id: &str,
+    repo: &str,
+    pr: i64,
+    json_stdout: bool,
+) {
+    let tools = &ProcessTools;
+    if let Err(error) = try_publish_pr_docs(client, tools, session_id, repo, pr, json_stdout) {
         eprintln!("Could not check PR #{pr} for unpublished docs: {error:#}");
     }
 }
@@ -653,6 +661,7 @@ fn try_publish_pr_docs(
     session_id: &str,
     repo: &str,
     pr: i64,
+    json_stdout: bool,
 ) -> Result<()> {
     let cwd = env::current_dir()?;
     let Some((head, changed)) = pr_changed_docs(tools, &cwd, repo, pr)? else {
@@ -689,15 +698,19 @@ fn try_publish_pr_docs(
             }),
         );
         match published {
-            Ok(doc) => println!(
-                "{}",
-                auto_published_line(
+            Ok(doc) => {
+                let line = auto_published_line(
                     &path,
                     pr,
                     doc["owner_name"].as_str().unwrap_or("the owner"),
-                    &reader_url(client, &doc)
-                )
-            ),
+                    &reader_url(client, &doc),
+                );
+                if json_stdout {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
+            }
             Err(error) => eprintln!("Could not publish {path} from PR #{pr}: {error:#}"),
         }
     }
