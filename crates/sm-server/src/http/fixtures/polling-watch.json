@@ -2113,6 +2113,7 @@
           "scope": "sm_tracked"
         }
       ],
+      "review_policy": null,
       "role": null,
       "state": "waiting",
       "status_at": null,

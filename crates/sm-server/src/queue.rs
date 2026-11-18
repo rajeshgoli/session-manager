@@ -3303,6 +3303,10 @@ impl RetainedQueueStore {
                       WHERE reviewer_session_id = ?1 AND is_active = 1",
                     "UPDATE OR IGNORE paired_reviewers SET session_id = ?2
                       WHERE session_id = ?1",
+                    "UPDATE paired_reviewers SET author_session_id = ?2
+                      WHERE author_session_id = ?1",
+                    "UPDATE OR IGNORE agent_review_policies SET session_id = ?2
+                      WHERE session_id = ?1",
                     "UPDATE scheduled_reminders SET target_session_id = ?2
                       WHERE target_session_id = ?1 AND is_active = 1",
                     "UPDATE OR IGNORE remind_registrations SET target_session_id = ?2
@@ -4314,7 +4318,9 @@ fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
         "superseded_at",
         "TIMESTAMP",
     )?;
-    conn.execute_batch(crate::review::paired::SCHEMA)?;
+    crate::review::paired::ensure_schema(conn)?;
+    // Created here as well, so a handoff can move an agent's policy (#2672).
+    conn.execute_batch(crate::review::policy::AGENT_SCHEMA)?;
     for (name, kind) in [
         ("chain_json", "TEXT"),
         ("policy_source", "TEXT"),

@@ -5496,6 +5496,7 @@ async fn list_client_sessions(
                 let mut value = client_session_value(&state, session, actor_email.as_deref(), None);
                 value["waiting_on_review"] = json!(null);
                 value["paired_reviewer"] = json!(null);
+                value["review_policy"] = json!(null);
                 if let Some(Value::Object(fields)) = fields {
                     for (key, field) in fields {
                         value[key] = field;
@@ -5824,17 +5825,28 @@ async fn create_review_request_core(
             );
         }
         let settings = state.session_store.owner_settings()?;
-        let policy = crate::review::policy::resolve(
+        // The requesting agent's own policy comes first (#2672).
+        let agent_name = state
+            .session_store
+            .get_session(&owner)?
+            .map(session_display_name)
+            .unwrap_or_else(|| owner.clone());
+        let policy = crate::review::policy::resolve_for(
             &queue_db_path,
             &repo,
             Some(payload.pr_number),
             None,
             None,
+            Some(&crate::review::policy::AgentRef {
+                session_id: &owner,
+                name: &agent_name,
+            }),
             &settings["reviews"]["reviewer"],
         )?;
         let mut chain = vec![policy["reviewer"].clone()];
         if chain[0]["kind"] == "paired" {
             chain[0]["ticket"] = policy["ticket"].clone();
+            chain[0]["agent"] = policy["agent"].clone();
         }
         chain.extend(policy["fallback"].as_array().into_iter().flatten().cloned());
         RetainedQueueStore::initialize_review_chain(

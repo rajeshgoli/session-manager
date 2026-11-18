@@ -97,30 +97,42 @@ export function ReviewerEditor({ value, onChange, paired = false, kinds, note })
   </div>`;
 }
 
-const SCOPE_NAME = { repo: 'this repo', lane: 'this lane', ticket: 'this ticket' };
+const SCOPE_NAME = { repo: 'this repo', lane: 'this lane', ticket: 'this ticket', agent: 'this agent' };
+const INHERIT = { ticket: 'Use the lane or default', agent: "Use the PR's policy" };
 
-/** The Board's and Settings' policy editor for one repo, lane or ticket. */
-export function PolicyPopover({ scope, repo, number, title, policy, lanePolicy, onClose, onSaved, align }) {
+/** What a review request uses without this scope's own policy. */
+export function inheritedText(listing, { scope, repo, lanePolicy }) {
+  if (!listing) return 'Loading…';
+  // An agent's own policy sits above every PR's ticket, lane and repo (#2672).
+  if (scope === 'agent') return `Uses the PR's ticket, lane or repo policy, else the default: ${reviewerText(listing.default?.reviewer)}.`;
+  const inherited = inheritedPolicy(listing, { scope, repo, lanePolicy });
+  return `Uses ${inherited.source}: ${reviewerText(inherited.reviewer)}.`;
+}
+
+/** The policy editor for one repo, lane, ticket (Board, Settings) or agent (its ⋯ menu). */
+export function PolicyPopover({ scope, repo, number, agent, title, policy, lanePolicy, onClose, onSaved, align }) {
   const [listing, setListing] = useState(null);
   const [own, setOwn] = useState(!!policy);
   const [draft, setDraft] = useState(policy?.reviewer || { kind: 'github_codex' });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   useEffect(() => { api('/review-policies').then(setListing).catch((e) => setError(e.message)); }, []);
-  const inherited = inheritedPolicy(listing, { scope, repo, lanePolicy });
   const save = async () => {
     setBusy(true); setError(null);
     try {
-      await api('/review-policies', { method: 'PUT', body: { scope, repo, number: scope === 'repo' ? 0 : number, reviewer: own ? draft : null } });
+      const reviewer = own ? draft : null;
+      await api('/review-policies', { method: 'PUT', body: scope === 'agent' ? { scope, agent, reviewer }
+        : { scope, repo, number: scope === 'repo' ? 0 : number, reviewer } });
       onSaved?.(); onClose();
     } catch (e) { setError(e.message); } finally { setBusy(false); }
   };
   return html`<${Popover} onClose=${onClose} align=${align} className="review-policy-pop">
     <h2>${title}</h2>
     <${Seg} label="Policy source" value=${own} onChange=${setOwn}
-      options=${[{ value: false, label: scope === 'ticket' ? 'Use the lane or default' : 'Use the default' }, { value: true, label: `Set for ${SCOPE_NAME[scope]}` }]} />
-    ${own ? html`<${ReviewerEditor} value=${draft} onChange=${setDraft} paired=${scope === 'ticket'} />`
-      : html`<p class="sub">${inherited ? `Uses ${inherited.source}: ${reviewerText(inherited.reviewer)}.` : 'Loading…'}</p>`}
+      options=${[{ value: false, label: INHERIT[scope] || 'Use the default' }, { value: true, label: `Set for ${SCOPE_NAME[scope]}` }]} />
+    ${own ? html`<${ReviewerEditor} value=${draft} onChange=${setDraft} paired=${scope === 'ticket' || scope === 'agent'}
+        note=${scope === 'agent' && draft.kind === 'paired' ? "A paired reviewer works in this agent's checkout, so it can read local files a cloud review cannot." : null} />`
+      : html`<p class="sub">${inheritedText(listing, { scope, repo, lanePolicy })}</p>`}
     ${policy ? html`<p class="sub">${setByText(policy)}</p>` : null}
     <p class="sub">Changes apply to the next review request.</p>
     ${error ? html`<p class="err" role="alert">${error}</p>` : null}

@@ -19,7 +19,7 @@ await board.evaluate();
 const { groupTickets, visibleOther, openBlockers, blockedText, clockSegments, BALL_TONE, canStart } = board.namespace;
 const { startBody, providerDefaults, canStartAnyway, blockedReasons, modelShort, matchType, chipText, autoStartBody, retryBody, defaultType, laneCandidates, CUSTOM } = modules.get(`${root}/board-start.js`).namespace;
 const { canStartWhenReady, boardSections } = board.namespace;
-const { reviewFallback, reviewerText, switchKind, inheritedPolicy, tier } = modules.get(`${root}/reviews.js`).namespace;
+const { reviewFallback, reviewerText, switchKind, inheritedPolicy, inheritedText, tier } = modules.get(`${root}/reviews.js`).namespace;
 const queueModel = load(`${root}/queue-model.js`);
 await queueModel.link(() => { throw new Error('queue-model has no imports'); });
 await queueModel.evaluate();
@@ -160,6 +160,9 @@ test('a scope without its own policy names the next scope out', () => {
   assert.equal(inheritedPolicy(listing, { scope: 'lane', repo: 'o/b' }).source, 'the default');
   assert.equal(inheritedPolicy(listing, { scope: 'repo', repo: 'o/a' }).source, 'the default');
   assert.equal(inheritedPolicy(listing, { scope: 'ticket', repo: 'o/a', lanePolicy: { reviewer: { kind: 'github_codex' } } }).source, 'the lane');
+  // #2672: an agent's own policy inherits from each PR, not from one scope.
+  assert.match(inheritedText(listing, { scope: 'agent' }), /^Uses the PR's ticket, lane or repo policy, else the default: /);
+  assert.equal(inheritedText(null, { scope: 'agent' }), 'Loading…');
 });
 
 test('Start sends the chosen reviewer and nothing when the ticket keeps its policy', () => {
@@ -189,6 +192,8 @@ test('authors and paired reviewers read their review state on the Agents page', 
     assert.deepEqual(pairedText({ ...paired, request_state }), { active: true, text: 'Reviewing PR #1851 for far-1848 · round 1' });
   }
   assert.deepEqual(pairedText({ ...paired, request_state: null }), { active: false, text: 'Paired reviewer for #1848 · idle' });
+  assert.deepEqual(pairedText({ ...paired, ticket: 0, author_session_id: 'a1', author_name: 'sm-art', request_state: null }),
+    { active: false, text: 'Paired reviewer for sm-art · idle' });
   assert.equal(pairedText(null), null);
   assert.deepEqual(jobsFact({ paired_reviewer: { ...paired, request_state: 'reviewing' }, facts: { jobs: { text: 'No jobs' } } }), { text: 'Reviewing PR #1851 for far-1848 · round 1', tone: 'amber' });
   assert.deepEqual(jobsFact({ paired_reviewer: { ...paired, request_state: 'reviewing' }, facts: { jobs: { running: 1, text: 'Tests running 3m', tone: 'green' } } }),

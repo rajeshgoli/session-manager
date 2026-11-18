@@ -7,6 +7,7 @@ import {
   closePanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored,
 } from './ui.js';
 import { HandoffPopover } from './handoff.js';
+import { PolicyPopover, reviewerText } from './reviews.js';
 import { isShell, shellFact, ShellMenu, createShell, shellError } from './shell.js';
 
 // ---- facts and attention (1782 B: the server computes both) ------------------
@@ -96,7 +97,8 @@ export function pairedText(paired) {
   if (['waiting_reviewer', 'reviewing', 'nudged'].includes(paired.request_state)) {
     return { active: true, text: `Reviewing PR #${paired.pr_number} for ${paired.author_name || 'its author'} · round ${paired.round}` };
   }
-  return { active: false, text: `Paired reviewer for #${paired.ticket} · idle` };
+  const serves = paired.author_session_id ? paired.author_name || 'its author' : `#${paired.ticket}`;
+  return { active: false, text: `Paired reviewer for ${serves} · idle` };
 }
 
 /** An author's line while sm finds and runs its review (1768 I3). */
@@ -534,6 +536,11 @@ function MoreMenu({ agent, align, onClose, onSaved, onHandoff }) {
       setBusy(false);
     }
   };
+  if (editing === 'review') {
+    // The agent's own reviewer, ahead of its PRs' ticket, lane and repo policies (#2672).
+    return html`<${PolicyPopover} scope="agent" agent=${agent.id} title=${`Reviews for ${agent.name}`}
+      policy=${agent.review_policy} align=${align} onClose=${onClose} onSaved=${onSaved} />`;
+  }
   if (editing) {
     const Editor = editing === 'rename' ? RenameEditor : NoteEditor;
     // A fresh Popover, so it re-fits the viewport for the wider editor.
@@ -560,6 +567,8 @@ function MoreMenu({ agent, align, onClose, onSaved, onHandoff }) {
     <${FollowButton} id=${agent.id} menu onClose=${onClose} />
     <button type="button" onClick=${copy}>Copy attach command</button>
     <button type="button" onClick=${() => setEditing('rename')}>Rename…</button>
+    ${agent.state !== 'stopped' ? html`<button type="button" onClick=${() => setEditing('review')}>
+      ${agent.review_policy ? `Review: ${reviewerText(agent.review_policy.reviewer)}…` : 'Review policy…'}</button>` : null}
     ${agent.state !== 'stopped' || agent.facts?.note ? html`<button type="button" onClick=${() => setEditing('note')}>
       ${agent.facts?.note ? 'Edit note…' : 'Pin a note…'}</button>` : null}
   <//>`;
