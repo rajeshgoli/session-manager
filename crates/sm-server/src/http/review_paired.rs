@@ -201,7 +201,16 @@ async fn start(
     if let Some(reason) = review_runs::meter_skip(state, provider).map_err(|e| e.to_string())? {
         return advance(state, db, r, &reason);
     }
-    let agent = step_agent(step);
+    // The chain stores the agent as it was at request time; a handoff since
+    // then moved its policy to the successor, so key the reviewer there.
+    let agent = match step_agent(step) {
+        Some(id) => Some(
+            live_session(state, &id)
+                .map_err(|e| e.to_string())?
+                .map_or(id, |session| session.id),
+        ),
+        None => None,
+    };
     let ticket = match (&agent, step_ticket(step)) {
         // An agent's reviewer is keyed on the agent; ticket 0 marks that.
         (Some(_), _) => (r.repo.clone(), 0),
