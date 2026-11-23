@@ -30,6 +30,8 @@ merge or drop the weakest entries. Keep these six sections.
   jobs. Check a burst's next week before planning on it. (readout 2026-W46)
 - Holding pushes while he is at his desk: asked 2026-11-02, opened, never answered; sm abandoned it 2026-11-16
   and its build (PR #2536) closed unmerged. (readout 2026-W47)
+- Board latency tails: use faded before planning (211 opens and 108 starts Oct 19–Nov 1; 8 opens, 0 starts
+  Nov 16–22). Dropped. (readout 2026-W48)
 
 ## Rules
 - Never infer disuse or backlog from stored state; check activity by surface. (two misreadings, session 8bbcb31a, 2026-10-15)
@@ -59,7 +61,9 @@ merge or drop the weakest entries. Keep these six sections.
   nav on 2026-11-02 (23–36 on other days). Exclude both from counts. (readout 2026-W47)
 - After `sm autopm start`, move the experiment `planned → building` yourself; sm moves only
   `building → dark`, on its timer. x-2026w47 sat in planned after its build deployed. (2026-11-16)
+- `doc.open` covers both the doc page and `GET /docs/{id}` details; each doc's first row averages 21 ms.
+  Separate them before using `doc.open` as a metric. (readout 2026-W48)
 
 ## Open hypotheses
-1. Board open and start-from-board are slow in the tail: p90 4.1 s and 4.6 s, Nov 2–15. Find where the time
-   goes before planning. (readout 2026-W47)
+1. Doc review opens are slow: about 0.6 s mean on by-id opens, one in eight over 1 s, Oct 26–Nov 22; docs
+   without a PR are slower (0.8 s), so not the PR lookup. Time each step first. (readout 2026-W48)
