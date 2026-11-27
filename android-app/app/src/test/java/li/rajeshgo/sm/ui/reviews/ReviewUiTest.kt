@@ -25,6 +25,18 @@ class ReviewUiTest {
     private val json = Json { ignoreUnknownKeys = true }
 
     @Test
+    fun reviewerModelsUseTheRunCatalogAndPreserveTheStoredChoice() {
+        assertEquals("codex-fork", reviewModelProvider("codex"))
+        assertEquals("claude", reviewModelProvider("claude"))
+        val catalog = listOf("gpt-6.2-astra", "gpt-6.2-sol")
+        assertEquals(catalog, reviewModelOptions(catalog, "gpt-6.2-sol"))
+        assertEquals(catalog + "gpt-5.5", reviewModelOptions(catalog, "gpt-5.5"))
+        assertEquals(listOf("gpt-5.5"), reviewModelOptions(emptyList(), "gpt-5.5"))
+        assertEquals(catalog, reviewModelOptions(catalog, null))
+        assertEquals(emptyList<String>(), reviewModelOptions(emptyList(), ""))
+    }
+
+    @Test
     fun fallbackMatchesTheServerTierTable() {
         // The server's chain (review/mod.rs) for each row of appendix C2.
         assertEquals(

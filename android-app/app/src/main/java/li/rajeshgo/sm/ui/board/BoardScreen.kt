@@ -519,6 +519,7 @@ fun BoardScreen(
             error = edit.error,
             onDismiss = viewModel::closeReviewPolicy,
             onSave = viewModel::saveReviewPolicy,
+            loadModels = viewModel::sessionModels,
         )
     }
 
@@ -575,6 +576,7 @@ fun BoardScreen(
                 extra = { enabled ->
                     StartReviewerRow(
                         laneDefault = policy?.takeUnless { ticketOwn },
+                        loadModels = viewModel::sessionModels,
                         value = reviewer,
                         onChange = { reviewer = it },
                         enabled = enabled,

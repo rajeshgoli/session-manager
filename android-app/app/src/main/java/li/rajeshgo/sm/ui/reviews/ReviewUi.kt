@@ -9,15 +9,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import li.rajeshgo.sm.data.model.ReviewPolicy
 import li.rajeshgo.sm.data.model.Reviewer
+import li.rajeshgo.sm.data.model.SessionModelsResponse
+import kotlinx.coroutines.CancellationException
 import li.rajeshgo.sm.ui.theme.Rose
 import li.rajeshgo.sm.ui.theme.TextMuted
 import li.rajeshgo.sm.ui.theme.TextSecondary
 
-/** The models the server accepts for each run provider (sm#1768 appendix C1), top tier first. */
-val REVIEW_MODELS = mapOf(
-    "codex" to listOf("gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"),
-    "claude" to listOf("fable", "opus", "opus[1m]", "sonnet", "haiku"),
-)
+/** Review runs use the fork's catalog, just as server validation does. */
+internal fun reviewModelProvider(provider: String): String = if (provider == "codex") "codex-fork" else provider
+
+/** Preserve a stored model even when it is absent from today's catalog. */
+internal fun reviewModelOptions(catalog: List<String>, current: String?): List<String> =
+    (catalog + listOfNotNull(current)).filter { it.isNotBlank() }.distinct()
 
 val REVIEW_EFFORTS = mapOf(
     "codex" to listOf("medium", "high", "xhigh"),
@@ -81,7 +84,36 @@ fun fallbackText(fallback: List<Reviewer>): String =
  * [allowPaired] is for a ticket, the only scope a paired reviewer may have.
  */
 @Composable
-fun ReviewerEditor(value: Reviewer, onChange: (Reviewer) -> Unit, allowPaired: Boolean, enabled: Boolean) {
+fun ReviewerEditor(
+    value: Reviewer,
+    onChange: (Reviewer) -> Unit,
+    allowPaired: Boolean,
+    enabled: Boolean,
+    loadModels: suspend (String, String) -> SessionModelsResponse,
+) {
+    val provider = when (value.kind) {
+        "github_codex" -> null
+        "paired" -> value.provider ?: "codex"
+        else -> value.kind
+    }
+    var catalog by remember(provider) { mutableStateOf(emptyList<String>()) }
+    var loading by remember(provider) { mutableStateOf(false) }
+    var modelsError by remember(provider) { mutableStateOf(false) }
+    var attempt by remember { mutableIntStateOf(0) }
+    LaunchedEffect(provider, loadModels, attempt) {
+        if (provider == null) return@LaunchedEffect
+        loading = true
+        modelsError = false
+        try {
+            catalog = loadModels(reviewModelProvider(provider), "").models
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            modelsError = true
+        } finally {
+            loading = false
+        }
+    }
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         val kinds = listOf("github_codex" to "GitHub", "codex" to "Codex", "claude" to "Claude") +
             if (allowPaired) listOf("paired" to "Paired") else emptyList()
@@ -98,20 +130,24 @@ fun ReviewerEditor(value: Reviewer, onChange: (Reviewer) -> Unit, allowPaired: B
         if (value.kind == "github_codex") {
             Text("GitHub Codex chooses its own model.", style = MaterialTheme.typography.bodySmall, color = TextMuted)
         } else {
-            val provider = if (value.kind == "paired") value.provider ?: "codex" else value.kind
+            val provider = requireNotNull(provider)
             if (value.kind == "paired") {
                 SegmentedChoice(listOf("codex" to "Codex agent", "claude" to "Claude agent"), provider, enabled) {
                     if (it != provider) onChange(defaultRun(it).copy(kind = "paired", provider = it))
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Dropdown("Model", value.model.orEmpty(), REVIEW_MODELS.getValue(provider), enabled, Modifier.weight(1.4f)) {
+                Dropdown("Model", value.model.orEmpty(), reviewModelOptions(catalog, value.model), enabled, Modifier.weight(1.4f)) {
                     onChange(value.copy(model = it))
                 }
                 val efforts = REVIEW_EFFORTS.getValue(provider)
                 Dropdown("Effort", value.effort.orEmpty(), efforts, enabled, Modifier.weight(1f)) {
                     onChange(value.copy(effort = it))
                 }
+            }
+            if (loading) Text("Loading models…", style = MaterialTheme.typography.bodySmall, color = TextMuted)
+            if (modelsError) {
+                TextButton(onClick = { attempt++ }, enabled = enabled) { Text("Couldn't load models · Retry") }
             }
             if (value.kind == "paired") {
                 Text(
@@ -167,7 +203,13 @@ private fun Dropdown(label: String, value: String, options: List<String>, enable
  * ticket's own policy when the author starts.
  */
 @Composable
-fun StartReviewerRow(laneDefault: li.rajeshgo.sm.data.model.StartReviewPolicy?, value: Reviewer?, onChange: (Reviewer?) -> Unit, enabled: Boolean) {
+fun StartReviewerRow(
+    laneDefault: li.rajeshgo.sm.data.model.StartReviewPolicy?,
+    value: Reviewer?,
+    onChange: (Reviewer?) -> Unit,
+    enabled: Boolean,
+    loadModels: suspend (String, String) -> SessionModelsResponse,
+) {
     var expanded by remember { mutableStateOf(false) }
     if (!expanded) {
         Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
@@ -188,7 +230,7 @@ fun StartReviewerRow(laneDefault: li.rajeshgo.sm.data.model.StartReviewPolicy?, 
                 color = TextSecondary,
             )
         } else {
-            ReviewerEditor(value, { onChange(it) }, allowPaired = true, enabled = enabled)
+            ReviewerEditor(value, { onChange(it) }, allowPaired = true, enabled = enabled, loadModels = loadModels)
         }
     }
 }
@@ -209,6 +251,7 @@ fun ReviewPolicySheet(
     error: String?,
     onDismiss: () -> Unit,
     onSave: (Reviewer?) -> Unit,
+    loadModels: suspend (String, String) -> SessionModelsResponse,
 ) {
     var own by remember(current) { mutableStateOf(current != null) }
     var reviewer by remember(current) { mutableStateOf(current?.reviewer ?: defaultRun("codex")) }
@@ -220,7 +263,7 @@ fun ReviewPolicySheet(
             Text(title, style = MaterialTheme.typography.titleLarge)
             SegmentedChoice(listOf("inherit" to inheritLabel, "own" to ownLabel), if (own) "own" else "inherit", !busy) { own = it == "own" }
             if (own) {
-                ReviewerEditor(reviewer, { reviewer = it }, allowPaired, !busy)
+                ReviewerEditor(reviewer, { reviewer = it }, allowPaired, !busy, loadModels)
             } else {
                 Text("Uses the wider policy: the lane's, the repo's, or the default.", style = MaterialTheme.typography.bodySmall, color = TextMuted)
             }

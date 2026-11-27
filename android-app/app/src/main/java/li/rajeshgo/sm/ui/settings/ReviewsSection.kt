@@ -193,7 +193,10 @@ fun ReviewsSection() {
         Text("Default reviewer", style = MaterialTheme.typography.titleSmall)
         Text("Every repo, lane and ticket without its own.", style = MaterialTheme.typography.bodySmall, color = TextMuted)
         val draft = draftReviewer ?: stored.default.reviewer
-        ReviewerEditor(draft, { draftReviewer = it; message = null }, allowPaired = false, enabled = !busy)
+        val loadModels: suspend (String, String) -> li.rajeshgo.sm.data.model.SessionModelsResponse = remember(repository, url, token) {
+            { provider, directory -> repository.fetchSessionModelCatalog(url, token, provider, directory) }
+        }
+        ReviewerEditor(draft, { draftReviewer = it; message = null }, allowPaired = false, enabled = !busy, loadModels = loadModels)
         if (draft != stored.default.reviewer) {
             Button(enabled = !busy, onClick = {
                 write("Saved") { repository.putReviewPolicy(url, token, PutReviewPolicyRequest("default", null, null, draft)) }
