@@ -328,7 +328,7 @@ private fun BugReportSheet(viewModel: BugReportViewModel) {
             filedIssue = sheet.filedIssue,
         ),
         extra = { enabled ->
-            StartReviewerRow(laneDefault = options?.reviewPolicy, value = reviewer, onChange = { reviewer = it }, enabled = enabled)
+            StartReviewerRow(laneDefault = options?.reviewPolicy, value = reviewer, onChange = { reviewer = it }, enabled = enabled, loadModels = viewModel::sessionModels)
         },
         onFile = { filing -> viewModel.submit(filing.copy(start = filing.start?.copy(reviewer = reviewer))) },
         onCreate = {},
