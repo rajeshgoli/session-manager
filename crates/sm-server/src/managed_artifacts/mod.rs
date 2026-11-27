@@ -315,6 +315,20 @@ impl ManagedArtifacts {
         tx.commit()?;
         Ok(json!(result))
     }
+    pub fn hand_off_building(
+        &self,
+        predecessor_id: &str,
+        successor_id: &str,
+        successor_name: &str,
+    ) -> Result<()> {
+        self.store.open()?.execute(
+            "UPDATE artifacts SET owner_session_id=?2, owner_session_name=?3
+             WHERE owner_session_id=?1 AND state='building' AND origin='hand'",
+            params![predecessor_id, successor_id, successor_name],
+        )?;
+        Ok(())
+    }
+
     pub fn done(&self, root: &ArtifactRoot, name: &str, actor: &str) -> Result<Value> {
         let mut conn = self.store.open()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

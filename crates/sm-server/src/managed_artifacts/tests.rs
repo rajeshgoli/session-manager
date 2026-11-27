@@ -252,6 +252,42 @@ fn done_requires_creating_session_and_hand_origin() {
     );
 }
 #[test]
+fn handoff_transfers_only_the_predecessors_unfinished_hand_artifacts() {
+    let f = Fixture::new();
+    for name in ["123_open", "123_finished", "123_job"] {
+        f.create(name);
+    }
+    f.svc
+        .create(&f.root, "123_other", &f.flags(), "other", "Other")
+        .unwrap();
+    f.svc.done(&f.root, "123_finished", "maker").unwrap();
+    let conn = f.svc.store.open().unwrap();
+    conn.execute(
+        "UPDATE artifacts SET origin='queue' WHERE name='123_job'",
+        [],
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        f.svc
+            .hand_off_building("maker", "next", "Next worker")
+            .unwrap();
+    }
+
+    assert!(f.svc.done(&f.root, "123_open", "maker").is_err());
+    let completed = f.svc.done(&f.root, "123_open", "next").unwrap();
+    assert_eq!(completed["state"], "live");
+    assert_eq!(completed["owner_session_name"], "Next worker");
+    for name in ["123_finished", "123_job"] {
+        assert_eq!(
+            artifact(&conn, &f.root.path, name).unwrap()["owner_session_id"],
+            "maker"
+        );
+    }
+    f.svc.done(&f.root, "123_other", "other").unwrap();
+}
+
+#[test]
 fn record_is_atomic_and_adopts_without_recipe() {
     let f = Fixture::new();
     fs::create_dir(f.path("123_data")).unwrap();
