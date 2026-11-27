@@ -1069,6 +1069,9 @@ fn move_work(
     claims.hand_off(predecessor_id, successor_id, &successor_name)?;
     let queue = RetainedQueueStore::new(db_path.clone());
     queue.hand_off_rows(predecessor_id, successor_id)?;
+    if let Some(artifacts) = &state.managed_artifacts {
+        artifacts.hand_off_building(predecessor_id, successor_id, &successor_name)?;
+    }
     let queue_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
     RetainedQueueStore::hand_off_queue_jobs(&queue_dir, predecessor_id, successor_id)?;
     docs::owner_doc_store(state).hand_off(predecessor_id, successor_id, &successor_name)?;
